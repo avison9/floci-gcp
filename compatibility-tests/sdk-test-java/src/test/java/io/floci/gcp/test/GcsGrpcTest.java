@@ -35,6 +35,7 @@ class GcsGrpcTest {
                     .build());
 
             assertThat(storage.get(bucketName).getLabels()).containsEntry("transport", "grpc");
+            assertThat(storage.get(bucketName).getGeneratedId()).isEqualTo(bucketName);
             assertThat(StreamSupport.stream(storage.list().iterateAll().spliterator(), false)
                     .map(bucket -> bucket.getName())).contains(bucketName);
             assertThat(storage.update(storage.get(bucketName).toBuilder()

@@ -51,6 +51,7 @@ final class GcsGrpcMapper {
     static Bucket toProto(GcsBucket stored) {
         Bucket.Builder value = Bucket.newBuilder()
                 .setName(bucketName(stored.getName()))
+                .setBucketId(stored.getName())
                 .setProject("projects/" + stored.getProjectId())
                 .setMetageneration(parseLong(stored.getMetageneration()))
                 .setLocation(orEmpty(stored.getLocation()))
