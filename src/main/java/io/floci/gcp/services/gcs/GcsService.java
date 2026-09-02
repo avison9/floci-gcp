@@ -935,9 +935,15 @@ public class GcsService {
     // resident for the lifetime of the process, on either transport. Sweeping the two together
     // keeps REST and gRPC from diverging again.
     //
-    // `nowMillis` is a parameter rather than a clock read so the sweep is directly testable,
-    // and the per-session locks below are the same monitors the write paths hold, so a session
-    // cannot be written and evicted concurrently. Returns the number of sessions dropped.
+    // `nowMillis` is a parameter rather than a clock read so the sweep is directly testable.
+    //
+    // Both loops take the same monitor the matching write path holds, but that alone is not
+    // enough for the streaming case: GcsGrpcController looks a session up and only then
+    // synchronizes on it, so the sweep can remove the map entry in between and leave the writer
+    // holding a live reference to an orphaned session. Marking the session evicted under its own
+    // monitor closes that window, because the writer has to take the same monitor to append. The
+    // resumable path needs no equivalent, since applyResumableChunk reads the map inside the
+    // lock and so simply sees the session gone. Returns the number of sessions dropped.
     int evictExpiredUploadSessions(long nowMillis, long idleTimeoutMillis) {
         if (idleTimeoutMillis <= 0) {
             return 0;
@@ -959,6 +965,7 @@ public class GcsService {
             GcsStreamingUpload upload = entry.getValue();
             synchronized (upload) {
                 if (upload.lastTouchedMillis() < cutoff) {
+                    upload.markEvicted();
                     streamingUploads.remove(entry.getKey(), upload);
                     evicted++;
                 }
@@ -974,6 +981,9 @@ public class GcsService {
     public GcsObjectMeta finalizeStreamingUpload(String uploadId, String baseUrl) {
         GcsStreamingUpload upload = getStreamingUpload(uploadId);
         synchronized (upload) {
+            if (upload.isEvicted()) {
+                throw GcpException.notFound("Streaming upload not found: " + uploadId);
+            }
             if (upload.finalizedObject() != null) {
                 return upload.finalizedObject();
             }
