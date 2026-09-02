@@ -8,6 +8,9 @@ import com.google.storage.v2.Bucket;
 import com.google.storage.v2.ChecksummedData;
 import com.google.storage.v2.ComposeObjectRequest;
 import com.google.storage.v2.CreateBucketRequest;
+import com.google.storage.v2.GetBucketRequest;
+import com.google.storage.v2.ListBucketsRequest;
+import com.google.storage.v2.ListBucketsResponse;
 import com.google.storage.v2.ListObjectsRequest;
 import com.google.storage.v2.ListObjectsResponse;
 import com.google.storage.v2.QueryWriteStatusRequest;
@@ -76,6 +79,41 @@ class GcsGrpcControllerTest {
                 .build(), updated);
         assertNull(updated.error);
         assertEquals("true", updated.single().getLabelsOrThrow("updated"));
+    }
+
+    @Test
+    void everyBucketResponseCarriesBucketId() {
+        RecordingObserver<Bucket> created = new RecordingObserver<>();
+        controller.createBucket(CreateBucketRequest.newBuilder()
+                .setParent("projects/_")
+                .setBucketId("bucket-id-bucket")
+                .setBucket(Bucket.newBuilder().setProject("projects/test-project"))
+                .build(), created);
+        assertNull(created.error);
+        assertEquals("bucket-id-bucket", created.single().getBucketId());
+
+        RecordingObserver<Bucket> fetched = new RecordingObserver<>();
+        controller.getBucket(GetBucketRequest.newBuilder()
+                .setName("projects/_/buckets/bucket-id-bucket")
+                .build(), fetched);
+        assertNull(fetched.error);
+        assertEquals("bucket-id-bucket", fetched.single().getBucketId());
+
+        RecordingObserver<ListBucketsResponse> listed = new RecordingObserver<>();
+        controller.listBuckets(ListBucketsRequest.newBuilder()
+                .setParent("projects/test-project")
+                .build(), listed);
+        assertNull(listed.error);
+        assertEquals(List.of("bucket-id-bucket"),
+                listed.single().getBucketsList().stream().map(Bucket::getBucketId).toList());
+
+        RecordingObserver<Bucket> updated = new RecordingObserver<>();
+        controller.updateBucket(UpdateBucketRequest.newBuilder()
+                .setBucket(created.single().toBuilder().putLabels("updated", "true"))
+                .setUpdateMask(FieldMask.newBuilder().addPaths("labels.updated"))
+                .build(), updated);
+        assertNull(updated.error);
+        assertEquals("bucket-id-bucket", updated.single().getBucketId());
     }
 
     @Test
