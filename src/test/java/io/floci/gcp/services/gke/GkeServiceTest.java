@@ -538,6 +538,28 @@ class GkeServiceTest {
     }
 
     @Test
+    void aPoolCreatedAfterANodeVersionUpdateInheritsTheClusterVersion() {
+        // Review finding: a new pool defaulted its version to the build-time constant, so once a
+        // cluster had been moved off it by desiredNodeVersion, the next pool created without an
+        // explicit version came back on the old version while the cluster and its existing pools
+        // reported the new one.
+        service.createCluster(PROJECT, LOCATION, Map.of("name", "inherit-cluster"));
+        service.updateCluster(PROJECT, LOCATION, "inherit-cluster",
+                Map.of("desiredNodeVersion", "1.32.0-gke.7"));
+
+        service.createNodePool(PROJECT, LOCATION, "inherit-cluster", Map.of("name", "later-pool"));
+
+        StoredNodePool created = service.getNodePool(PROJECT, LOCATION, "inherit-cluster", "later-pool");
+        assertEquals("1.32.0-gke.7", created.getVersion());
+
+        // An explicit version on the request still wins.
+        service.createNodePool(PROJECT, LOCATION, "inherit-cluster",
+                Map.of("name", "pinned-pool", "version", "1.30.1-gke.2"));
+        assertEquals("1.30.1-gke.2",
+                service.getNodePool(PROJECT, LOCATION, "inherit-cluster", "pinned-pool").getVersion());
+    }
+
+    @Test
     void desiredNodeVersionUpdatesTheNodePoolsAsWellAsTheCluster() {
         // Review finding: a cluster-wide node version update touched only the cluster aggregate,
         // leaving every pool reporting its previous version to reconciliation clients.

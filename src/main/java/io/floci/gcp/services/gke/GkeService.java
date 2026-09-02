@@ -745,7 +745,15 @@ public class GkeService {
         Object initialNodeCount = poolMap.get("initialNodeCount");
         pool.setInitialNodeCount(initialNodeCount instanceof Number n ? n.intValue() : 3);
         pool.setLocations(stringListField(poolMap, "locations", List.of(location)));
-        pool.setVersion(stringField(poolMap, "version", DEFAULT_MASTER_VERSION));
+        // Default the version from the owning cluster, not the build-time constant: after an
+        // UpdateCluster carrying desiredNodeVersion, the cluster and its existing pools have
+        // moved off DEFAULT_MASTER_VERSION, and a pool created afterwards without an explicit
+        // version would otherwise come back on the old one and read as drift.
+        String clusterNodeVersion = clusterStore.get(clusterKey(project, location, clusterId))
+                .map(StoredCluster::getCurrentNodeVersion)
+                .filter(v -> v != null && !v.isBlank())
+                .orElse(DEFAULT_MASTER_VERSION);
+        pool.setVersion(stringField(poolMap, "version", clusterNodeVersion));
         pool.setStatus("RUNNING");
         pool.setSelfLink(nodePoolSelfLink(project, location, clusterId, name));
         pool.setEtag(newFingerprint());
