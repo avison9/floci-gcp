@@ -22,6 +22,7 @@ import java.util.Map;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.when;
@@ -291,8 +292,9 @@ class GkeServiceTest {
     void nodePoolUpgradeOperationsRequireAnExistingPool() {
         service.createCluster(PROJECT, LOCATION, Map.of("name", "upgrade-me"));
 
-        StoredOperation complete = service.completeNodePoolUpgrade(PROJECT, LOCATION, "upgrade-me", "default-pool");
-        assertEquals(OperationType.COMPLETE_NODE_POOL_UPGRADE, complete.getOperationType());
+        // CompleteNodePoolUpgrade returns google.protobuf.Empty, not an Operation
+        // (cluster_service.proto#L382-L388), so it only has to validate and return.
+        service.completeNodePoolUpgrade(PROJECT, LOCATION, "upgrade-me", "default-pool");
 
         StoredOperation rollback = service.rollbackNodePoolUpgrade(PROJECT, LOCATION, "upgrade-me", "default-pool");
         assertEquals(OperationType.ROLLBACK_NODE_POOL_UPGRADE, rollback.getOperationType());
@@ -449,6 +451,99 @@ class GkeServiceTest {
         assertEquals(LOCATION, migrated.get(0).getLocation());
         assertEquals("legacy-cluster", migrated.get(0).getClusterId());
         assertNotNull(migrated.get(0).getSelfLink());
+    }
+
+    @Test
+    void readingAClusterDoesNotWriteNodePoolsBackOntoTheStoredRecord() {
+        // Review finding: getCluster/listClusters attached pools to the live stored object, so a
+        // stale pool snapshot was persisted on the next flush and the startup migration could
+        // replay it and resurrect deleted pools. The read path must leave the record untouched.
+        InMemoryStorage<String, StoredCluster> clusterStore = new InMemoryStorage<>();
+        GkeOperationService operationService =
+                new GkeOperationService(new InMemoryStorage<String, StoredOperation>());
+        GkeService readService = new GkeService(clusterStore,
+                new InMemoryStorage<String, StoredNodePool>(), config, clusterManager, operationService, null);
+        readService.createCluster(PROJECT, LOCATION, Map.of("name", "read-only"));
+        String key = "projects/" + PROJECT + "/locations/" + LOCATION + "/clusters/read-only";
+
+        assertEquals(1, readService.getCluster(PROJECT, LOCATION, "read-only").getNodePools().size(),
+                "the returned view still carries its pools");
+        assertNull(clusterStore.get(key).orElseThrow().getNodePools(),
+                "reading must not attach pools to the persisted record");
+
+        readService.listClusters(PROJECT, LOCATION);
+        assertNull(clusterStore.get(key).orElseThrow().getNodePools(),
+                "listing must not attach pools to the persisted record either");
+    }
+
+    @Test
+    void migrationResumesAfterAPartialRunAndDoesNotResurrectDeletedPools() {
+        // Review finding: migration skipped a whole cluster once its pool store was non-empty, so
+        // a run interrupted partway never finished, and the surviving embedded copy could bring a
+        // deleted pool back. Pools migrate individually and the embedded list is cleared once done.
+        StoredCluster legacy = new StoredCluster();
+        legacy.setName("partial-cluster");
+        legacy.setProject(PROJECT);
+        legacy.setLocation(LOCATION);
+        legacy.setStatus("RUNNING");
+        StoredNodePool first = new StoredNodePool();
+        first.setName("pool-a");
+        StoredNodePool second = new StoredNodePool();
+        second.setName("pool-b");
+        legacy.setNodePools(List.of(first, second));
+
+        InMemoryStorage<String, StoredCluster> clusterStore = new InMemoryStorage<>();
+        String clusterKey = "projects/" + PROJECT + "/locations/" + LOCATION + "/clusters/partial-cluster";
+        clusterStore.put(clusterKey, legacy);
+
+        // Simulate a previous run that persisted only pool-a before being interrupted.
+        InMemoryStorage<String, StoredNodePool> poolStore = new InMemoryStorage<>();
+        StoredNodePool alreadyMigrated = new StoredNodePool();
+        alreadyMigrated.setName("pool-a");
+        alreadyMigrated.setProject(PROJECT);
+        alreadyMigrated.setLocation(LOCATION);
+        alreadyMigrated.setClusterId("partial-cluster");
+        poolStore.put(clusterKey + "/nodePools/pool-a", alreadyMigrated);
+
+        GkeOperationService operationService =
+                new GkeOperationService(new InMemoryStorage<String, StoredOperation>());
+        GkeService resuming = new GkeService(clusterStore, poolStore, config,
+                clusterManager, operationService, null);
+        resuming.init();
+
+        List<String> names = resuming.listNodePools(PROJECT, LOCATION, "partial-cluster").stream()
+                .map(StoredNodePool::getName).sorted().toList();
+        assertEquals(List.of("pool-a", "pool-b"), names, "the interrupted run must finish");
+        assertNull(clusterStore.get(clusterKey).orElseThrow().getNodePools(),
+                "a migrated cluster must stop carrying embedded pools");
+
+        // A pool deleted after migration must stay deleted across a restart.
+        resuming.deleteNodePool(PROJECT, LOCATION, "partial-cluster", "pool-b");
+        GkeService restarted = new GkeService(clusterStore, poolStore, config,
+                clusterManager, operationService, null);
+        restarted.init();
+
+        assertEquals(List.of("pool-a"),
+                restarted.listNodePools(PROJECT, LOCATION, "partial-cluster").stream()
+                        .map(StoredNodePool::getName).toList(),
+                "a deleted pool must not be resurrected by the embedded copy");
+    }
+
+    @Test
+    void desiredNodeVersionUpdatesTheNodePoolsAsWellAsTheCluster() {
+        // Review finding: a cluster-wide node version update touched only the cluster aggregate,
+        // leaving every pool reporting its previous version to reconciliation clients.
+        service.createCluster(PROJECT, LOCATION, Map.of("name", "version-cluster"));
+
+        service.updateCluster(PROJECT, LOCATION, "version-cluster",
+                Map.of("desiredNodeVersion", "1.31.5-gke.1"));
+
+        assertEquals("1.31.5-gke.1",
+                service.getCluster(PROJECT, LOCATION, "version-cluster").getCurrentNodeVersion());
+        for (StoredNodePool pool : service.listNodePools(PROJECT, LOCATION, "version-cluster")) {
+            assertEquals("1.31.5-gke.1", pool.getVersion(),
+                    "node pool " + pool.getName() + " must report the requested version");
+        }
     }
 
     @Test

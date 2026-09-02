@@ -118,20 +118,24 @@ public class GkeService {
      * else). Without this, those pools would simply vanish after an upgrade — the node pool
      * store starts empty and nothing would ever populate it for a pre-existing cluster. Backfills
      * the fields the embedded shape never had (project/location/clusterId/selfLink/etag/status)
-     * and moves each pool into the node pool store. Idempotent: skipped for any cluster that
-     * already has node pool store entries, so it's safe to run on every startup. */
+     * and moves each pool into the node pool store, then clears the embedded list so the cluster
+     * records that it has been migrated. Idempotent and resumable: pools already present in the
+     * store are skipped individually, so an interrupted run finishes on the next startup, and a
+     * pool deleted after migration is not resurrected. */
     private void migrateEmbeddedNodePools() {
         for (StoredCluster cluster : clusterStore.scan(k -> true)) {
             List<StoredNodePool> embedded = cluster.getNodePools();
             if (embedded == null || embedded.isEmpty()) {
                 continue;
             }
-            if (!listNodePools(cluster.getProject(), cluster.getLocation(), cluster.getName()).isEmpty()) {
-                continue;
-            }
             int migrated = 0;
             for (StoredNodePool pool : embedded) {
                 if (pool.getName() == null || pool.getName().isBlank()) {
+                    continue;
+                }
+                String poolKey = nodePoolKey(
+                        cluster.getProject(), cluster.getLocation(), cluster.getName(), pool.getName());
+                if (nodePoolStore.get(poolKey).isPresent()) {
                     continue;
                 }
                 pool.setProject(cluster.getProject());
@@ -153,11 +157,18 @@ public class GkeService {
                 if (pool.getConditions() == null) {
                     pool.setConditions(List.of());
                 }
-                nodePoolStore.put(
-                        nodePoolKey(cluster.getProject(), cluster.getLocation(), cluster.getName(), pool.getName()),
-                        pool);
+                nodePoolStore.put(poolKey, pool);
                 migrated++;
             }
+            // Clearing the embedded list is what marks this cluster migrated, and it has to be
+            // the marker rather than "the pool store has entries for this cluster": that signal
+            // is erased by a later DeleteNodePool, which would let the stale embedded copy
+            // resurrect a deleted pool on the next startup. Per-pool skipping above plus this
+            // clear also make an interrupted migration resumable — whatever is still embedded is
+            // exactly what has not been moved yet.
+            cluster.setNodePools(null);
+            clusterStore.put(
+                    clusterKey(cluster.getProject(), cluster.getLocation(), cluster.getName()), cluster);
             if (migrated > 0) {
                 LOG.infov("Migrated {0} embedded node pool(s) for cluster {1} to the node pool store",
                         migrated, cluster.getName());
@@ -243,18 +254,27 @@ public class GkeService {
         return operationService.createOperation(project, location, name, OperationType.CREATE_CLUSTER);
     }
 
+    /** Returns a detached copy carrying the cluster's node pools. The store hands back the live
+     * record, so attaching pools to it directly would write a stale pool snapshot back to disk on
+     * the next flush — which the startup migration could then replay, resurrecting deleted pools.
+     * The read path has to stay side-effect free. */
     public StoredCluster getCluster(String project, String location, String clusterId) {
-        StoredCluster cluster = clusterStore.get(clusterKey(project, location, clusterId))
+        StoredCluster stored = clusterStore.get(clusterKey(project, location, clusterId))
                 .orElseThrow(() -> GcpException.notFound("Not found: cluster " + clusterId));
-        cluster.setNodePools(listNodePools(project, location, clusterId));
-        return cluster;
+        return withNodePools(stored);
     }
 
     public List<StoredCluster> listClusters(String project, String location) {
         return clusterStore.scan(k -> true).stream()
                 .filter(c -> project.equals(c.getProject()) && location.equals(c.getLocation()))
-                .peek(c -> c.setNodePools(listNodePools(project, location, c.getName())))
+                .map(this::withNodePools)
                 .toList();
+    }
+
+    private StoredCluster withNodePools(StoredCluster stored) {
+        StoredCluster view = new StoredCluster(stored);
+        view.setNodePools(listNodePools(stored.getProject(), stored.getLocation(), stored.getName()));
+        return view;
     }
 
     public StoredOperation deleteCluster(String project, String location, String clusterId) {
@@ -285,6 +305,15 @@ public class GkeService {
             String desiredNodeVersion = (String) updateMap.get("desiredNodeVersion");
             if (desiredNodeVersion != null) {
                 cluster.setCurrentNodeVersion(desiredNodeVersion);
+                // A cluster-wide node version update has to reach the pools as well. Each pool
+                // carries its own `version`, and GetNodePool/ListNodePools read it from the pool
+                // store, so updating only the cluster aggregate would report the new version on
+                // the cluster while every pool still reported the old one.
+                for (StoredNodePool pool : listNodePools(project, location, clusterId)) {
+                    pool.setVersion(desiredNodeVersion);
+                    pool.setEtag(newFingerprint());
+                    nodePoolStore.put(nodePoolKey(project, location, clusterId, pool.getName()), pool);
+                }
             }
             String desiredMasterVersion = (String) updateMap.get("desiredMasterVersion");
             if (desiredMasterVersion != null) {
@@ -418,15 +447,14 @@ public class GkeService {
         return operationService.createOperation(project, location, clusterId, OperationType.COMPLETE_IP_ROTATION);
     }
 
-    /** No real node-version upgrade is in flight in this emulator (node pools don't run real
-     * node VMs), so completing/rolling back an upgrade is an acknowledgment with no state to
-     * change beyond returning the operation — consistent with this emulator's synchronous,
-     * always-DONE operation model. */
-    public StoredOperation completeNodePoolUpgrade(String project, String location, String clusterId,
-                                                   String nodePoolId) {
+    /** {@code CompleteNodePoolUpgrade} returns {@code google.protobuf.Empty}, not an Operation
+     * (cluster_service.proto#L382-L388) — unlike {@code RollbackNodePoolUpgrade}, which really
+     * does return one. No real node-version upgrade is in flight in this emulator (node pools
+     * don't run real node VMs), so this is a validated acknowledgment with no state to change
+     * and no operation to report. */
+    public void completeNodePoolUpgrade(String project, String location, String clusterId,
+                                        String nodePoolId) {
         requireNodePool(project, location, clusterId, nodePoolId);
-        return operationService.createNodePoolOperation(
-                project, location, clusterId, nodePoolId, OperationType.COMPLETE_NODE_POOL_UPGRADE);
     }
 
     public StoredOperation rollbackNodePoolUpgrade(String project, String location, String clusterId,

@@ -3,6 +3,8 @@ package io.floci.gcp.services.gke.model;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -43,13 +45,13 @@ public class StoredCluster {
     private List<String> locations;
     private String loggingService;
     private String monitoringService;
-    // The node pool store (populated by GkeService.getCluster/listClusters before this is
-    // returned) is the real source of truth, not this field — but it is deliberately NOT
-    // @JsonIgnore'd, for two reasons: (1) clusters persisted by a version of floci-gcp before
-    // node pools had their own store embedded pools directly here, and GkeService migrates that
-    // embedded data into the node pool store on startup, which only works if Jackson still
-    // deserializes it; (2) no code path calls clusterStore.put() on an object that has had
-    // setNodePools() called on it, so this never round-trips a stale snapshot back to disk.
+    // The node pool store is the real source of truth, not this field, which is only populated
+    // on the detached copy that GkeService.getCluster/listClusters return. It is deliberately
+    // NOT @JsonIgnore'd: clusters persisted by a version of floci-gcp before node pools had
+    // their own store embedded their pools directly here, and the startup migration moves that
+    // data into the node pool store, which only works if Jackson still deserializes it. The
+    // migration clears this field once a cluster is migrated, so a persisted record only carries
+    // embedded pools while it still has un-migrated ones.
     private List<StoredNodePool> nodePools;
     private Map<String, String> resourceLabels;
     private String labelFingerprint;
@@ -67,6 +69,51 @@ public class StoredCluster {
     private String volumeName;
 
     public StoredCluster() {
+    }
+
+    /**
+     * Detached copy used to attach a node-pool view without mutating the persisted record.
+     *
+     * <p>{@code getCluster}/{@code listClusters} need to return a cluster carrying its node
+     * pools, but the store hands back the live object: calling {@code setNodePools} on it wrote
+     * a stale pool snapshot back to disk on the next flush, which the startup migration could
+     * then replay and resurrect deleted pools. Copying first keeps the read path side-effect
+     * free. Collections are copied defensively; {@code extraConfig} and {@code conditions} hold
+     * request-shaped values that are only ever replaced wholesale, so a shallow copy is enough.
+     */
+    public StoredCluster(StoredCluster other) {
+        this.name = other.name;
+        this.description = other.description;
+        this.project = other.project;
+        this.location = other.location;
+        this.zone = other.zone;
+        this.status = other.status;
+        this.statusMessage = other.statusMessage;
+        this.endpoint = other.endpoint;
+        this.caCertificate = other.caCertificate;
+        this.currentMasterVersion = other.currentMasterVersion;
+        this.currentNodeVersion = other.currentNodeVersion;
+        this.initialClusterVersion = other.initialClusterVersion;
+        this.initialNodeCount = other.initialNodeCount;
+        this.network = other.network;
+        this.subnetwork = other.subnetwork;
+        this.clusterIpv4Cidr = other.clusterIpv4Cidr;
+        this.locations = other.locations == null ? null : new ArrayList<>(other.locations);
+        this.loggingService = other.loggingService;
+        this.monitoringService = other.monitoringService;
+        this.nodePools = other.nodePools == null ? null : new ArrayList<>(other.nodePools);
+        this.resourceLabels = other.resourceLabels == null ? null : new LinkedHashMap<>(other.resourceLabels);
+        this.labelFingerprint = other.labelFingerprint;
+        this.createTime = other.createTime;
+        this.expireTime = other.expireTime;
+        this.selfLink = other.selfLink;
+        this.etag = other.etag;
+        this.conditions = other.conditions == null ? null : new ArrayList<>(other.conditions);
+        this.extraConfig = other.extraConfig == null ? null : new LinkedHashMap<>(other.extraConfig);
+        this.containerId = other.containerId;
+        this.hostPort = other.hostPort;
+        this.internalEndpoint = other.internalEndpoint;
+        this.volumeName = other.volumeName;
     }
 
     public String getName() {

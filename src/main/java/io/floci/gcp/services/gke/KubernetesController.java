@@ -381,7 +381,9 @@ public class KubernetesController {
             @PathParam("nodePoolId") String nodePoolId,
             Map<String, Object> body) {
 
-        return Response.ok(gkeService.completeNodePoolUpgrade(project, location, clusterId, nodePoolId)).build();
+        gkeService.completeNodePoolUpgrade(project, location, clusterId, nodePoolId);
+        // CompleteNodePoolUpgrade returns google.protobuf.Empty, which is `{}` over REST.
+        return Response.ok(Map.of()).build();
     }
 
     @POST
