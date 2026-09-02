@@ -117,11 +117,12 @@ public class GkeService {
      * their pools directly on the cluster record (just {@code name}/{@code status}, nothing
      * else). Without this, those pools would simply vanish after an upgrade — the node pool
      * store starts empty and nothing would ever populate it for a pre-existing cluster. Backfills
-     * the fields the embedded shape never had (project/location/clusterId/selfLink/etag/status)
-     * and moves each pool into the node pool store, then clears the embedded list so the cluster
-     * records that it has been migrated. Idempotent and resumable: pools already present in the
-     * store are skipped individually, so an interrupted run finishes on the next startup, and a
-     * pool deleted after migration is not resurrected. */
+     * the fields the embedded shape never had — project/location/clusterId/selfLink/etag/status,
+     * plus version/locations/initialNodeCount derived from the owning cluster — moves each pool
+     * into the node pool store, then clears the embedded list so the cluster records that it has
+     * been migrated. Idempotent and resumable: pools already present in the store are skipped
+     * individually, so an interrupted run finishes on the next startup, and a pool deleted after
+     * migration is not resurrected. */
     private void migrateEmbeddedNodePools() {
         for (StoredCluster cluster : clusterStore.scan(k -> true)) {
             List<StoredNodePool> embedded = cluster.getNodePools();
@@ -156,6 +157,24 @@ public class GkeService {
                 }
                 if (pool.getConditions() == null) {
                     pool.setConditions(List.of());
+                }
+                // The embedded shape carried only name and status, so version, locations and
+                // initialNodeCount arrive unset. Left alone they would surface through the
+                // standalone node pool API as null, null and 0, which reads to a refreshing
+                // client as real drift rather than as missing legacy data. Derive them from the
+                // owning cluster, which is where a pool created today gets them from anyway.
+                if (pool.getVersion() == null) {
+                    pool.setVersion(cluster.getCurrentNodeVersion() != null
+                            ? cluster.getCurrentNodeVersion() : DEFAULT_MASTER_VERSION);
+                }
+                if (pool.getLocations() == null || pool.getLocations().isEmpty()) {
+                    pool.setLocations(cluster.getLocations() != null && !cluster.getLocations().isEmpty()
+                            ? List.copyOf(cluster.getLocations())
+                            : List.of(cluster.getLocation()));
+                }
+                if (pool.getInitialNodeCount() <= 0) {
+                    pool.setInitialNodeCount(
+                            cluster.getInitialNodeCount() > 0 ? cluster.getInitialNodeCount() : 3);
                 }
                 nodePoolStore.put(poolKey, pool);
                 migrated++;

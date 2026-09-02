@@ -429,6 +429,7 @@ class GkeServiceTest {
         legacyCluster.setProject(PROJECT);
         legacyCluster.setLocation(LOCATION);
         legacyCluster.setStatus("RUNNING");
+        legacyCluster.setCurrentNodeVersion("1.29.0-gke.1");
         StoredNodePool embeddedPool = new StoredNodePool();
         embeddedPool.setName("default-pool");
         embeddedPool.setStatus("RUNNING");
@@ -451,6 +452,13 @@ class GkeServiceTest {
         assertEquals(LOCATION, migrated.get(0).getLocation());
         assertEquals("legacy-cluster", migrated.get(0).getClusterId());
         assertNotNull(migrated.get(0).getSelfLink());
+
+        // The embedded shape carried only name and status. Version, locations and node count must
+        // be derived from the owning cluster, or the standalone node pool API reports null, null
+        // and 0, which a refreshing client reads as real drift rather than missing legacy data.
+        assertEquals(legacyCluster.getCurrentNodeVersion(), migrated.get(0).getVersion());
+        assertEquals(List.of(LOCATION), migrated.get(0).getLocations());
+        assertEquals(3, migrated.get(0).getInitialNodeCount());
     }
 
     @Test
