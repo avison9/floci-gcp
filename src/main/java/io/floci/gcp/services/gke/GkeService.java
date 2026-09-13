@@ -332,19 +332,23 @@ public class GkeService {
                 // assigning first would leave a rejected request's version behind on it.
                 List<StoredNodePool> targets =
                         nodeVersionUpdateTargets(project, location, clusterId, updateMap);
-                cluster.setCurrentNodeVersion(desiredNodeVersion);
+                String nodeVersion = resolveNodeVersion(desiredNodeVersion, cluster);
+                cluster.setCurrentNodeVersion(nodeVersion);
                 // The pool carries its own `version`, and GetNodePool/ListNodePools read it from
                 // the pool store, so moving only the cluster aggregate would report the new
                 // version on the cluster while the pool still reported the old one.
                 for (StoredNodePool pool : targets) {
-                    pool.setVersion(desiredNodeVersion);
+                    pool.setVersion(nodeVersion);
                     pool.setEtag(newFingerprint());
                     nodePoolStore.put(nodePoolKey(project, location, clusterId, pool.getName()), pool);
                 }
             }
             String desiredMasterVersion = (String) updateMap.get("desiredMasterVersion");
             if (desiredMasterVersion != null) {
-                cluster.setCurrentMasterVersion(desiredMasterVersion);
+                // Same aliases as UpdateMaster; gcloud sends "-" here for `clusters upgrade
+                // --master` without --cluster-version, which stored verbatim left the cluster
+                // reporting version "-".
+                cluster.setCurrentMasterVersion(resolveMasterVersion(desiredMasterVersion));
             }
             if (updateMap.get("desiredLocations") != null) {
                 cluster.setLocations(stringListField(updateMap, "desiredLocations", cluster.getLocations()));
@@ -839,6 +843,15 @@ public class GkeService {
         }
         throw GcpException.invalidArgument("Invalid master version \"" + requested
                 + "\": expected \"latest\", \"-\", \"1.X\", \"1.X.Y\" or \"1.X.Y-gke.N\"");
+    }
+
+    /** {@code desired_node_version} documents the same spellings as {@code master_version}
+     * with one difference: {@code "-"} "picks the Kubernetes master version", the cluster's
+     * current control plane version, not the server default that {@code "-"} means on the master
+     * field. The proto allows one {@code ClusterUpdate} field per request, so this reads the
+     * master version as stored, not one the same request might also be changing. */
+    private static String resolveNodeVersion(String requested, StoredCluster cluster) {
+        return "-".equals(requested) ? cluster.getCurrentMasterVersion() : resolveMasterVersion(requested);
     }
 
     /** The node pools an {@code UpdateCluster} carrying {@code desiredNodeVersion} upgrades.

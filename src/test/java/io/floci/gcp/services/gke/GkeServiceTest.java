@@ -756,6 +756,48 @@ class GkeServiceTest {
     }
 
     @Test
+    void updateClusterResolvesDesiredMasterVersionAliases() {
+        // gcloud `container clusters upgrade C --master` sends desiredMasterVersion "-" when no
+        // --cluster-version is given; stored verbatim, the cluster then reported version "-".
+        service.createCluster(PROJECT, LOCATION, Map.of("name", "master-alias",
+                "initialClusterVersion", "1.29.0-gke.1"));
+        String advertised = (String) service.getServerConfig().get("defaultClusterVersion");
+
+        service.updateCluster(PROJECT, LOCATION, "master-alias", Map.of("desiredMasterVersion", "-"));
+        assertEquals(advertised, service.getCluster(PROJECT, LOCATION, "master-alias").getCurrentMasterVersion());
+
+        service.updateCluster(PROJECT, LOCATION, "master-alias", Map.of("desiredMasterVersion", "1.29.0-gke.1"));
+        service.updateCluster(PROJECT, LOCATION, "master-alias", Map.of("desiredMasterVersion", "latest"));
+        assertEquals(advertised, service.getCluster(PROJECT, LOCATION, "master-alias").getCurrentMasterVersion());
+
+        // An explicit version is still stored verbatim, and node versions do not move with the master.
+        service.updateCluster(PROJECT, LOCATION, "master-alias", Map.of("desiredMasterVersion", "1.31.5-gke.1"));
+        StoredCluster cluster = service.getCluster(PROJECT, LOCATION, "master-alias");
+        assertEquals("1.31.5-gke.1", cluster.getCurrentMasterVersion());
+        assertEquals("1.29.0-gke.1", cluster.getCurrentNodeVersion());
+    }
+
+    @Test
+    void updateClusterResolvesDesiredNodeVersionAliasesAgainstTheMaster() {
+        // desired_node_version documents the same aliases as the master field, except that "-"
+        // "picks the Kubernetes master version": the cluster's control plane, not the server default.
+        service.createCluster(PROJECT, LOCATION, Map.of("name", "node-alias",
+                "initialClusterVersion", "1.29.0-gke.1"));
+        String advertised = (String) service.getServerConfig().get("defaultClusterVersion");
+        assertNotEquals(advertised, "1.29.0-gke.1");
+
+        service.updateCluster(PROJECT, LOCATION, "node-alias", Map.of("desiredNodeVersion", "latest"));
+        assertEquals(advertised, service.getCluster(PROJECT, LOCATION, "node-alias").getCurrentNodeVersion());
+        assertEquals(advertised, service.getNodePool(PROJECT, LOCATION, "node-alias", "default-pool").getVersion());
+
+        service.updateCluster(PROJECT, LOCATION, "node-alias", Map.of("desiredNodeVersion", "-"));
+        StoredCluster cluster = service.getCluster(PROJECT, LOCATION, "node-alias");
+        assertEquals("1.29.0-gke.1", cluster.getCurrentMasterVersion());
+        assertEquals("1.29.0-gke.1", cluster.getCurrentNodeVersion());
+        assertEquals("1.29.0-gke.1", service.getNodePool(PROJECT, LOCATION, "node-alias", "default-pool").getVersion());
+    }
+
+    @Test
     void updateClusterMergesDesiredFieldsIntoExtraConfig() {
         service.createCluster(PROJECT, LOCATION, Map.of("name", "updatable"));
 
