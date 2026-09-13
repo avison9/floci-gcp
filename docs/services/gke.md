@@ -176,6 +176,11 @@ analysis, since floci-gcp has no real infrastructure behind them to inspect:
   omitted; with several it is required, and a request without it is rejected
   as `400 INVALID_ARGUMENT` rather than silently upgrading pools the caller
   did not name.
+  `desiredMasterVersion` and `desiredNodeVersion` accept the same aliases as
+  `UpdateMaster` below, with the documented difference that `-` on the node side
+  picks the cluster's current master version rather than the server default. This
+  is what `gcloud container clusters upgrade` sends when no `--cluster-version` is
+  given, so both forms of that command leave the cluster on a real version.
 - `UpdateMaster` moves only the control plane: `currentMasterVersion` changes and
   `currentNodeVersion` and every node pool's `version` stay as they were, as in real
   GKE, where the master and node pools upgrade independently. `masterVersion` is
