@@ -181,9 +181,11 @@ analysis, since floci-gcp has no real infrastructure behind them to inspect:
   GKE, where the master and node pools upgrade independently. `masterVersion` is
   required (`400 INVALID_ARGUMENT` when missing). The aliases the API documents
   resolve against this emulator's single advertised version: `latest`, `-`, and a
-  `1.X` / `1.X.Y` prefix of it all pick that version; any other explicit version is
-  stored verbatim, as `CreateCluster` and `UpdateCluster` already do. The operation
-  is reported as `UPGRADE_MASTER`, the `Operation.Type` real GKE uses.
+  `1.X` / `1.X.Y` prefix of it all pick that version; any other `1.X.Y-gke.N` (or an
+  unmatched `1.X` / `1.X.Y`) is stored verbatim, as `CreateCluster` and `UpdateCluster`
+  already do. A value outside those five documented shapes (a bare `1`, for example)
+  is rejected with `400 INVALID_ARGUMENT`, as real GKE does. The operation is
+  reported as `UPGRADE_MASTER`, the `Operation.Type` real GKE uses.
 
 **Autopilot mode** (`autopilot.enabled`) and **Fleet/Anthos registration**
 (`fleet`) are not semantically modeled — floci-gcp does not run a real
