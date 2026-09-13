@@ -108,6 +108,26 @@ class GkeUpdateMasterRestIntegrationTest {
     }
 
     @Test
+    void updateMasterRejectsAnUndocumentedVersionShape() {
+        String cluster = "bad-shape";
+        given()
+                .contentType("application/json")
+                .body("{\"cluster\":{\"name\":\"" + cluster + "\"}}")
+                .when().post(BASE + "/clusters")
+                .then()
+                .statusCode(200);
+
+        given()
+                .urlEncodingEnabled(false)
+                .contentType("application/json")
+                .body("{\"masterVersion\":\"1\"}")
+                .when().post(BASE + "/clusters/" + cluster + ":updateMaster")
+                .then()
+                .statusCode(400)
+                .body("error.status", equalTo("INVALID_ARGUMENT"));
+    }
+
+    @Test
     void updateMasterOnAMissingClusterIs404() {
         given()
                 .urlEncodingEnabled(false)

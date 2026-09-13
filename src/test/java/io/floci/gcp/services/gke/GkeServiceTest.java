@@ -357,6 +357,29 @@ class GkeServiceTest {
     }
 
     @Test
+    void updateMasterRejectsAVersionShapeTheFieldDoesNotDocument() {
+        // master_version documents "latest", "-", "1.X", "1.X.Y" and "1.X.Y-gke.N" only. A bare
+        // major is none of those, and must not be resolved just because it happens to be a
+        // character prefix of the advertised version (review follow-up on #192).
+        service.createCluster(PROJECT, LOCATION, Map.of("name", "shape-cluster"));
+        StoredCluster before = service.getCluster(PROJECT, LOCATION, "shape-cluster");
+
+        for (String bad : List.of("1", "1.", "v1.30", "banana", "1.30.5-gke", "1.30.5-gke.")) {
+            GcpException ex = assertThrows(GcpException.class,
+                    () -> service.updateMaster(PROJECT, LOCATION, "shape-cluster", Map.of("masterVersion", bad)),
+                    bad);
+            assertEquals(400, ex.getHttpStatus(), bad);
+        }
+        StoredCluster after = service.getCluster(PROJECT, LOCATION, "shape-cluster");
+        assertEquals(before.getCurrentMasterVersion(), after.getCurrentMasterVersion());
+        assertEquals(before.getEtag(), after.getEtag());
+
+        // An explicit 1.X.Y-gke.N that is not the advertised version is still kept verbatim.
+        service.updateMaster(PROJECT, LOCATION, "shape-cluster", Map.of("masterVersion", "1.31.5-gke.1"));
+        assertEquals("1.31.5-gke.1", service.getCluster(PROJECT, LOCATION, "shape-cluster").getCurrentMasterVersion());
+    }
+
+    @Test
     void updateMasterRejectsAMissingVersionWithoutTouchingTheCluster() {
         service.createCluster(PROJECT, LOCATION, Map.of("name", "needs-version"));
         StoredCluster before = service.getCluster(PROJECT, LOCATION, "needs-version");

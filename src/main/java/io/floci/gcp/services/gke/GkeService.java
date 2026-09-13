@@ -43,6 +43,10 @@ public class GkeService {
     private static final String DEFAULT_NODE_POOL_NAME = "default-pool";
     private static final Pattern VALID_CLUSTER_NAME =
             Pattern.compile("^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$");
+    /** {@code 1.X} / {@code 1.X.Y}: the two prefix aliases a version field documents. */
+    private static final Pattern VERSION_PREFIX_ALIAS = Pattern.compile("^\\d+\\.\\d+(?:\\.\\d+)?$");
+    /** {@code 1.X.Y-gke.N}: an explicit GKE version. */
+    private static final Pattern EXPLICIT_VERSION = Pattern.compile("^\\d+\\.\\d+\\.\\d+-gke\\.\\d+$");
     private static final Pattern VALID_NODE_POOL_NAME =
             Pattern.compile("^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$");
 
@@ -808,20 +812,33 @@ public class GkeService {
                 .orElseThrow(() -> GcpException.notFound("Not found: nodePool " + nodePoolId));
     }
 
-    /** Resolves the version aliases {@code master_version} accepts (cluster_service.proto,
+    /** Resolves the version spellings {@code master_version} accepts (cluster_service.proto,
      * {@code UpdateMasterRequest}): {@code "latest"} and {@code "-"} pick the highest valid and
      * the default version respectively, and {@code "1.X"} / {@code "1.X.Y"} pick the highest
      * valid version under that prefix. {@link #getServerConfig()} advertises exactly one valid
-     * master version, so every alias that matches it resolves to it. An explicit version that is
-     * not the advertised one is kept verbatim, as {@code createCluster} and {@code UpdateCluster}
-     * already do, so clients pinning a specific version keep working against the emulator. */
+     * master version, so every alias that matches it resolves to it. An explicit
+     * {@code 1.X.Y-gke.N} that is not the advertised one is kept verbatim, as {@code createCluster}
+     * and {@code UpdateCluster} already do, so clients pinning a specific version keep working
+     * against the emulator; a {@code 1.X} / {@code 1.X.Y} alias that matches nothing is kept the
+     * same way rather than failing on a catalogue this emulator does not have.
+     *
+     * <p>Anything outside those five shapes is rejected. The prefix test alone would also accept
+     * a bare major ({@code "1"} is a character prefix of {@code "1.30..."}), which the field does
+     * not document and real GKE rejects. */
     private static String resolveMasterVersion(String requested) {
-        if ("latest".equals(requested) || "-".equals(requested)
-                || DEFAULT_MASTER_VERSION.startsWith(requested + ".")
-                || DEFAULT_MASTER_VERSION.startsWith(requested + "-")) {
+        if ("latest".equals(requested) || "-".equals(requested)) {
             return DEFAULT_MASTER_VERSION;
         }
-        return requested;
+        if (VERSION_PREFIX_ALIAS.matcher(requested).matches()) {
+            return DEFAULT_MASTER_VERSION.startsWith(requested + ".")
+                    || DEFAULT_MASTER_VERSION.startsWith(requested + "-")
+                    ? DEFAULT_MASTER_VERSION : requested;
+        }
+        if (EXPLICIT_VERSION.matcher(requested).matches()) {
+            return requested;
+        }
+        throw GcpException.invalidArgument("Invalid master version \"" + requested
+                + "\": expected \"latest\", \"-\", \"1.X\", \"1.X.Y\" or \"1.X.Y-gke.N\"");
     }
 
     /** The node pools an {@code UpdateCluster} carrying {@code desiredNodeVersion} upgrades.
