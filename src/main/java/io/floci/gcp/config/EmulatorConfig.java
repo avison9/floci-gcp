@@ -323,6 +323,12 @@ public interface EmulatorConfig {
         @WithDefault("postgres:18.4-alpine")
         String postgres18Image();
 
+        @WithDefault("mysql:8.0.46")
+        String mysql80Image();
+
+        @WithDefault("mysql:8.4.11")
+        String mysql84Image();
+
         @WithDefault("90")
         int startupTimeoutSeconds();
     }

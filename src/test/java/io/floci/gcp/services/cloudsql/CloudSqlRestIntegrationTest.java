@@ -291,12 +291,12 @@ class CloudSqlRestIntegrationTest {
     }
 
     @Test
-    void cloudSqlRejectsNonPostgresInstancesAndMissingResourcesUseGcpErrors() {
+    void cloudSqlRejectsUnsupportedEnginesAndMissingResourcesUseGcpErrors() {
         String project = "sql-it-errors";
 
         given()
                 .contentType("application/json")
-                .body("{\"name\":\"mysql-main\",\"databaseVersion\":\"MYSQL_8_0\"}")
+                .body("{\"name\":\"mssql-main\",\"databaseVersion\":\"SQLSERVER_2019_STANDARD\"}")
                 .when().post("/v1/projects/" + project + "/instances")
                 .then()
                 .statusCode(400)

@@ -152,7 +152,7 @@ GCP's official emulators are fragmented: each service ships its own binary, runs
 | GKE (Kubernetes Engine) | ✅ | ❌ |
 | Cloud Run | ✅ | ❌ |
 | Cloud Functions | ✅ | ❌ |
-| Cloud SQL for PostgreSQL | ✅ | ❌ |
+| Cloud SQL for PostgreSQL and MySQL | ✅ | ❌ |
 | Cloud Tasks | ✅ | ❌ |
 | Cloud Scheduler | ✅ | ❌ |
 | Cloud Monitoring | ✅ | ❌ |
@@ -181,7 +181,7 @@ flowchart LR
         end
 
         subgraph Docker ["Docker-backed"]
-            C["Managed Kafka (Redpanda)\nCloud SQL (Postgres)\nCloud Run\nGKE (k3s)"]
+            C["Managed Kafka (Redpanda)\nCloud SQL (Postgres, MySQL)\nCloud Run\nGKE (k3s)"]
         end
 
         Router --> GRPC
@@ -207,7 +207,7 @@ floci-gcp emulates GCP services across storage, messaging, identity, and managed
 | Container orchestration | GKE (Kubernetes Engine) |
 | Serverless control planes | Cloud Run, Cloud Functions |
 | Task scheduling | Cloud Tasks, Cloud Scheduler |
-| Databases | Cloud SQL for PostgreSQL |
+| Databases | Cloud SQL for PostgreSQL and MySQL |
 | Analytics | BigQuery (Phase 1) |
 | Observability | Cloud Logging, Cloud Monitoring |
 | API management | Service Usage, Cloud Resource Manager (`projects.get` and IAM policy mixins) |
@@ -231,7 +231,7 @@ floci-gcp emulates GCP services across storage, messaging, identity, and managed
 | **Cloud Run** | REST JSON | Services, IAM policies, revisions, long-running operations; Docker-backed invocation on by default (set `FLOCI_GCP_SERVICES_CLOUDRUN_MOCK=true` for control plane only) |
 | **Eventarc** | REST JSON | Trigger CRUD (`eventarc.googleapis.com` v1); delivers CloudEvents from Pub/Sub publishes and GCS object events to Cloud Run and HTTP endpoint destinations |
 | **Cloud Functions** | REST JSON | Functions, source upload URL generation, long-running operations; control plane only, no runtime invocation |
-| **Cloud SQL for PostgreSQL** | REST JSON | Instances (Postgres), control-plane lifecycle, long-running operations |
+| **Cloud SQL for PostgreSQL and MySQL** | REST JSON | Instances (PostgreSQL 15-18, MySQL 8.0/8.4), databases, users, long-running operations |
 | **Cloud Tasks** | gRPC | Queues (rate limits, retry config, pause/resume/purge), tasks (HTTP and App Engine targets, schedule time), `RunTask`; control plane only, tasks are tracked but not dispatched |
 | **Cloud Scheduler** | gRPC + REST JSON | Cron jobs with Pub/Sub, HTTP, and App Engine targets; `Pause`/`Resume`/`RunJob`; unix-cron + time zones; background tick fires due jobs (Pub/Sub publishes into the local backend) |
 | **Cloud Monitoring** | gRPC + REST JSON | Metric descriptors (create/get/list/delete), monitored resource descriptors, time series write (`CreateTimeSeries` with GCP validation rules) and read (`ListTimeSeries` with alignment/reduction subset and pagination) |
@@ -248,7 +248,7 @@ floci-gcp uses real Docker containers when in-process emulation would reduce fid
 | Service | Default image | What is real | Mock flag |
 |---|---|---|---|
 | Managed Kafka | `redpandadata/redpanda:latest` | Kafka-compatible broker via Redpanda | `FLOCI_GCP_SERVICES_KAFKA_MOCK` |
-| Cloud SQL for PostgreSQL | `postgres:15.18-alpine` (15-18) | PostgreSQL engine, JDBC-compatible access | `FLOCI_GCP_SERVICES_CLOUDSQL_MOCK` |
+| Cloud SQL for PostgreSQL and MySQL | `postgres:15.18-alpine` (15-18), `mysql:8.0.46` / `mysql:8.4.11` | PostgreSQL or MySQL engine, JDBC-compatible access | `FLOCI_GCP_SERVICES_CLOUDSQL_MOCK` |
 | Cloud Run | User-specified container image | Image-based service execution and request serving | `FLOCI_GCP_SERVICES_CLOUDRUN_MOCK` |
 | GKE (Kubernetes Engine) | `rancher/k3s:latest` | Real k3s Kubernetes clusters reachable via kubectl | `FLOCI_GCP_SERVICES_GKE_MOCK` |
 
@@ -270,6 +270,8 @@ docker run -d --name floci-gcp \
 | `FLOCI_GCP_SERVICES_CLOUDSQL_POSTGRES16_IMAGE` | `postgres:16.14-alpine` |
 | `FLOCI_GCP_SERVICES_CLOUDSQL_POSTGRES17_IMAGE` | `postgres:17.10-alpine` |
 | `FLOCI_GCP_SERVICES_CLOUDSQL_POSTGRES18_IMAGE` | `postgres:18.4-alpine` |
+| `FLOCI_GCP_SERVICES_CLOUDSQL_MYSQL80_IMAGE` | `mysql:8.0.46` |
+| `FLOCI_GCP_SERVICES_CLOUDSQL_MYSQL84_IMAGE` | `mysql:8.4.11` |
 | `FLOCI_GCP_SERVICES_GKE_DEFAULT_IMAGE` | `rancher/k3s:latest` |
 
 ## Persistence and Storage Modes

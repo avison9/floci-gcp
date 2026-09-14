@@ -134,6 +134,8 @@ Some services (e.g. Managed Kafka) start real sidecar containers via the host Do
 | `FLOCI_GCP_SERVICES_CLOUDSQL_POSTGRES16_IMAGE` | `postgres:16.14-alpine` | Docker image used for `POSTGRES_16` instances |
 | `FLOCI_GCP_SERVICES_CLOUDSQL_POSTGRES17_IMAGE` | `postgres:17.10-alpine` | Docker image used for `POSTGRES_17` instances |
 | `FLOCI_GCP_SERVICES_CLOUDSQL_POSTGRES18_IMAGE` | `postgres:18.4-alpine` | Docker image used for `POSTGRES_18` instances |
+| `FLOCI_GCP_SERVICES_CLOUDSQL_MYSQL80_IMAGE` | `mysql:8.0.46` | Docker image used for `MYSQL_8_0` and `MYSQL_8_0_NN` instances |
+| `FLOCI_GCP_SERVICES_CLOUDSQL_MYSQL84_IMAGE` | `mysql:8.4.11` | Docker image used for `MYSQL_8_4` instances |
 | `FLOCI_GCP_SERVICES_CLOUDSQL_STARTUP_TIMEOUT_SECONDS` | `90` | Max time to wait for PostgreSQL readiness after container start |
 
 ### GKE (Kubernetes Engine)
