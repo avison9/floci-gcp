@@ -351,6 +351,20 @@ class CloudSqlServiceTest {
     }
 
     @Test
+    void unsupportedVersionsAreRejectedEvenWithoutADataPlane() {
+        // Mock mode has no image lookup, so the version check must not live only in the plane.
+        withProject("project-a");
+        for (String version : List.of("MYSQL_5_7", "MYSQL_9_0", "MYSQL_8_00", "POSTGRES_14", "POSTGRES_99")) {
+            GcpException error = assertThrows(GcpException.class,
+                    () -> service.createInstance("project-a", Map.of("name", "v", "databaseVersion", version)), version);
+            assertEquals("INVALID_ARGUMENT", error.getGcpStatus());
+        }
+        for (String version : List.of("POSTGRES_15", "POSTGRES_18", "MYSQL_8_0", "MYSQL_8_0_36", "MYSQL_8_4")) {
+            service.createInstance("project-a", Map.of("name", "ok-" + version.toLowerCase(), "databaseVersion", version));
+        }
+    }
+
+    @Test
     void unsupportedEnginesAreRejected() {
         for (String version : List.of("SQLSERVER_2019_STANDARD", "", "ORACLE")) {
             GcpException error = assertThrows(GcpException.class,

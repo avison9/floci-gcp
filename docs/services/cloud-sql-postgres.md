@@ -51,7 +51,8 @@ Creating an instance accepts PostgreSQL (`POSTGRES_15` to `POSTGRES_18`) and MyS
 `MYSQL_8_0_NN`, `MYSQL_8_4`) `databaseVersion` values, starts the matching Docker container, stores a
 `RUNNABLE` instance resource, seeds the engine's system database metadata (`postgres`; or
 `information_schema`, `mysql`, `performance_schema`, `sys`), and returns an immediately completed
-`sql#operation`. Any other engine (SQL Server) is rejected with `400 INVALID_ARGUMENT`.
+`sql#operation`. Any other engine (SQL Server) or version is rejected with `400 INVALID_ARGUMENT`, in
+mock mode as well.
 
 `instances.insert` returns only once the engine accepts connections. PostgreSQL is ready in a few
 seconds; a MySQL instance initialises its data directory first and typically takes 15 to 25 seconds
