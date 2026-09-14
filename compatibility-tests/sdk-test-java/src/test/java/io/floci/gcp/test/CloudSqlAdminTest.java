@@ -95,6 +95,10 @@ class CloudSqlAdminTest {
                 assertThat(users).extracting(User::getName).contains("root");
                 assertThat(users).filteredOn(user -> USER_ID.equals(user.getName()))
                         .extracting(User::getHost).containsExactly("%");
+            } else {
+                // The postgres admin role the instance is provisioned with is listed too.
+                assertThat(users).filteredOn(user -> "postgres".equals(user.getName()))
+                        .extracting(User::getType).containsExactly("BUILT_IN");
             }
 
             DatabaseInstance running = client.instances().get(PROJECT_ID, instanceId).execute();

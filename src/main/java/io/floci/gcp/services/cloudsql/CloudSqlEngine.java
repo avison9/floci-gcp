@@ -14,9 +14,9 @@ import java.util.regex.Pattern;
  */
 enum CloudSqlEngine {
 
-    /** PostgreSQL: one {@code postgres} database, roles have no host. */
+    /** PostgreSQL: one {@code postgres} database, roles have no host, {@code postgres} is the admin role. */
     POSTGRES("PostgreSQL", "POSTGRES_", "^POSTGRES_1[5-8]$", "POSTGRES_15 to POSTGRES_18",
-            List.of("postgres"), "UTF8", "en_US.UTF8", null, null),
+            List.of("postgres"), "UTF8", "en_US.UTF8", null, "postgres"),
 
     /**
      * MySQL: the four system schemas a fresh Cloud SQL MySQL instance lists, {@code utf8mb4}
