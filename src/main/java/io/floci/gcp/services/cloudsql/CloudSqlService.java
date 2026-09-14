@@ -104,8 +104,31 @@ public class CloudSqlService {
                         CloudSqlLegacyController.class, CloudSqlGlobalController.class,
                         CloudSqlV1Beta4GlobalController.class, CloudSqlLegacyGlobalController.class)
                 .build());
+        if (config.services().cloudsql().enabled()) {
+            backfillBuiltInUsers();
+        }
         if (config.services().cloudsql().enabled() && dataPlaneEnabled) {
             restartPersistedInstances();
+        }
+    }
+
+    /**
+     * Instances persisted by a build that did not list the engine's built-in user gain it on
+     * startup, so {@code users.list} answers the same before and after an upgrade. Idempotent,
+     * and never overwrites a user record that already exists.
+     */
+    void backfillBuiltInUsers() {
+        for (Map<String, Object> instance : allInstances()) {
+            String project = stringValue(instance.get("project"));
+            String name = stringValue(instance.get("name"));
+            if (project == null || name == null) {
+                continue;
+            }
+            try {
+                createBuiltInUser(project, name, engineOf(instance));
+            } catch (GcpException e) {
+                LOG.warnf("Skipping built-in user backfill project=%s instance=%s: %s", project, name, e.getMessage());
+            }
         }
     }
 
@@ -509,8 +532,8 @@ public class CloudSqlService {
         }
         String host = engine.normalizeHost(null);
         String key = userKey(instance, user, host);
-        if (userStore.get(key).isEmpty()) {
-            userStore.put(key, normalizeUser(project, instance, user, host, Map.of("name", user)));
+        if (getForProject(userStore, project, key).isEmpty()) {
+            putForProject(userStore, project, key, normalizeUser(project, instance, user, host, Map.of("name", user)));
         }
     }
 
@@ -527,6 +550,25 @@ public class CloudSqlService {
             throw GcpException.invalidArgument("databaseVersion cannot change the instance engine from "
                     + engineOf(existing) + " to " + CloudSqlEngine.fromDatabaseVersion(requested));
         }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static java.util.Optional<Map<String, Object>> getForProject(
+            StorageBackend<String, Map<String, Object>> store, String project, String key) {
+        if (store instanceof ProjectAwareStorageBackend<?> projectAware) {
+            return ((ProjectAwareStorageBackend<Map<String, Object>>) projectAware).getForProject(project, key);
+        }
+        return store.get(key);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void putForProject(StorageBackend<String, Map<String, Object>> store, String project,
+                                      String key, Map<String, Object> value) {
+        if (store instanceof ProjectAwareStorageBackend<?> projectAware) {
+            ((ProjectAwareStorageBackend<Map<String, Object>>) projectAware).putForProject(project, key, value);
+            return;
+        }
+        store.put(key, value);
     }
 
     private CloudSqlEngine engineOf(Map<String, Object> instanceMetadata) {

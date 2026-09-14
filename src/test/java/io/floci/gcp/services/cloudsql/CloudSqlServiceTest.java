@@ -150,6 +150,9 @@ class CloudSqlServiceTest {
         assertEquals(List.of(
                 "start:project-a/pg-main",
                 "create-db:appdb:UTF8/en_US.UTF8",
+                // the built-in postgres user is listed, so it is offered the database like any
+                // other; the PostgreSQL plane itself leaves the admin role alone.
+                "grant:appdb:postgres",
                 "create-user:app:secret",
                 "grant:postgres:app",
                 "grant:appdb:app",
@@ -503,6 +506,55 @@ class CloudSqlServiceTest {
         Map<String, Object> latin = dataPlaneService.getDatabase("project-a", "my-main", "latin");
         assertEquals("latin1", latin.get("charset"));
         assertFalse(latin.containsKey("collation"));
+    }
+
+    @Test
+    void postgresInstanceListsTheBuiltInPostgresUserAndProtectsIt() {
+        withProject("project-a");
+        service.createInstance("project-a", Map.of("name", "pg-main", "databaseVersion", "POSTGRES_18"));
+
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> users =
+                (List<Map<String, Object>>) service.listUsers("project-a", "pg-main").get("items");
+        assertEquals(1, users.size());
+        assertEquals("postgres", users.get(0).get("name"));
+        assertEquals("BUILT_IN", users.get(0).get("type"));
+        assertNull(users.get(0).get("host"));
+        assertEquals("postgres", service.getUser("project-a", "pg-main", "postgres", null).get("name"));
+
+        // users.update is accepted (real Cloud SQL lets the password be rotated) and stays password-free.
+        service.updateUser("project-a", "pg-main", "postgres", null, Map.of("password", "rotated"));
+        assertFalse(service.getUser("project-a", "pg-main", "postgres", null).containsKey("password"));
+
+        GcpException error = assertThrows(GcpException.class,
+                () -> service.deleteUser("project-a", "pg-main", "postgres", null));
+        assertEquals("FAILED_PRECONDITION", error.getGcpStatus());
+        assertEquals(1, ((List<?>) service.listUsers("project-a", "pg-main").get("items")).size());
+    }
+
+    @Test
+    void startupBackfillsTheBuiltInUserOnInstancesPersistedWithoutIt() {
+        withProject("project-a");
+        StorageBackend<String, Map<String, Object>> instances = projectAwareStore();
+        StorageBackend<String, Map<String, Object>> users = projectAwareStore();
+        // An instance written by a build that predates built-in users: no users at all.
+        instances.put("instances/legacy", new java.util.LinkedHashMap<>(Map.of(
+                "name", "legacy", "project", "project-a", "databaseVersion", "POSTGRES_16")));
+        CloudSqlService upgraded = new CloudSqlService(instances, projectAwareStore(), users,
+                projectAwareStore(), new ObjectMapper(), "http://localhost:4588");
+
+        upgraded.backfillBuiltInUsers();
+
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> listed =
+                (List<Map<String, Object>>) upgraded.listUsers("project-a", "legacy").get("items");
+        assertEquals(List.of("postgres"), listed.stream().map(u -> u.get("name")).toList());
+
+        // Idempotent, and never clobbers a user record that already exists.
+        upgraded.updateUser("project-a", "legacy", "postgres", null, Map.of("etag", "keep-me"));
+        upgraded.backfillBuiltInUsers();
+        assertEquals("keep-me", upgraded.getUser("project-a", "legacy", "postgres", null).get("etag"));
+        assertEquals(1, ((List<?>) upgraded.listUsers("project-a", "legacy").get("items")).size());
     }
 
     private static class RecordingDataPlane implements CloudSqlDataPlane {

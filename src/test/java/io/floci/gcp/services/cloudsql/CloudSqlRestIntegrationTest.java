@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.everyItem;
 import static org.hamcrest.Matchers.hasItem;
 import static org.hamcrest.Matchers.nullValue;
 
@@ -157,7 +158,9 @@ class CloudSqlRestIntegrationTest {
                 .statusCode(200)
                 .body("kind", equalTo("sql#usersList"))
                 .body("items.name", hasItem("app"))
-                .body("items[0].password", nullValue());
+                // the built-in admin role is listed like real Cloud SQL does
+                .body("items.find { it.name == 'postgres' }.type", equalTo("BUILT_IN"))
+                .body("items.password", everyItem(nullValue()));
 
         given()
                 .when().get(base + "/instances/" + instance + "/users/app")

@@ -74,6 +74,9 @@ Database and user Admin API operations are synchronized into the backing Postgre
 - `users.insert` and `users.update` create/update PostgreSQL login roles.
 - `users.delete` drops objects owned by the role in known databases, then drops the role.
 - Created users receive connect/create privileges on existing and newly created databases.
+- `users.list` includes the `postgres` role the instance is provisioned with (`type: BUILT_IN`).
+  It cannot be deleted, and a password update on it is acknowledged without changing the server;
+  instances persisted by an older floci-gcp gain the entry on the next start.
 
 On a MySQL instance the same operations are synchronized into the backing MySQL server, with the
 engine's own identity model:

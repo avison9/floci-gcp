@@ -106,9 +106,17 @@ public class CloudSqlPostgresDataPlane extends CloudSqlContainerDataPlane {
                 "Could not delete PostgreSQL database " + database);
     }
 
-    /** PostgreSQL roles carry no host; the control plane never passes one for this engine. */
+    /**
+     * PostgreSQL roles carry no host; the control plane never passes one for this engine. The
+     * {@code postgres} role is the emulator's own admin login, so a {@code users.update} on it is
+     * acknowledged without altering the server: rotating it would strand every later DDL call.
+     */
     @Override
     public void createOrUpdateUser(Map<String, Object> instanceMetadata, String user, String host, String password) {
+        if (ADMIN_USER.equals(user)) {
+            LOG.debugv("Leaving the PostgreSQL admin role {0} unchanged; its password is fixed in the emulator", user);
+            return;
+        }
         String secret = password == null || password.isBlank() ? ADMIN_PASSWORD : password;
         String verb = roleExists(instanceMetadata, user) ? "ALTER ROLE " : "CREATE ROLE ";
         runSql(instanceMetadata, "postgres",
@@ -131,6 +139,9 @@ public class CloudSqlPostgresDataPlane extends CloudSqlContainerDataPlane {
 
     @Override
     public void grantDatabaseAccess(Map<String, Object> instanceMetadata, String database, String user, String host) {
+        if (ADMIN_USER.equals(user)) {
+            return; // superuser already; nothing to grant
+        }
         runSql(instanceMetadata, "postgres",
                 "GRANT CONNECT, CREATE ON DATABASE " + quoteIdentifier(database) + " TO " + quoteIdentifier(user),
                 "Could not grant PostgreSQL database access");
