@@ -10,7 +10,8 @@ interface CloudSqlDataPlane {
 
     void stopInstance(String project, String instance, Map<String, Object> metadata, boolean removeStorage);
 
-    void createDatabase(Map<String, Object> instanceMetadata, String database);
+    /** {@code charset} / {@code collation} are the values the stored resource reports (engine defaults when unset). */
+    void createDatabase(Map<String, Object> instanceMetadata, String database, String charset, String collation);
 
     void deleteDatabase(Map<String, Object> instanceMetadata, String database);
 
@@ -39,7 +40,8 @@ interface CloudSqlDataPlane {
             }
 
             @Override
-            public void createDatabase(Map<String, Object> instanceMetadata, String database) {
+            public void createDatabase(Map<String, Object> instanceMetadata, String database, String charset,
+                                       String collation) {
             }
 
             @Override

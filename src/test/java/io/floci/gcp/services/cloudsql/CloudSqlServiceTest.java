@@ -363,6 +363,72 @@ class CloudSqlServiceTest {
         assertEquals("INVALID_ARGUMENT", missing.getGcpStatus());
     }
 
+    @Test
+    void instanceEngineCannotBeChangedByPatchOrUpdate() {
+        withProject("project-a");
+        service.createInstance("project-a", Map.of("name", "pg-main", "databaseVersion", "POSTGRES_16"));
+
+        GcpException patch = assertThrows(GcpException.class,
+                () -> service.patchInstance("project-a", "pg-main", Map.of("databaseVersion", "MYSQL_8_4")));
+        assertEquals("INVALID_ARGUMENT", patch.getGcpStatus());
+        GcpException update = assertThrows(GcpException.class,
+                () -> service.updateInstance("project-a", "pg-main", Map.of("databaseVersion", "MYSQL_8_0")));
+        assertEquals("INVALID_ARGUMENT", update.getGcpStatus());
+        assertEquals("POSTGRES_16", service.getInstance("project-a", "pg-main").get("databaseVersion"));
+
+        // Same-engine version changes keep their pre-existing behaviour.
+        service.patchInstance("project-a", "pg-main", Map.of("databaseVersion", "POSTGRES_17"));
+        assertEquals("POSTGRES_17", service.getInstance("project-a", "pg-main").get("databaseVersion"));
+    }
+
+    @Test
+    void patchDoesNotPersistRootPassword() {
+        withProject("project-a");
+        service.createInstance("project-a", Map.of("name", "my-main", "databaseVersion", "MYSQL_8_0"));
+
+        service.patchInstance("project-a", "my-main", Map.of("rootPassword", "hunter2", "settings", Map.of("tier", "db-custom-2-7680")));
+
+        Map<String, Object> instance = service.getInstance("project-a", "my-main");
+        assertFalse(instance.containsKey("rootPassword"));
+        assertEquals("db-custom-2-7680", ((Map<?, ?>) instance.get("settings")).get("tier"));
+    }
+
+    @Test
+    void onlyTheProvisionedRootIdentityIsProtected() {
+        withProject("project-a");
+        RecordingDataPlane dataPlane = new RecordingDataPlane();
+        CloudSqlService dataPlaneService = new CloudSqlService(
+                projectAwareStore(), projectAwareStore(), projectAwareStore(), projectAwareStore(),
+                new ObjectMapper(), "http://localhost:4588", dataPlane, true);
+        dataPlaneService.createInstance("project-a", Map.of("name", "my-main", "databaseVersion", "MYSQL_8_0"));
+
+        // root at another host is an ordinary account: created on the server and deletable.
+        dataPlaneService.createUser("project-a", "my-main", Map.of("name", "root", "host", "10.0.0.5", "password", "s"));
+        assertTrue(dataPlane.events.contains("create-user:root@10.0.0.5:s"));
+        dataPlaneService.deleteUser("project-a", "my-main", "root", "10.0.0.5");
+        assertTrue(dataPlane.events.stream().anyMatch(e -> e.startsWith("delete-user:root@10.0.0.5:")));
+
+        GcpException error = assertThrows(GcpException.class,
+                () -> dataPlaneService.deleteUser("project-a", "my-main", "root", "%"));
+        assertEquals("FAILED_PRECONDITION", error.getGcpStatus());
+    }
+
+    @Test
+    void hostQualifiedUserKeysCannotCollide() {
+        withProject("project-a");
+        service.createInstance("project-a", Map.of("name", "my-main", "databaseVersion", "MYSQL_8_0"));
+
+        // Without encoding, host "10.0.0.0/255.255.255.0" + user "app" and host "10.0.0.0" +
+        // user "255.255.255.0/app" would share one storage key.
+        service.createUser("project-a", "my-main", Map.of("name", "app", "host", "10.0.0.0/255.255.255.0", "password", "a"));
+        service.createUser("project-a", "my-main", Map.of("name", "255.255.255.0/app", "host", "10.0.0.0", "password", "b"));
+
+        assertEquals(3, ((List<?>) service.listUsers("project-a", "my-main").get("items")).size());
+        service.deleteUser("project-a", "my-main", "255.255.255.0/app", "10.0.0.0");
+        assertEquals("10.0.0.0/255.255.255.0",
+                service.getUser("project-a", "my-main", "app", "10.0.0.0/255.255.255.0").get("host"));
+    }
+
     private static class RecordingDataPlane implements CloudSqlDataPlane {
         private final List<String> events = new java.util.ArrayList<>();
 
@@ -384,7 +450,8 @@ class CloudSqlServiceTest {
         }
 
         @Override
-        public void createDatabase(Map<String, Object> instanceMetadata, String database) {
+        public void createDatabase(Map<String, Object> instanceMetadata, String database, String charset,
+                                   String collation) {
             events.add("create-db:" + database);
         }
 

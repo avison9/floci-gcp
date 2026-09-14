@@ -81,8 +81,9 @@ public class CloudSqlPostgresDataPlane extends CloudSqlContainerDataPlane {
                 "-U", ADMIN_USER, "-d", "postgres");
     }
 
+    /** Encoding and collation are left to the server default, as before this signature gained them. */
     @Override
-    public void createDatabase(Map<String, Object> instanceMetadata, String database) {
+    public void createDatabase(Map<String, Object> instanceMetadata, String database, String charset, String collation) {
         if ("postgres".equals(database)) {
             return;
         }

@@ -12,6 +12,7 @@ import org.jboss.logging.Logger;
 
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Pattern;
 
 /**
  * MySQL data plane: the official {@code mysql} image, one container per instance, DDL issued
@@ -31,6 +32,10 @@ public class CloudSqlMySqlDataPlane extends CloudSqlContainerDataPlane {
     private static final String ADMIN_USER = "root";
     private static final String ADMIN_PASSWORD = "root";
     private static final String MYSQL_DATA_DIR = "/var/lib/mysql";
+    /** {@code MYSQL_8_0} or a minor-pinned {@code MYSQL_8_0_NN}; nothing looser. */
+    private static final Pattern MYSQL_8_0_VERSION = Pattern.compile("^MYSQL_8_0(?:_\\d+)?$");
+    /** Charset and collation names are bare identifiers in MySQL ({@code utf8mb4}, {@code utf8mb4_bin}). */
+    private static final Pattern CHARSET_OR_COLLATION = Pattern.compile("^[A-Za-z0-9_]+$");
 
     @Inject
     public CloudSqlMySqlDataPlane(ContainerBuilder containerBuilder,
@@ -61,7 +66,7 @@ public class CloudSqlMySqlDataPlane extends CloudSqlContainerDataPlane {
      */
     @Override
     protected String imageFor(String databaseVersion) {
-        if (databaseVersion != null && databaseVersion.startsWith("MYSQL_8_0")) {
+        if (databaseVersion != null && MYSQL_8_0_VERSION.matcher(databaseVersion).matches()) {
             return config.services().cloudsql().mysql80Image();
         }
         if ("MYSQL_8_4".equals(databaseVersion)) {
@@ -91,13 +96,27 @@ public class CloudSqlMySqlDataPlane extends CloudSqlContainerDataPlane {
                 "-u", ADMIN_USER, "-p" + ADMIN_PASSWORD, "--silent");
     }
 
+    /** Applies the requested charset and collation so the server matches what the resource reports. */
     @Override
-    public void createDatabase(Map<String, Object> instanceMetadata, String database) {
+    public void createDatabase(Map<String, Object> instanceMetadata, String database, String charset, String collation) {
         if (CloudSqlEngine.MYSQL.isSystemDatabase(database)) {
             return;
         }
-        runSql(instanceMetadata, "CREATE DATABASE IF NOT EXISTS " + quoteIdentifier(database),
-                "Could not create MySQL database " + database);
+        StringBuilder sql = new StringBuilder("CREATE DATABASE IF NOT EXISTS ").append(quoteIdentifier(database));
+        if (charset != null && !charset.isBlank()) {
+            sql.append(" CHARACTER SET ").append(requireName("charset", charset));
+        }
+        if (collation != null && !collation.isBlank()) {
+            sql.append(" COLLATE ").append(requireName("collation", collation));
+        }
+        runSql(instanceMetadata, sql.toString(), "Could not create MySQL database " + database);
+    }
+
+    private static String requireName(String field, String value) {
+        if (!CHARSET_OR_COLLATION.matcher(value).matches()) {
+            throw GcpException.invalidArgument("Invalid MySQL " + field + ": " + value);
+        }
+        return value;
     }
 
     @Override
@@ -111,7 +130,7 @@ public class CloudSqlMySqlDataPlane extends CloudSqlContainerDataPlane {
 
     @Override
     public void createOrUpdateUser(Map<String, Object> instanceMetadata, String user, String host, String password) {
-        if (isAdminAccount(user)) {
+        if (isAdminAccount(user, host)) {
             LOG.debugv("Leaving the MySQL admin account {0} unchanged; its password is fixed in the emulator", user);
             return;
         }
@@ -139,7 +158,7 @@ public class CloudSqlMySqlDataPlane extends CloudSqlContainerDataPlane {
      */
     @Override
     public void grantDatabaseAccess(Map<String, Object> instanceMetadata, String database, String user, String host) {
-        if (CloudSqlEngine.MYSQL.isSystemDatabase(database) || isAdminAccount(user)) {
+        if (CloudSqlEngine.MYSQL.isSystemDatabase(database) || isAdminAccount(user, host)) {
             return;
         }
         runSql(instanceMetadata,
@@ -164,8 +183,9 @@ public class CloudSqlMySqlDataPlane extends CloudSqlContainerDataPlane {
                         "-u", ADMIN_USER, "--batch", "--skip-column-names", "-e", sql));
     }
 
-    private static boolean isAdminAccount(String user) {
-        return ADMIN_USER.equals(user);
+    /** Only the provisioned {@code root@%}; a {@code root} at another host is an ordinary account. */
+    private static boolean isAdminAccount(String user, String host) {
+        return ADMIN_USER.equals(user) && (host == null || host.isBlank() || "%".equals(host));
     }
 
     private static String account(String user, String host) {
