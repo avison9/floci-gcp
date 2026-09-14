@@ -798,6 +798,28 @@ class GkeServiceTest {
     }
 
     @Test
+    void invalidVersionErrorsNameTheFieldThatCarriedThem() {
+        // Review follow-up on #198: the three version fields share one resolver, and a bad
+        // desiredNodeVersion used to come back as 'Invalid master version ...'.
+        service.createCluster(PROJECT, LOCATION, Map.of("name", "field-name"));
+
+        GcpException master = assertThrows(GcpException.class,
+                () -> service.updateMaster(PROJECT, LOCATION, "field-name", Map.of("masterVersion", "banana")));
+        assertTrue(master.getMessage().startsWith("Invalid masterVersion \"banana\""), master.getMessage());
+
+        GcpException desiredMaster = assertThrows(GcpException.class,
+                () -> service.updateCluster(PROJECT, LOCATION, "field-name", Map.of("desiredMasterVersion", "banana")));
+        assertTrue(desiredMaster.getMessage().startsWith("Invalid desiredMasterVersion \"banana\""),
+                desiredMaster.getMessage());
+
+        GcpException desiredNode = assertThrows(GcpException.class,
+                () -> service.updateCluster(PROJECT, LOCATION, "field-name", Map.of("desiredNodeVersion", "banana")));
+        assertTrue(desiredNode.getMessage().startsWith("Invalid desiredNodeVersion \"banana\""),
+                desiredNode.getMessage());
+        assertEquals(400, desiredNode.getHttpStatus());
+    }
+
+    @Test
     void updateClusterMergesDesiredFieldsIntoExtraConfig() {
         service.createCluster(PROJECT, LOCATION, Map.of("name", "updatable"));
 
