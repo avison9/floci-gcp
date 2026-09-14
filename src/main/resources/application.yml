@@ -33,7 +33,9 @@ quarkus:
       # Holds a static SecureRandom; native image refuses one in the image heap.
       - --initialize-at-run-time=io.floci.gcp.services.gcs.GcsHmacKeyService
       - --initialize-at-run-time=io.floci.gcp.services.firebaseauth.FirebaseAuthService
+      - --initialize-at-run-time=io.floci.gcp.services.cloudsql.CloudSqlContainerDataPlane
       - --initialize-at-run-time=io.floci.gcp.services.cloudsql.CloudSqlPostgresDataPlane
+      - --initialize-at-run-time=io.floci.gcp.services.cloudsql.CloudSqlMySqlDataPlane
       - --initialize-at-run-time=io.floci.gcp.services.scheduler.SchedulerExpressionParser
       - --initialize-at-run-time=org.bouncycastle.jcajce.provider.drbg.DRBG$Default
       - --initialize-at-run-time=org.bouncycastle.jcajce.provider.drbg.DRBG$NonceAndIV
@@ -96,6 +98,8 @@ floci-gcp:
       postgres16-image: "postgres:16.14-alpine"
       postgres17-image: "postgres:17.10-alpine"
       postgres18-image: "postgres:18.4-alpine"
+      mysql80-image: "mysql:8.0.46"
+      mysql84-image: "mysql:8.4.11"
       startup-timeout-seconds: 90
     cloudtasks:
       enabled: true

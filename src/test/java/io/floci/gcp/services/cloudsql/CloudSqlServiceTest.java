@@ -245,6 +245,124 @@ class CloudSqlServiceTest {
         assertEquals("INVALID_ARGUMENT", deleteError.getGcpStatus());
     }
 
+    @Test
+    void mysqlInstanceListsSystemDatabasesAndRootAndUsesMysqlDefaults() {
+        withProject("project-a");
+        Map<String, Object> operation = service.createInstance("project-a", Map.of(
+                "name", "my-main",
+                "databaseVersion", "MYSQL_8_0",
+                "rootPassword", "hunter2"));
+        assertEquals("CREATE", operation.get("operationType"));
+
+        Map<String, Object> instance = service.getInstance("project-a", "my-main");
+        assertEquals("MYSQL_8_0", instance.get("databaseVersion"));
+        // rootPassword is write-only in the Admin API and must never be echoed back.
+        assertFalse(instance.containsKey("rootPassword"));
+
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> databases =
+                (List<Map<String, Object>>) service.listDatabases("project-a", "my-main").get("items");
+        assertEquals(List.of("information_schema", "mysql", "performance_schema", "sys"),
+                databases.stream().map(d -> d.get("name")).toList());
+
+        service.createDatabase("project-a", "my-main", Map.of("name", "appdb"));
+        Map<String, Object> appdb = service.getDatabase("project-a", "my-main", "appdb");
+        assertEquals("utf8mb4", appdb.get("charset"));
+        assertEquals("utf8mb4_0900_ai_ci", appdb.get("collation"));
+
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> users =
+                (List<Map<String, Object>>) service.listUsers("project-a", "my-main").get("items");
+        assertEquals(1, users.size());
+        assertEquals("root", users.get(0).get("name"));
+        assertEquals("%", users.get(0).get("host"));
+        assertEquals("BUILT_IN", users.get(0).get("type"));
+    }
+
+    @Test
+    void mysqlSystemDatabasesAndRootCannotBeDeleted() {
+        withProject("project-a");
+        service.createInstance("project-a", Map.of("name", "my-main", "databaseVersion", "MYSQL_8_4"));
+
+        for (String system : List.of("mysql", "sys", "information_schema", "performance_schema")) {
+            GcpException error = assertThrows(GcpException.class,
+                    () -> service.deleteDatabase("project-a", "my-main", system), system);
+            assertEquals("FAILED_PRECONDITION", error.getGcpStatus());
+        }
+        GcpException root = assertThrows(GcpException.class,
+                () -> service.deleteUser("project-a", "my-main", "root", null));
+        assertEquals("FAILED_PRECONDITION", root.getGcpStatus());
+        assertEquals("root", service.getUser("project-a", "my-main", "root", "%").get("name"));
+    }
+
+    @Test
+    void mysqlUsersAreHostQualifiedAndDefaultToPercent() {
+        withProject("project-a");
+        RecordingDataPlane dataPlane = new RecordingDataPlane();
+        CloudSqlService dataPlaneService = new CloudSqlService(
+                projectAwareStore(), projectAwareStore(), projectAwareStore(), projectAwareStore(),
+                new ObjectMapper(), "http://localhost:4588", dataPlane, true);
+        dataPlaneService.createInstance("project-a", Map.of("name", "my-main", "databaseVersion", "MYSQL_8_0"));
+        dataPlaneService.createDatabase("project-a", "my-main", Map.of("name", "appdb"));
+
+        // No host on insert: stored and addressed as '%', which is what users.get?host=% must find.
+        dataPlaneService.createUser("project-a", "my-main", Map.of("name", "app", "password", "secret"));
+        assertEquals("%", dataPlaneService.getUser("project-a", "my-main", "app", null).get("host"));
+        assertEquals("%", dataPlaneService.getUser("project-a", "my-main", "app", "%").get("host"));
+
+        // An explicit host is a distinct identity from the same name at '%'.
+        dataPlaneService.createUser("project-a", "my-main",
+                Map.of("name", "app", "host", "10.0.0.5", "password", "secret2"));
+        assertEquals("10.0.0.5", dataPlaneService.getUser("project-a", "my-main", "app", "10.0.0.5").get("host"));
+        assertEquals(3, ((List<?>) dataPlaneService.listUsers("project-a", "my-main").get("items")).size());
+
+        dataPlaneService.updateUser("project-a", "my-main", "app", null, Map.of("password", "rotated"));
+        dataPlaneService.deleteUser("project-a", "my-main", "app", "10.0.0.5");
+        dataPlaneService.createDatabase("project-a", "my-main", Map.of("name", "second"));
+
+        // Grants are issued once per (database, user); their relative order follows store
+        // iteration and is not part of the contract, so they are compared as a multiset.
+        List<String> lifecycle = dataPlane.events.stream()
+                .filter(e -> !e.startsWith("grant:") && !e.startsWith("delete-user:")).toList();
+        List<String> grants = dataPlane.events.stream().filter(e -> e.startsWith("grant:")).sorted().toList();
+        assertEquals(List.of(
+                "start:project-a/my-main",
+                "create-db:appdb",
+                "create-user:app@%:secret",
+                "create-user:app@10.0.0.5:secret2",
+                "create-user:app@%:rotated",
+                "create-db:second"), lifecycle);
+        String deleted = dataPlane.events.stream().filter(e -> e.startsWith("delete-user:")).findFirst().orElseThrow();
+        assertTrue(deleted.startsWith("delete-user:app@10.0.0.5:"), deleted);
+        assertEquals(List.of("appdb", "information_schema", "mysql", "performance_schema", "sys"),
+                java.util.Arrays.stream(deleted.substring(deleted.lastIndexOf(':') + 1).split(",")).sorted().toList());
+        List<String> expectedGrants = new java.util.ArrayList<>();
+        // root@% is listed as a user, so it is offered each new database like any other; the
+        // MySQL plane itself declines to touch the admin account.
+        expectedGrants.add("grant:appdb:root@%");
+        expectedGrants.add("grant:second:root@%");
+        for (String identity : List.of("app@%", "app@10.0.0.5", "app@%")) {
+            for (String database : List.of("information_schema", "mysql", "performance_schema", "sys", "appdb")) {
+                expectedGrants.add("grant:" + database + ":" + identity);
+            }
+        }
+        expectedGrants.add("grant:second:app@%");
+        assertEquals(expectedGrants.stream().sorted().toList(), grants);
+    }
+
+    @Test
+    void unsupportedEnginesAreRejected() {
+        for (String version : List.of("SQLSERVER_2019_STANDARD", "", "ORACLE")) {
+            GcpException error = assertThrows(GcpException.class,
+                    () -> service.createInstance("project-a", Map.of("name", "other", "databaseVersion", version)),
+                    version);
+            assertEquals("INVALID_ARGUMENT", error.getGcpStatus());
+        }
+        GcpException missing = assertThrows(GcpException.class,
+                () -> service.createInstance("project-a", Map.of("name", "other")));
+        assertEquals("INVALID_ARGUMENT", missing.getGcpStatus());
+    }
+
     private static class RecordingDataPlane implements CloudSqlDataPlane {
         private final List<String> events = new java.util.ArrayList<>();
 
@@ -276,18 +394,25 @@ class CloudSqlServiceTest {
         }
 
         @Override
-        public void createOrUpdateUser(Map<String, Object> instanceMetadata, String user, String password) {
-            events.add("create-user:" + user + ":" + password);
+        public void createOrUpdateUser(Map<String, Object> instanceMetadata, String user, String host,
+                                       String password) {
+            events.add("create-user:" + identity(user, host) + ":" + password);
         }
 
         @Override
-        public void deleteUser(Map<String, Object> instanceMetadata, String user, Iterable<String> databases) {
-            events.add("delete-user:" + user + ":" + String.join(",", databases));
+        public void deleteUser(Map<String, Object> instanceMetadata, String user, String host,
+                               Iterable<String> databases) {
+            events.add("delete-user:" + identity(user, host) + ":" + String.join(",", databases));
         }
 
         @Override
-        public void grantDatabaseAccess(Map<String, Object> instanceMetadata, String database, String user) {
-            events.add("grant:" + database + ":" + user);
+        public void grantDatabaseAccess(Map<String, Object> instanceMetadata, String database, String user,
+                                        String host) {
+            events.add("grant:" + database + ":" + identity(user, host));
+        }
+
+        private static String identity(String user, String host) {
+            return host == null ? user : user + "@" + host;
         }
     }
 }
