@@ -31,7 +31,7 @@ abstract class CloudSqlContainerDataPlane implements CloudSqlDataPlane {
     private static final SecureRandom RANDOM = new SecureRandom();
 
     /**
-     * Volume-name prefix used before names were persisted. Pinned for backfill only —
+     * Volume-name prefix used before names were persisted. Pinned for backfill only:
      * pre-upgrade volumes must keep resolving to this exact prefix regardless of what the
      * live naming helper produces.
      */
@@ -241,7 +241,7 @@ abstract class CloudSqlContainerDataPlane implements CloudSqlDataPlane {
     /**
      * Resolves the Docker volume name for an instance. Pre-upgrade instances persisted only a
      * {@code volumeId}, so their data lives under the pinned legacy name; the live helper must
-     * never be used to backfill them — a future prefix or namespace change would orphan the data.
+     * never be used to backfill them, since a future prefix or namespace change would orphan the data.
      */
     private String resolveVolumeName(Map<String, Object> metadata, String volumeId,
                                      String fallbackId, boolean newVolume) {

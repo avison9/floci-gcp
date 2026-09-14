@@ -349,10 +349,15 @@ public class CloudSqlService {
         if (user == null || user.isBlank()) {
             throw GcpException.invalidArgument("User name is required");
         }
-        String host = engineOf(instanceMetadata).normalizeHost(stringValue(request.get("host")));
+        CloudSqlEngine engine = engineOf(instanceMetadata);
+        String host = engine.normalizeHost(stringValue(request.get("host")));
         String key = userKey(instance, user, host);
         if (userStore.get(key).isPresent()) {
             throw GcpException.alreadyExists("Cloud SQL user already exists: " + user);
+        }
+        if (engine.isReservedIdentity(user, host)) {
+            throw GcpException.invalidArgument("User identity is reserved for the instance administrator: "
+                    + user + (host == null ? "" : "@" + host));
         }
         if (dataPlaneEnabled) {
             dataPlane.createOrUpdateUser(instanceMetadata, user, host, stringValue(request.get("password")));
@@ -414,7 +419,7 @@ public class CloudSqlService {
         String key = userKey(instance, user, host);
         Map<String, Object> existing = userStore.get(key)
                 .orElseThrow(() -> GcpException.notFound("Cloud SQL user not found: " + user));
-        if (engine.isBuiltInUser(user, host)) {
+        if (engine.isReservedIdentity(user, host)) {
             // The data plane's own admin login; dropping it would strand every later DDL call.
             throw GcpException.failedPrecondition("Built-in user cannot be deleted: " + user);
         }
@@ -535,8 +540,14 @@ public class CloudSqlService {
         stored.put("name", database);
         stored.put("project", project);
         stored.put("instance", instance);
-        putDefault(stored, "charset", engine.defaultCharset());
-        putDefault(stored, "collation", engine.defaultCollation());
+        // Charset and collation are a pair: a request naming only one of them gets nothing
+        // defaulted for the other, so the DDL never combines a caller's charset with the
+        // engine-default collation of a different charset. The engine defaults apply only when
+        // the request names neither.
+        if (isBlank(stored.get("charset")) && isBlank(stored.get("collation"))) {
+            stored.put("charset", engine.defaultCharset());
+            stored.put("collation", engine.defaultCollation());
+        }
         stored.put("selfLink", effectiveBaseUrl() + "/v1/projects/" + project
                 + "/instances/" + instance + "/databases/" + database);
         return stored;
@@ -672,6 +683,10 @@ public class CloudSqlService {
             return new LinkedHashMap<>();
         }
         return objectMapper.convertValue(value, MAP_TYPE);
+    }
+
+    private static boolean isBlank(Object value) {
+        return value == null || value.toString().isBlank();
     }
 
     private void putDefault(Map<String, Object> map, String key, Object value) {

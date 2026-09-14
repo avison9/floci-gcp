@@ -104,11 +104,23 @@ enum CloudSqlEngine {
     }
 
     /**
-     * Whether {@code user@host} is the provisioned admin identity itself. Only that identity is
-     * protected: a MySQL {@code root@10.0.0.5} is an ordinary, separately created account.
+     * Whether {@code user@host} is one of the identities the data plane itself is provisioned
+     * with and logs in as. On MySQL that is {@code root} at {@code %} and at the local hosts the
+     * image also creates ({@code localhost}, {@code 127.0.0.1}, {@code ::1}), which the plane's
+     * own {@code 127.0.0.1} connections resolve to. A MySQL {@code root@10.0.0.5} is an ordinary,
+     * separately created account. These identities cannot be created, deleted or re-passworded
+     * through the API: doing so would strand every later DDL call.
      */
-    boolean isBuiltInUser(String user, String host) {
-        return builtInUser != null && builtInUser.equals(user)
-                && java.util.Objects.equals(normalizeHost(null), host);
+    boolean isReservedIdentity(String user, String host) {
+        if (builtInUser == null || !builtInUser.equals(user)) {
+            return false;
+        }
+        if (!hostQualifiedUsers()) {
+            return true;
+        }
+        String normalized = normalizeHost(host);
+        return defaultHost.equals(normalized) || LOCAL_HOSTS.contains(normalized.toLowerCase());
     }
+
+    private static final List<String> LOCAL_HOSTS = List.of("localhost", "127.0.0.1", "::1");
 }

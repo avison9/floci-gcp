@@ -146,6 +146,9 @@ public class CloudSqlMySqlDataPlane extends CloudSqlContainerDataPlane {
 
     @Override
     public void deleteUser(Map<String, Object> instanceMetadata, String user, String host, Iterable<String> databases) {
+        if (isAdminAccount(user, host)) {
+            return;
+        }
         runSql(instanceMetadata, "DROP USER IF EXISTS " + account(user, host),
                 "Could not delete MySQL user " + user);
     }
@@ -183,9 +186,13 @@ public class CloudSqlMySqlDataPlane extends CloudSqlContainerDataPlane {
                         "-u", ADMIN_USER, "--batch", "--skip-column-names", "-e", sql));
     }
 
-    /** Only the provisioned {@code root@%}; a {@code root} at another host is an ordinary account. */
+    /**
+     * The identities the image provisions and this plane logs in through; see
+     * {@link CloudSqlEngine#isReservedIdentity}. Defensive: the control plane refuses these
+     * before reaching here.
+     */
     private static boolean isAdminAccount(String user, String host) {
-        return ADMIN_USER.equals(user) && (host == null || host.isBlank() || "%".equals(host));
+        return CloudSqlEngine.MYSQL.isReservedIdentity(user, host);
     }
 
     private static String account(String user, String host) {

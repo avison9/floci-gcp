@@ -82,9 +82,14 @@ engine's own identity model:
   PostgreSQL instances still reject a `host`.
 - `users.list` includes the `root@%` account the instance is provisioned with (`type: BUILT_IN`).
   It cannot be deleted, and a password update on it is acknowledged without changing the server.
+  `root` at `localhost`, `127.0.0.1` or `::1` is reserved for the same reason (the image creates
+  it and the emulator connects through it) and cannot be created through the API; `root` at any
+  other host is an ordinary user.
 - Created users receive `ALL PRIVILEGES` on every existing and later user database; system schemas
   are not granted.
-- New databases report `utf8mb4` / `utf8mb4_0900_ai_ci` unless the request sets `charset` or `collation`.
+- New databases report `utf8mb4` / `utf8mb4_0900_ai_ci` when the request sets neither `charset` nor
+  `collation`. A request naming only one of them has only that one applied and reported; the server
+  picks the matching counterpart, which is not read back.
 - The four system schemas are listed by `databases.list` and cannot be deleted, like `postgres` on PostgreSQL.
 
 Docker storage follows the global floci-gcp storage policy. In named-volume mode, each instance gets
