@@ -49,7 +49,7 @@ just test-all-iac
 
 ## Test Coverage
 
-### SDK tests — 258 tests total
+### SDK tests: 258 tests total
 
 | Test class | GCP service | Java | Python | Node | Go |
 |---|---|:---:|:---:|:---:|:---:|

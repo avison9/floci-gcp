@@ -188,6 +188,11 @@ class CloudSqlMySqlDataPlaneTest {
         }
         plane.createOrUpdateUser(RUNNING, "root", "%", "new-root-password");
         plane.createOrUpdateUser(RUNNING, "root", null, "new-root-password");
+        // the local root identities the image also creates, which 127.0.0.1 connections resolve to
+        for (String local : List.of("localhost", "127.0.0.1", "::1")) {
+            plane.createOrUpdateUser(RUNNING, "root", local, "new-root-password");
+            plane.deleteUser(RUNNING, "root", local, List.of());
+        }
         plane.grantDatabaseAccess(RUNNING, "appdb", "root", "%");
 
         verify(lifecycleManager, never()).exec(any(), anyList(), anyList());

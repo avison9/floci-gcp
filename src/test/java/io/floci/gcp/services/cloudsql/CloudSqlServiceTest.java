@@ -149,7 +149,7 @@ class CloudSqlServiceTest {
 
         assertEquals(List.of(
                 "start:project-a/pg-main",
-                "create-db:appdb",
+                "create-db:appdb:UTF8/en_US.UTF8",
                 "create-user:app:secret",
                 "grant:postgres:app",
                 "grant:appdb:app",
@@ -327,11 +327,11 @@ class CloudSqlServiceTest {
         List<String> grants = dataPlane.events.stream().filter(e -> e.startsWith("grant:")).sorted().toList();
         assertEquals(List.of(
                 "start:project-a/my-main",
-                "create-db:appdb",
+                "create-db:appdb:utf8mb4/utf8mb4_0900_ai_ci",
                 "create-user:app@%:secret",
                 "create-user:app@10.0.0.5:secret2",
                 "create-user:app@%:rotated",
-                "create-db:second"), lifecycle);
+                "create-db:second:utf8mb4/utf8mb4_0900_ai_ci"), lifecycle);
         String deleted = dataPlane.events.stream().filter(e -> e.startsWith("delete-user:")).findFirst().orElseThrow();
         assertTrue(deleted.startsWith("delete-user:app@10.0.0.5:"), deleted);
         assertEquals(List.of("appdb", "information_schema", "mysql", "performance_schema", "sys"),
@@ -429,6 +429,50 @@ class CloudSqlServiceTest {
                 service.getUser("project-a", "my-main", "app", "10.0.0.0/255.255.255.0").get("host"));
     }
 
+    @Test
+    void localRootIdentitiesAreReservedOnMysql() {
+        withProject("project-a");
+        RecordingDataPlane dataPlane = new RecordingDataPlane();
+        CloudSqlService dataPlaneService = new CloudSqlService(
+                projectAwareStore(), projectAwareStore(), projectAwareStore(), projectAwareStore(),
+                new ObjectMapper(), "http://localhost:4588", dataPlane, true);
+        dataPlaneService.createInstance("project-a", Map.of("name", "my-main", "databaseVersion", "MYSQL_8_0"));
+
+        // The image provisions root at these hosts and the plane logs in through them over
+        // 127.0.0.1, so re-passwording any of them would strand every later DDL call.
+        for (String host : List.of("localhost", "127.0.0.1", "::1", "LOCALHOST")) {
+            GcpException error = assertThrows(GcpException.class, () -> dataPlaneService.createUser(
+                    "project-a", "my-main", Map.of("name", "root", "host", host, "password", "x")), host);
+            assertEquals("INVALID_ARGUMENT", error.getGcpStatus());
+        }
+        assertTrue(dataPlane.events.stream().noneMatch(e -> e.startsWith("create-user:root")));
+        // root@% already exists from provisioning, so that spelling is a conflict rather than a reservation.
+        assertEquals("ALREADY_EXISTS", assertThrows(GcpException.class, () -> dataPlaneService.createUser(
+                "project-a", "my-main", Map.of("name", "root", "password", "x"))).getGcpStatus());
+    }
+
+    @Test
+    void charsetAndCollationAreDefaultedTogetherOrNotAtAll() {
+        withProject("project-a");
+        RecordingDataPlane dataPlane = new RecordingDataPlane();
+        CloudSqlService dataPlaneService = new CloudSqlService(
+                projectAwareStore(), projectAwareStore(), projectAwareStore(), projectAwareStore(),
+                new ObjectMapper(), "http://localhost:4588", dataPlane, true);
+        dataPlaneService.createInstance("project-a", Map.of("name", "my-main", "databaseVersion", "MYSQL_8_0"));
+
+        dataPlaneService.createDatabase("project-a", "my-main", Map.of("name", "latin", "charset", "latin1"));
+        dataPlaneService.createDatabase("project-a", "my-main", Map.of("name", "bin", "collation", "utf8mb4_bin"));
+        dataPlaneService.createDatabase("project-a", "my-main", Map.of("name", "plain"));
+
+        // A charset-only request must not be paired with the utf8mb4 default collation.
+        assertTrue(dataPlane.events.contains("create-db:latin:latin1/null"), dataPlane.events.toString());
+        assertTrue(dataPlane.events.contains("create-db:bin:null/utf8mb4_bin"), dataPlane.events.toString());
+        assertTrue(dataPlane.events.contains("create-db:plain:utf8mb4/utf8mb4_0900_ai_ci"), dataPlane.events.toString());
+        Map<String, Object> latin = dataPlaneService.getDatabase("project-a", "my-main", "latin");
+        assertEquals("latin1", latin.get("charset"));
+        assertFalse(latin.containsKey("collation"));
+    }
+
     private static class RecordingDataPlane implements CloudSqlDataPlane {
         private final List<String> events = new java.util.ArrayList<>();
 
@@ -452,7 +496,8 @@ class CloudSqlServiceTest {
         @Override
         public void createDatabase(Map<String, Object> instanceMetadata, String database, String charset,
                                    String collation) {
-            events.add("create-db:" + database);
+            events.add("create-db:" + database + (charset == null && collation == null
+                    ? "" : ":" + charset + "/" + collation));
         }
 
         @Override
