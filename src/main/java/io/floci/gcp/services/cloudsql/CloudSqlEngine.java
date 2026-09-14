@@ -103,7 +103,12 @@ enum CloudSqlEngine {
         return builtInUser;
     }
 
-    boolean isBuiltInUser(String user) {
-        return builtInUser != null && builtInUser.equals(user);
+    /**
+     * Whether {@code user@host} is the provisioned admin identity itself. Only that identity is
+     * protected: a MySQL {@code root@10.0.0.5} is an ordinary, separately created account.
+     */
+    boolean isBuiltInUser(String user, String host) {
+        return builtInUser != null && builtInUser.equals(user)
+                && java.util.Objects.equals(normalizeHost(null), host);
     }
 }

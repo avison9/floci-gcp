@@ -149,6 +149,9 @@ public class CloudSqlService {
     public Map<String, Object> patchInstance(String project, String instance, Map<String, Object> body) {
         Map<String, Object> existing = getInstance(project, instance);
         Map<String, Object> patch = copy(body);
+        rejectEngineChange(existing, patch);
+        // rootPassword is write-only in the Admin API; a PATCH must not persist it either.
+        patch.remove("rootPassword");
         merge(existing, patch);
         existing.put("kind", "sql#instance");
         existing.put("name", instance);
@@ -163,6 +166,7 @@ public class CloudSqlService {
     public Map<String, Object> updateInstance(String project, String instance, Map<String, Object> body) {
         Map<String, Object> existing = getInstance(project, instance);
         Map<String, Object> update = copy(body);
+        rejectEngineChange(existing, update);
         merge(existing, update);
         Map<String, Object> stored = normalizeInstance(project, instance, existing);
         instanceStore.put(instanceKey(instance), stored);
@@ -274,7 +278,8 @@ public class CloudSqlService {
         }
         Map<String, Object> stored = normalizeDatabase(project, instance, engineOf(instanceMetadata), database, request);
         if (dataPlaneEnabled) {
-            dataPlane.createDatabase(instanceMetadata, database);
+            dataPlane.createDatabase(instanceMetadata, database,
+                    stringValue(stored.get("charset")), stringValue(stored.get("collation")));
             for (Map<String, Object> user : users(instance)) {
                 dataPlane.grantDatabaseAccess(instanceMetadata, database,
                         stringValue(user.get("name")), stringValue(user.get("host")));
@@ -409,7 +414,7 @@ public class CloudSqlService {
         String key = userKey(instance, user, host);
         Map<String, Object> existing = userStore.get(key)
                 .orElseThrow(() -> GcpException.notFound("Cloud SQL user not found: " + user));
-        if (engine.isBuiltInUser(user)) {
+        if (engine.isBuiltInUser(user, host)) {
             // The data plane's own admin login; dropping it would strand every later DDL call.
             throw GcpException.failedPrecondition("Built-in user cannot be deleted: " + user);
         }
@@ -501,6 +506,21 @@ public class CloudSqlService {
         String key = userKey(instance, user, host);
         if (userStore.get(key).isEmpty()) {
             userStore.put(key, normalizeUser(project, instance, user, host, Map.of("name", user)));
+        }
+    }
+
+    /**
+     * The engine is fixed by the container an instance was provisioned with; the data plane
+     * dispatches on {@code databaseVersion}, so letting it cross engines would run the MySQL
+     * client against a PostgreSQL container (or restart the wrong image on the retained
+     * volume). Real Cloud SQL has no cross-engine update either. Same-engine version changes
+     * are left as they were.
+     */
+    private void rejectEngineChange(Map<String, Object> existing, Map<String, Object> request) {
+        String requested = stringValue(request.get("databaseVersion"));
+        if (requested != null && CloudSqlEngine.fromDatabaseVersion(requested) != engineOf(existing)) {
+            throw GcpException.invalidArgument("databaseVersion cannot change the instance engine from "
+                    + engineOf(existing) + " to " + CloudSqlEngine.fromDatabaseVersion(requested));
         }
     }
 
@@ -694,8 +714,14 @@ public class CloudSqlService {
         return "instances/" + instance + "/users/";
     }
 
+    /**
+     * {@code <encoded host>/<user>}: the host is percent-encoded so it can never contain the
+     * {@code /} separator (MySQL hosts may be CIDR ranges), which keeps the key unambiguous for
+     * any user name. PostgreSQL users have no host and keep their pre-existing {@code /user} key.
+     */
     private static String userKey(String instance, String user, String host) {
-        return userPrefix(instance) + (host == null ? "" : host) + "/" + user;
+        String encodedHost = host == null ? "" : java.net.URLEncoder.encode(host, java.nio.charset.StandardCharsets.UTF_8);
+        return userPrefix(instance) + encodedHost + "/" + user;
     }
 
     private static String operationKey(String operation) {

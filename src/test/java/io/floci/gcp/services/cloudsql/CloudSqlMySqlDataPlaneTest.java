@@ -127,8 +127,9 @@ class CloudSqlMySqlDataPlaneTest {
         assertEquals("mysql:8.0.46", plane.imageFor("MYSQL_8_0"));
         assertEquals("mysql:8.0.46", plane.imageFor("MYSQL_8_0_36"));
         assertEquals("mysql:8.4.11", plane.imageFor("MYSQL_8_4"));
-        assertThrows(GcpException.class, () -> plane.imageFor("MYSQL_5_7"));
-        assertThrows(GcpException.class, () -> plane.imageFor("POSTGRES_16"));
+        for (String bad : List.of("MYSQL_5_7", "POSTGRES_16", "MYSQL_8_00", "MYSQL_8_0foo", "MYSQL_8_0_", "MYSQL_8_4_1")) {
+            assertThrows(GcpException.class, () -> plane.imageFor(bad), bad);
+        }
     }
 
     @Test
@@ -150,18 +151,22 @@ class CloudSqlMySqlDataPlaneTest {
                 .thenReturn(new ExecResult(0, "", ""));
         CloudSqlMySqlDataPlane plane = dataPlane();
 
-        plane.createDatabase(RUNNING, "app`db");
+        plane.createDatabase(RUNNING, "app`db", "utf8mb4", "utf8mb4_bin");
+        plane.createDatabase(RUNNING, "plain", null, null);
         plane.createOrUpdateUser(RUNNING, "app", "%", "it's");
         plane.grantDatabaseAccess(RUNNING, "appdb", "app", "10.0.0.5");
         plane.deleteUser(RUNNING, "app", "%", List.of("appdb"));
         plane.deleteDatabase(RUNNING, "appdb");
+        // charset/collation are spliced into DDL, so anything but a bare name is refused first.
+        assertThrows(GcpException.class, () -> plane.createDatabase(RUNNING, "x", "utf8mb4; DROP DATABASE mysql", null));
 
         ArgumentCaptor<List<String>> commands = ArgumentCaptor.captor();
         ArgumentCaptor<List<String>> envs = ArgumentCaptor.captor();
-        verify(lifecycleManager, org.mockito.Mockito.times(5)).exec(eq("container-1"), envs.capture(), commands.capture());
+        verify(lifecycleManager, org.mockito.Mockito.times(6)).exec(eq("container-1"), envs.capture(), commands.capture());
         List<String> sql = commands.getAllValues().stream().map(cmd -> cmd.get(cmd.size() - 1)).toList();
         assertEquals(List.of(
-                "CREATE DATABASE IF NOT EXISTS `app``db`",
+                "CREATE DATABASE IF NOT EXISTS `app``db` CHARACTER SET utf8mb4 COLLATE utf8mb4_bin",
+                "CREATE DATABASE IF NOT EXISTS `plain`",
                 "CREATE USER IF NOT EXISTS 'app'@'%' IDENTIFIED BY 'it''s'; ALTER USER 'app'@'%' IDENTIFIED BY 'it''s'",
                 "GRANT ALL PRIVILEGES ON `appdb`.* TO 'app'@'10.0.0.5'",
                 "DROP USER IF EXISTS 'app'@'%'",
@@ -177,20 +182,27 @@ class CloudSqlMySqlDataPlaneTest {
         CloudSqlMySqlDataPlane plane = dataPlane();
 
         for (String system : List.of("mysql", "sys", "information_schema", "performance_schema")) {
-            plane.createDatabase(RUNNING, system);
+            plane.createDatabase(RUNNING, system, "utf8mb4", "utf8mb4_0900_ai_ci");
             plane.deleteDatabase(RUNNING, system);
             plane.grantDatabaseAccess(RUNNING, system, "app", "%");
         }
         plane.createOrUpdateUser(RUNNING, "root", "%", "new-root-password");
+        plane.createOrUpdateUser(RUNNING, "root", null, "new-root-password");
         plane.grantDatabaseAccess(RUNNING, "appdb", "root", "%");
 
         verify(lifecycleManager, never()).exec(any(), anyList(), anyList());
+
+        // root at another host is not the admin identity and is managed like any user.
+        when(lifecycleManager.exec(eq("container-1"), anyList(), anyList())).thenReturn(new ExecResult(0, "", ""));
+        plane.createOrUpdateUser(RUNNING, "root", "10.0.0.5", "pw");
+        verify(lifecycleManager).exec(eq("container-1"), anyList(),
+                argThat(cmd -> cmd.get(cmd.size() - 1).startsWith("CREATE USER IF NOT EXISTS 'root'@'10.0.0.5'")));
     }
 
     @Test
     void operationsWithoutARunningContainerFailBeforeExec() {
         GcpException error = assertThrows(GcpException.class,
-                () -> dataPlane().createDatabase(Map.of("databaseVersion", "MYSQL_8_0"), "appdb"));
+                () -> dataPlane().createDatabase(Map.of("databaseVersion", "MYSQL_8_0"), "appdb", null, null));
         assertEquals("FAILED_PRECONDITION", error.getGcpStatus());
         verify(lifecycleManager, never()).exec(any(), anyList(), anyList());
     }

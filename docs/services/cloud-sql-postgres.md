@@ -56,8 +56,8 @@ Creating an instance accepts PostgreSQL (`POSTGRES_15` to `POSTGRES_18`) and MyS
 `instances.insert` returns only once the engine accepts connections. PostgreSQL is ready in a few
 seconds; a MySQL instance initialises its data directory first and typically takes 15 to 25 seconds
 on a cold start, which is longer than the 20 second read timeout some Google API clients default to.
-Raise the client's read timeout, or poll `operations.get`, if you see a client-side timeout on
-`instances.insert` for MySQL. `rootPassword` on the request is accepted and never echoed back, as in
+Raise the client's read timeout if you see a client-side timeout on `instances.insert` for MySQL
+(the operation is only returned once startup completes, so there is nothing to poll before then). `rootPassword` on the request is accepted and never echoed back, as in
 the real API, but the emulator keeps the admin login fixed (`postgres`/`postgres`, `root`/`root`).
 
 `tiers.list` and `flags.list` return static metadata (flags carry `appliesTo` for both engines) so SDKs, gcloud, and IaC providers can complete discovery flows without contacting Google Cloud.

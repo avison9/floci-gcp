@@ -46,8 +46,8 @@ public class CloudSqlEngineDataPlane implements CloudSqlDataPlane {
     }
 
     @Override
-    public void createDatabase(Map<String, Object> instanceMetadata, String database) {
-        select(instanceMetadata).createDatabase(instanceMetadata, database);
+    public void createDatabase(Map<String, Object> instanceMetadata, String database, String charset, String collation) {
+        select(instanceMetadata).createDatabase(instanceMetadata, database, charset, collation);
     }
 
     @Override
