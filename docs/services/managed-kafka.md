@@ -79,4 +79,43 @@ curl -X DELETE \
 
 - `GetConsumerGroup`
 - `ListConsumerGroups`
+- `UpdateConsumerGroup`
 - `DeleteConsumerGroup`
+
+**ACLs:**
+
+- `CreateAcl`, `GetAcl`, `ListAcls`, `UpdateAcl`, `DeleteAcl`
+- `AddAclEntry`, `RemoveAclEntry`
+
+This is the full `ManagedKafka` v1 RPC surface. The sibling `ManagedKafkaConnect` and
+Schema Registry services are not served.
+
+## ACLs
+
+An ACL is addressed by an `acl_id` that encodes the Kafka resource pattern, exactly as the real
+API spells it: `cluster`; `topic/{name}`, `consumerGroup/{name}`, `transactionalId/{name}`;
+`topicPrefixed/{name}`, `consumerGroupPrefixed/{name}`, `transactionalIdPrefixed/{name}`; and
+`allTopics`, `allConsumerGroups`, `allTransactionalIds`. Anything else is `400 INVALID_ARGUMENT`.
+The output-only `resourceType`, `resourceName` and `patternType` fields are derived from the id.
+
+```bash
+B=http://localhost:4588/v1/projects/p/locations/us-central1/clusters/c
+curl -s -X POST "$B/acls?aclId=topic/orders" -H 'Content-Type: application/json' \
+  -d '{"aclEntries":[{"principal":"User:svc@p.iam.gserviceaccount.com","permissionType":"ALLOW","operation":"READ","host":"*"}]}'
+curl -s -X POST "$B/acls/topic/orders:addAclEntry" -H 'Content-Type: application/json' \
+  -d '{"principal":"User:svc@p.iam.gserviceaccount.com","permissionType":"ALLOW","operation":"WRITE","host":"*"}'
+curl -s "$B/acls/topic/orders"
+```
+
+- Entries follow the proto's field rules: `principal` carries the `User:` prefix (or is `User:*`),
+  `permissionType` is `ALLOW` or `DENY`, `operation` is one of the Kafka operations (`ALL`, `READ`,
+  `WRITE`, `CREATE`, `DELETE`, `ALTER`, `DESCRIBE`, `CLUSTER_ACTION`, `DESCRIBE_CONFIGS`,
+  `ALTER_CONFIGS`, `IDEMPOTENT_WRITE`), matched case-insensitively and stored upper-case, and
+  `host` must be `*`. At most 100 entries per ACL.
+- `addAclEntry` creates the ACL if it does not exist (`aclCreated: true`); `removeAclEntry`
+  deletes it when the last entry goes (`aclDeleted: true`). Adding an identical entry twice is
+  a no-op.
+- `etag` changes on every write. `UpdateAcl` with a stale `etag` is `409 ABORTED`; without one it
+  is unconditional. `updateMask` may only name `aclEntries`.
+- ACLs are control-plane metadata, like topics in this emulator: the Redpanda container runs
+  without an authorizer, so entries are recorded and read back but do not gate produce or consume.

@@ -1,5 +1,8 @@
 package io.floci.gcp.services.kafka;
 
+import io.floci.gcp.core.common.PageToken;
+import io.floci.gcp.services.kafka.model.AclEntry;
+import io.floci.gcp.services.kafka.model.StoredAcl;
 import io.floci.gcp.services.kafka.model.StoredCluster;
 import io.floci.gcp.services.kafka.model.StoredConsumerGroup;
 import io.floci.gcp.services.kafka.model.StoredTopic;
@@ -10,6 +13,7 @@ import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -204,6 +208,101 @@ public class KafkaController {
                 project, location, clusterId, groupId);
         service.deleteConsumerGroup(project, location, clusterId, groupId);
         return Response.ok(Map.of()).build();
+    }
+
+    // ── ACLs ──────────────────────────────────────────────────────────────────
+    //
+    // The acl id is a multi-segment path (`topic/orders`, `consumerGroupPrefixed/billing-`), bound
+    // as `acls/**` in the proto. `{aclId: [^:]+}` takes every segment up to a custom-method colon,
+    // so `.../acls/topic/orders:addAclEntry` still routes to the custom method below it.
+
+    @POST
+    @Path("/clusters/{clusterId}/acls")
+    public Response createAcl(@PathParam("project") String project,
+                              @PathParam("location") String location,
+                              @PathParam("clusterId") String clusterId,
+                              @QueryParam("aclId") String aclId,
+                              StoredAcl body) {
+        LOG.debugf("Kafka createAcl project=%s location=%s clusterId=%s aclId=%s", project, location, clusterId, aclId);
+        if (aclId == null || aclId.isBlank()) {
+            return gcpError(400, "aclId query parameter is required", "INVALID_ARGUMENT");
+        }
+        return Response.ok(service.createAcl(project, location, clusterId, aclId, body)).build();
+    }
+
+    @GET
+    @Path("/clusters/{clusterId}/acls")
+    public Response listAcls(@PathParam("project") String project,
+                             @PathParam("location") String location,
+                             @PathParam("clusterId") String clusterId,
+                             @QueryParam("pageSize") @DefaultValue("0") int pageSize,
+                             @QueryParam("pageToken") String pageToken) {
+        LOG.debugf("Kafka listAcls project=%s location=%s clusterId=%s", project, location, clusterId);
+        PageToken.Page<StoredAcl> page = service.listAcls(project, location, clusterId, pageSize, pageToken);
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("acls", page.items());
+        if (page.nextPageToken() != null) {
+            response.put("nextPageToken", page.nextPageToken());
+        }
+        return Response.ok(response).build();
+    }
+
+    @GET
+    @Path("/clusters/{clusterId}/acls/{aclId: [^:]+}")
+    public Response getAcl(@PathParam("project") String project,
+                           @PathParam("location") String location,
+                           @PathParam("clusterId") String clusterId,
+                           @PathParam("aclId") String aclId) {
+        LOG.debugf("Kafka getAcl project=%s location=%s clusterId=%s aclId=%s", project, location, clusterId, aclId);
+        return Response.ok(service.getAcl(project, location, clusterId, aclId)).build();
+    }
+
+    @PATCH
+    @Path("/clusters/{clusterId}/acls/{aclId: [^:]+}")
+    public Response updateAcl(@PathParam("project") String project,
+                              @PathParam("location") String location,
+                              @PathParam("clusterId") String clusterId,
+                              @PathParam("aclId") String aclId,
+                              @QueryParam("updateMask") String updateMask,
+                              StoredAcl body) {
+        LOG.debugf("Kafka updateAcl project=%s location=%s clusterId=%s aclId=%s", project, location, clusterId, aclId);
+        return Response.ok(service.updateAcl(project, location, clusterId, aclId, body, updateMask)).build();
+    }
+
+    @DELETE
+    @Path("/clusters/{clusterId}/acls/{aclId: [^:]+}")
+    public Response deleteAcl(@PathParam("project") String project,
+                              @PathParam("location") String location,
+                              @PathParam("clusterId") String clusterId,
+                              @PathParam("aclId") String aclId) {
+        LOG.debugf("Kafka deleteAcl project=%s location=%s clusterId=%s aclId=%s", project, location, clusterId, aclId);
+        service.deleteAcl(project, location, clusterId, aclId);
+        return Response.ok(Map.of()).build();
+    }
+
+    @POST
+    @Path("/clusters/{clusterId}/acls/{aclId: [^:]+}:addAclEntry")
+    public Response addAclEntry(@PathParam("project") String project,
+                                @PathParam("location") String location,
+                                @PathParam("clusterId") String clusterId,
+                                @PathParam("aclId") String aclId,
+                                AclEntry body) {
+        LOG.debugf("Kafka addAclEntry project=%s location=%s clusterId=%s aclId=%s", project, location, clusterId, aclId);
+        KafkaService.AddAclEntryResult result = service.addAclEntry(project, location, clusterId, aclId, body);
+        return Response.ok(Map.of("acl", result.acl(), "aclCreated", result.aclCreated())).build();
+    }
+
+    @POST
+    @Path("/clusters/{clusterId}/acls/{aclId: [^:]+}:removeAclEntry")
+    public Response removeAclEntry(@PathParam("project") String project,
+                                   @PathParam("location") String location,
+                                   @PathParam("clusterId") String clusterId,
+                                   @PathParam("aclId") String aclId,
+                                   AclEntry body) {
+        LOG.debugf("Kafka removeAclEntry project=%s location=%s clusterId=%s aclId=%s", project, location, clusterId, aclId);
+        KafkaService.RemoveAclEntryResult result = service.removeAclEntry(project, location, clusterId, aclId, body);
+        // RemoveAclEntryResponse is a oneof: exactly one of acl / aclDeleted is present.
+        return Response.ok(result.aclDeleted() ? Map.of("aclDeleted", true) : Map.of("acl", result.acl())).build();
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
