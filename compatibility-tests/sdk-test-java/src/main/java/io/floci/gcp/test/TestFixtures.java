@@ -386,6 +386,15 @@ public final class TestFixtures {
         return com.google.cloud.container.v1.ClusterManagerClient.create(settings);
     }
 
+    public static com.google.cloud.managedkafka.v1.ManagedKafkaConnectClient kafkaConnectClient() throws IOException {
+        com.google.cloud.managedkafka.v1.ManagedKafkaConnectSettings settings =
+                com.google.cloud.managedkafka.v1.ManagedKafkaConnectSettings.newHttpJsonBuilder()
+                        .setEndpoint(endpoint())
+                        .setCredentialsProvider(NoCredentialsProvider.create())
+                        .build();
+        return com.google.cloud.managedkafka.v1.ManagedKafkaConnectClient.create(settings);
+    }
+
     public static RevisionsClient cloudRunRevisionsClient() throws IOException {
         RevisionsSettings settings = RevisionsSettings.newHttpJsonBuilder()
                 .setEndpoint(endpoint())
