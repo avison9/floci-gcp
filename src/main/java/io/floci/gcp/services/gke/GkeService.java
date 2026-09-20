@@ -435,7 +435,7 @@ public class GkeService {
         putExtraConfig(cluster, "addonsConfig", body == null ? null : body.get("addonsConfig"));
         touch(cluster);
         clusterStore.put(clusterKey(project, location, clusterId), cluster);
-        return operationService.createOperation(project, location, clusterId, OperationType.SET_ADDONS_CONFIG);
+        return operationService.createOperation(project, location, clusterId, OperationType.UPDATE_CLUSTER);
     }
 
     public StoredOperation setLoggingService(String project, String location, String clusterId,
@@ -444,7 +444,7 @@ public class GkeService {
         cluster.setLoggingService(body == null ? null : (String) body.get("loggingService"));
         touch(cluster);
         clusterStore.put(clusterKey(project, location, clusterId), cluster);
-        return operationService.createOperation(project, location, clusterId, OperationType.SET_LOGGING_SERVICE);
+        return operationService.createOperation(project, location, clusterId, OperationType.UPDATE_CLUSTER);
     }
 
     public StoredOperation setMonitoringService(String project, String location, String clusterId,
@@ -453,7 +453,7 @@ public class GkeService {
         cluster.setMonitoringService(body == null ? null : (String) body.get("monitoringService"));
         touch(cluster);
         clusterStore.put(clusterKey(project, location, clusterId), cluster);
-        return operationService.createOperation(project, location, clusterId, OperationType.SET_MONITORING_SERVICE);
+        return operationService.createOperation(project, location, clusterId, OperationType.UPDATE_CLUSTER);
     }
 
     public StoredOperation setLocations(String project, String location, String clusterId,
@@ -462,7 +462,7 @@ public class GkeService {
         cluster.setLocations(stringListField(body == null ? Map.of() : body, "locations", cluster.getLocations()));
         touch(cluster);
         clusterStore.put(clusterKey(project, location, clusterId), cluster);
-        return operationService.createOperation(project, location, clusterId, OperationType.SET_LOCATIONS);
+        return operationService.createOperation(project, location, clusterId, OperationType.UPDATE_CLUSTER);
     }
 
     public StoredOperation setLegacyAbac(String project, String location, String clusterId,
@@ -472,7 +472,7 @@ public class GkeService {
         putExtraConfig(cluster, "legacyAbac", Map.of("enabled", enabled));
         touch(cluster);
         clusterStore.put(clusterKey(project, location, clusterId), cluster);
-        return operationService.createOperation(project, location, clusterId, OperationType.SET_LEGACY_ABAC);
+        return operationService.createOperation(project, location, clusterId, OperationType.UPDATE_CLUSTER);
     }
 
     /** An empty {@code maintenancePolicy} in the request clears the existing policy, matching
@@ -494,12 +494,12 @@ public class GkeService {
         StoredCluster cluster = requireCluster(project, location, clusterId);
         touch(cluster);
         clusterStore.put(clusterKey(project, location, clusterId), cluster);
-        return operationService.createOperation(project, location, clusterId, OperationType.START_IP_ROTATION);
+        return operationService.createOperation(project, location, clusterId, OperationType.UPDATE_CLUSTER);
     }
 
     public StoredOperation completeIpRotation(String project, String location, String clusterId) {
         requireCluster(project, location, clusterId);
-        return operationService.createOperation(project, location, clusterId, OperationType.COMPLETE_IP_ROTATION);
+        return operationService.createOperation(project, location, clusterId, OperationType.UPDATE_CLUSTER);
     }
 
     /** {@code CompleteNodePoolUpgrade} returns {@code google.protobuf.Empty}, not an Operation
@@ -516,7 +516,7 @@ public class GkeService {
                                                    String nodePoolId) {
         requireNodePool(project, location, clusterId, nodePoolId);
         return operationService.createNodePoolOperation(
-                project, location, clusterId, nodePoolId, OperationType.ROLLBACK_NODE_POOL_UPGRADE);
+                project, location, clusterId, nodePoolId, OperationType.UPGRADE_NODES);
     }
 
     /** {@code container.v1.ClusterManager.GetServerConfig} — the version/channel info gcloud
@@ -654,7 +654,7 @@ public class GkeService {
         pool.setEtag(newFingerprint());
         nodePoolStore.put(nodePoolKey(project, location, clusterId, nodePoolId), pool);
         return operationService.createNodePoolOperation(
-                project, location, clusterId, nodePoolId, OperationType.UPDATE_NODE_POOL);
+                project, location, clusterId, nodePoolId, OperationType.UPGRADE_NODES);
     }
 
     public StoredOperation setNodePoolAutoscaling(String project, String location, String clusterId,
@@ -664,7 +664,7 @@ public class GkeService {
         pool.setEtag(newFingerprint());
         nodePoolStore.put(nodePoolKey(project, location, clusterId, nodePoolId), pool);
         return operationService.createNodePoolOperation(
-                project, location, clusterId, nodePoolId, OperationType.SET_NODE_POOL_AUTOSCALING);
+                project, location, clusterId, nodePoolId, OperationType.UPDATE_CLUSTER);
     }
 
     public StoredOperation setNodePoolManagement(String project, String location, String clusterId,
