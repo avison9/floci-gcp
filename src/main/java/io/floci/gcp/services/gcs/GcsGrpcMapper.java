@@ -306,9 +306,11 @@ final class GcsGrpcMapper {
         return meta;
     }
 
-    static Map<String, java.lang.Object> objectUpdateFields(com.google.storage.v2.Object value,
+    static GcsObjectPatch objectUpdateFields(com.google.storage.v2.Object value,
             java.util.List<String> paths) {
         Map<String, java.lang.Object> patch = new LinkedHashMap<>();
+        Map<String, String> metadataUpdates = new LinkedHashMap<>();
+        java.util.Set<String> metadataRemovals = new java.util.LinkedHashSet<>();
         java.util.Set<String> selected = paths.contains("*")
                 ? java.util.Set.of("content_type", "content_disposition", "content_encoding",
                         "content_language", "cache_control", "custom_time", "metadata",
@@ -332,14 +334,23 @@ final class GcsGrpcMapper {
                 case "event_based_hold" -> patch.put("eventBasedHold", value.getEventBasedHold());
                 default -> {
                     if (path.startsWith("metadata.")) {
-                        patch.put("metadata", new LinkedHashMap<>(value.getMetadataMap()));
+                        String key = path.substring("metadata.".length());
+                        if (value.containsMetadata(key)) {
+                            metadataUpdates.put(key, value.getMetadataOrThrow(key));
+                        } else {
+                            metadataRemovals.add(key);
+                        }
                     } else {
                         throw GcpException.invalidArgument("Unsupported object update field: " + path);
                     }
                 }
             }
         }
-        return patch;
+        if (patch.containsKey("metadata")) {
+            metadataUpdates.clear();
+            metadataRemovals.clear();
+        }
+        return new GcsObjectPatch(patch, metadataUpdates, metadataRemovals);
     }
 
     static ObjectChecksums toChecksums(GcsObjectMeta stored) {
