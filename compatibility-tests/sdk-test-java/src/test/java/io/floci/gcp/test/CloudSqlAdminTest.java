@@ -45,9 +45,18 @@ class CloudSqlAdminTest {
         }
     }
 
+    @Test
+    void sqlAdminSdkCreatesUsableMysqlInstances() throws Exception {
+        for (String databaseVersion : List.of("MYSQL_8_0", "MYSQL_8_4")) {
+            createDatabaseUserAndConnect(databaseVersion);
+        }
+    }
+
     private void createDatabaseUserAndConnect(String databaseVersion) throws Exception {
-        String majorVersion = databaseVersion.substring("POSTGRES_".length());
-        String instanceId = TestFixtures.uniqueName("java-pg-" + majorVersion);
+        boolean mysql = databaseVersion.startsWith("MYSQL_");
+        // "MYSQL_8_4" -> "8.4", "POSTGRES_18" -> "18": what SELECT VERSION() / SHOW server_version starts with.
+        String majorVersion = databaseVersion.substring(databaseVersion.indexOf('_') + 1).replace('_', '.');
+        String instanceId = TestFixtures.uniqueName((mysql ? "java-my-" : "java-pg-") + majorVersion.replace('.', '-'));
 
         DatabaseInstance instance = new DatabaseInstance()
                 .setName(instanceId)
@@ -80,15 +89,30 @@ class CloudSqlAdminTest {
             List<User> users = client.users().list(PROJECT_ID, instanceId).execute().getItems();
             assertThat(users).extracting(User::getName).contains(USER_ID);
             assertThat(users).allMatch(user -> user.getPassword() == null);
+            if (mysql) {
+                // MySQL identities are host-qualified: root@% from provisioning, and a user
+                // inserted without a host lands on '%'.
+                assertThat(users).extracting(User::getName).contains("root");
+                assertThat(users).filteredOn(user -> USER_ID.equals(user.getName()))
+                        .extracting(User::getHost).containsExactly("%");
+                // The Terraform provider deletes root@% right after creating a MySQL instance and
+                // inserts it again to apply root_password; both must reach the server.
+                assertDone(client.users().delete(PROJECT_ID, instanceId).setName("root").setHost("%").execute(),
+                        "DELETE_USER");
+                assertThat(client.users().list(PROJECT_ID, instanceId).execute().getItems())
+                        .extracting(User::getName).doesNotContain("root");
+                assertDone(client.users().insert(PROJECT_ID, instanceId,
+                        new User().setName("root").setPassword("new-root")).execute(), "CREATE_USER");
+            }
 
             DatabaseInstance running = client.instances().get(PROJECT_ID, instanceId).execute();
             String host = running.getIpAddresses().get(0).getIpAddress();
             Number port = (Number) running.getIpAddresses().get(0).get("port");
-            try (var connection = DriverManager.getConnection(
-                    "jdbc:postgresql://" + host + ":" + port.intValue() + "/" + DATABASE_ID,
-                    USER_ID, "secret");
+            String jdbcUrl = (mysql ? "jdbc:mysql://" : "jdbc:postgresql://")
+                    + host + ":" + port.intValue() + "/" + DATABASE_ID;
+            try (var connection = DriverManager.getConnection(jdbcUrl, USER_ID, "secret");
                  var statement = connection.createStatement()) {
-                try (var result = statement.executeQuery("SHOW server_version")) {
+                try (var result = statement.executeQuery(mysql ? "SELECT VERSION()" : "SHOW server_version")) {
                     assertThat(result.next()).isTrue();
                     assertThat(result.getString(1)).startsWith(majorVersion + ".");
                 }

@@ -10,15 +10,17 @@ interface CloudSqlDataPlane {
 
     void stopInstance(String project, String instance, Map<String, Object> metadata, boolean removeStorage);
 
-    void createDatabase(Map<String, Object> instanceMetadata, String database);
+    /** {@code charset} / {@code collation} are the values the stored resource reports (engine defaults when unset). */
+    void createDatabase(Map<String, Object> instanceMetadata, String database, String charset, String collation);
 
     void deleteDatabase(Map<String, Object> instanceMetadata, String database);
 
-    void createOrUpdateUser(Map<String, Object> instanceMetadata, String user, String password);
+    /** {@code host} is the MySQL identity host ({@code %} by default); {@code null} for PostgreSQL. */
+    void createOrUpdateUser(Map<String, Object> instanceMetadata, String user, String host, String password);
 
-    void deleteUser(Map<String, Object> instanceMetadata, String user, Iterable<String> databases);
+    void deleteUser(Map<String, Object> instanceMetadata, String user, String host, Iterable<String> databases);
 
-    void grantDatabaseAccess(Map<String, Object> instanceMetadata, String database, String user);
+    void grantDatabaseAccess(Map<String, Object> instanceMetadata, String database, String user, String host);
 
     static CloudSqlDataPlane noop() {
         return new CloudSqlDataPlane() {
@@ -38,7 +40,8 @@ interface CloudSqlDataPlane {
             }
 
             @Override
-            public void createDatabase(Map<String, Object> instanceMetadata, String database) {
+            public void createDatabase(Map<String, Object> instanceMetadata, String database, String charset,
+                                       String collation) {
             }
 
             @Override
@@ -46,15 +49,18 @@ interface CloudSqlDataPlane {
             }
 
             @Override
-            public void createOrUpdateUser(Map<String, Object> instanceMetadata, String user, String password) {
+            public void createOrUpdateUser(Map<String, Object> instanceMetadata, String user, String host,
+                                           String password) {
             }
 
             @Override
-            public void deleteUser(Map<String, Object> instanceMetadata, String user, Iterable<String> databases) {
+            public void deleteUser(Map<String, Object> instanceMetadata, String user, String host,
+                                   Iterable<String> databases) {
             }
 
             @Override
-            public void grantDatabaseAccess(Map<String, Object> instanceMetadata, String database, String user) {
+            public void grantDatabaseAccess(Map<String, Object> instanceMetadata, String database, String user,
+                                            String host) {
             }
         };
     }

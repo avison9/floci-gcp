@@ -48,7 +48,7 @@ public class CloudSqlService {
                            ServiceRegistry serviceRegistry,
                            EmulatorConfig config,
                            ObjectMapper objectMapper,
-                           CloudSqlPostgresDataPlane dataPlane) {
+                           CloudSqlEngineDataPlane dataPlane) {
         this.instanceStore = storageFactory.create("cloudsql", "cloudsql-instances.json",
                 new TypeReference<Map<String, Map<String, Object>>>() {});
         this.databaseStore = storageFactory.create("cloudsql", "cloudsql-databases.json",
@@ -129,10 +129,7 @@ public class CloudSqlService {
         if (instance == null || instance.isBlank()) {
             throw GcpException.invalidArgument("Instance name is required");
         }
-        String databaseVersion = stringValue(request.get("databaseVersion"));
-        if (databaseVersion == null || !databaseVersion.startsWith("POSTGRES_")) {
-            throw GcpException.invalidArgument("Only PostgreSQL Cloud SQL instances are supported");
-        }
+        CloudSqlEngine engine = CloudSqlEngine.fromDatabaseVersion(stringValue(request.get("databaseVersion")));
         if (instanceStore.get(instanceKey(instance)).isPresent()) {
             throw GcpException.alreadyExists("Cloud SQL instance already exists: " + instance);
         }
@@ -142,15 +139,19 @@ public class CloudSqlService {
             stored = dataPlane.startInstance(project, instance, stored);
         }
         putInstance(project, instance, stored);
-        createDefaultDatabase(project, instance);
+        createSystemDatabases(project, instance, engine);
+        createBuiltInUser(project, instance, engine);
 
-        LOG.infof("create Cloud SQL PostgreSQL instance project=%s instance=%s", project, instance);
+        LOG.infof("create Cloud SQL %s instance project=%s instance=%s", engine, project, instance);
         return createOperation(project, "CREATE", instance, stored);
     }
 
     public Map<String, Object> patchInstance(String project, String instance, Map<String, Object> body) {
         Map<String, Object> existing = getInstance(project, instance);
         Map<String, Object> patch = copy(body);
+        rejectEngineChange(existing, patch);
+        // rootPassword is write-only in the Admin API; a PATCH must not persist it either.
+        patch.remove("rootPassword");
         merge(existing, patch);
         existing.put("kind", "sql#instance");
         existing.put("name", instance);
@@ -158,17 +159,18 @@ public class CloudSqlService {
         existing.put("connectionName", connectionName(project, existing, instance));
         existing.put("selfLink", instanceSelfLink(project, instance));
         instanceStore.put(instanceKey(instance), existing);
-        LOG.infof("patch Cloud SQL PostgreSQL instance project=%s instance=%s", project, instance);
+        LOG.infof("patch Cloud SQL instance project=%s instance=%s", project, instance);
         return createOperation(project, "UPDATE", instance, existing);
     }
 
     public Map<String, Object> updateInstance(String project, String instance, Map<String, Object> body) {
         Map<String, Object> existing = getInstance(project, instance);
         Map<String, Object> update = copy(body);
+        rejectEngineChange(existing, update);
         merge(existing, update);
         Map<String, Object> stored = normalizeInstance(project, instance, existing);
         instanceStore.put(instanceKey(instance), stored);
-        LOG.infof("update Cloud SQL PostgreSQL instance project=%s instance=%s", project, instance);
+        LOG.infof("update Cloud SQL instance project=%s instance=%s", project, instance);
         return createOperation(project, "UPDATE", instance, stored);
     }
 
@@ -201,7 +203,7 @@ public class CloudSqlService {
         instanceStore.delete(instanceKey(instance));
         deleteByPrefix(databaseStore, databasePrefix(instance));
         deleteByPrefix(userStore, userPrefix(instance));
-        LOG.infof("delete Cloud SQL PostgreSQL instance project=%s instance=%s", project, instance);
+        LOG.infof("delete Cloud SQL instance project=%s instance=%s", project, instance);
         return createOperation(project, "DELETE", instance, existing);
     }
 
@@ -223,7 +225,10 @@ public class CloudSqlService {
                         flag("cloudsql.iam_authentication", "BOOLEAN", true,
                                 "POSTGRES_15", "POSTGRES_16", "POSTGRES_17", "POSTGRES_18"),
                         flag("log_min_duration_statement", "INTEGER", false,
-                                "POSTGRES_15", "POSTGRES_16", "POSTGRES_17", "POSTGRES_18")));
+                                "POSTGRES_15", "POSTGRES_16", "POSTGRES_17", "POSTGRES_18"),
+                        flag("max_connections", "INTEGER", false, "MYSQL_8_0", "MYSQL_8_4"),
+                        flag("sql_mode", "STRING", false, "MYSQL_8_0", "MYSQL_8_4"),
+                        flag("character_set_server", "STRING", true, "MYSQL_8_0", "MYSQL_8_4")));
     }
 
     public Map<String, Object> getConnectSettings(String project, String instance) {
@@ -271,15 +276,17 @@ public class CloudSqlService {
         if (databaseStore.get(key).isPresent()) {
             throw GcpException.alreadyExists("Cloud SQL database already exists: " + database);
         }
-        Map<String, Object> stored = normalizeDatabase(project, instance, database, request);
+        Map<String, Object> stored = normalizeDatabase(project, instance, engineOf(instanceMetadata), database, request);
         if (dataPlaneEnabled) {
-            dataPlane.createDatabase(instanceMetadata, database);
-            for (String user : userNames(instance)) {
-                dataPlane.grantDatabaseAccess(instanceMetadata, database, user);
+            dataPlane.createDatabase(instanceMetadata, database,
+                    stringValue(stored.get("charset")), stringValue(stored.get("collation")));
+            for (Map<String, Object> user : users(instance)) {
+                dataPlane.grantDatabaseAccess(instanceMetadata, database,
+                        stringValue(user.get("name")), stringValue(user.get("host")));
             }
         }
         databaseStore.put(key, stored);
-        LOG.infof("create Cloud SQL PostgreSQL database project=%s instance=%s database=%s",
+        LOG.infof("create Cloud SQL database project=%s instance=%s database=%s",
                 project, instance, database);
         return createOperation(project, "CREATE_DATABASE", instance, stored);
     }
@@ -296,9 +303,10 @@ public class CloudSqlService {
         Map<String, Object> existing = getDatabase(project, instance, database);
         Map<String, Object> update = copy(body);
         merge(existing, update);
-        Map<String, Object> stored = normalizeDatabase(project, instance, database, existing);
+        Map<String, Object> stored = normalizeDatabase(project, instance,
+                engineOf(getInstance(project, instance)), database, existing);
         databaseStore.put(databaseKey(instance, database), stored);
-        LOG.infof("update Cloud SQL PostgreSQL database project=%s instance=%s database=%s",
+        LOG.infof("update Cloud SQL database project=%s instance=%s database=%s",
                 project, instance, database);
         return createOperation(project, "UPDATE_DATABASE", instance, stored);
     }
@@ -321,15 +329,15 @@ public class CloudSqlService {
 
     public Map<String, Object> deleteDatabase(String project, String instance, String database) {
         Map<String, Object> instanceMetadata = getInstance(project, instance);
-        if ("postgres".equals(database)) {
-            throw GcpException.failedPrecondition("Default PostgreSQL database cannot be deleted: postgres");
+        if (engineOf(instanceMetadata).isSystemDatabase(database)) {
+            throw GcpException.failedPrecondition("System database cannot be deleted: " + database);
         }
         Map<String, Object> existing = getDatabase(project, instance, database);
         if (dataPlaneEnabled) {
             dataPlane.deleteDatabase(instanceMetadata, database);
         }
         databaseStore.delete(databaseKey(instance, database));
-        LOG.infof("delete Cloud SQL PostgreSQL database project=%s instance=%s database=%s",
+        LOG.infof("delete Cloud SQL database project=%s instance=%s database=%s",
                 project, instance, database);
         return createOperation(project, "DELETE_DATABASE", instance, existing);
     }
@@ -341,21 +349,25 @@ public class CloudSqlService {
         if (user == null || user.isBlank()) {
             throw GcpException.invalidArgument("User name is required");
         }
-        String host = stringValue(request.get("host"));
-        validatePostgresHost(host);
+        CloudSqlEngine engine = engineOf(instanceMetadata);
+        String host = engine.normalizeHost(stringValue(request.get("host")));
         String key = userKey(instance, user, host);
         if (userStore.get(key).isPresent()) {
             throw GcpException.alreadyExists("Cloud SQL user already exists: " + user);
         }
+        if (engine.isReservedIdentity(user, host)) {
+            throw GcpException.invalidArgument("User identity is reserved for the instance administrator: "
+                    + user + (host == null ? "" : "@" + host));
+        }
         if (dataPlaneEnabled) {
-            dataPlane.createOrUpdateUser(instanceMetadata, user, stringValue(request.get("password")));
+            dataPlane.createOrUpdateUser(instanceMetadata, user, host, stringValue(request.get("password")));
             for (String database : databaseNames(instance)) {
-                dataPlane.grantDatabaseAccess(instanceMetadata, database, user);
+                dataPlane.grantDatabaseAccess(instanceMetadata, database, user, host);
             }
         }
         Map<String, Object> stored = normalizeUser(project, instance, user, host, request);
         userStore.put(key, stored);
-        LOG.infof("create Cloud SQL PostgreSQL user project=%s instance=%s user=%s", project, instance, user);
+        LOG.infof("create Cloud SQL user project=%s instance=%s user=%s", project, instance, user);
         return createOperation(project, "CREATE_USER", instance, stored);
     }
 
@@ -371,9 +383,9 @@ public class CloudSqlService {
     }
 
     public Map<String, Object> getUser(String project, String instance, String user, String host) {
-        getInstance(project, instance);
+        Map<String, Object> instanceMetadata = getInstance(project, instance);
         validateUserName(user);
-        validatePostgresHost(host);
+        host = engineOf(instanceMetadata).normalizeHost(host);
         return userStore.get(userKey(instance, user, host))
                 .map(this::copy)
                 .orElseThrow(() -> GcpException.notFound("Cloud SQL user not found: " + user));
@@ -381,19 +393,20 @@ public class CloudSqlService {
 
     public Map<String, Object> updateUser(String project, String instance, String user,
                                           String host, Map<String, Object> body) {
+        Map<String, Object> instanceMetadata = getInstance(project, instance);
+        host = engineOf(instanceMetadata).normalizeHost(host);
         Map<String, Object> existing = getUser(project, instance, user, host);
         Map<String, Object> update = copy(body);
         if (dataPlaneEnabled && update.containsKey("password")) {
-            Map<String, Object> instanceMetadata = getInstance(project, instance);
-            dataPlane.createOrUpdateUser(instanceMetadata, user, stringValue(update.get("password")));
+            dataPlane.createOrUpdateUser(instanceMetadata, user, host, stringValue(update.get("password")));
             for (String database : databaseNames(instance)) {
-                dataPlane.grantDatabaseAccess(instanceMetadata, database, user);
+                dataPlane.grantDatabaseAccess(instanceMetadata, database, user, host);
             }
         }
         merge(existing, update);
         Map<String, Object> stored = normalizeUser(project, instance, user, host, existing);
         userStore.put(userKey(instance, user, host), stored);
-        LOG.infof("update Cloud SQL PostgreSQL user project=%s instance=%s user=%s",
+        LOG.infof("update Cloud SQL user project=%s instance=%s user=%s",
                 project, instance, user);
         return createOperation(project, "UPDATE_USER", instance, stored);
     }
@@ -401,20 +414,27 @@ public class CloudSqlService {
     public Map<String, Object> deleteUser(String project, String instance, String user, String host) {
         Map<String, Object> instanceMetadata = getInstance(project, instance);
         validateUserName(user);
-        validatePostgresHost(host);
+        CloudSqlEngine engine = engineOf(instanceMetadata);
+        host = engine.normalizeHost(host);
         String key = userKey(instance, user, host);
         Map<String, Object> existing = userStore.get(key)
                 .orElseThrow(() -> GcpException.notFound("Cloud SQL user not found: " + user));
+        if (engine.isReservedIdentity(user, host)) {
+            // The data plane's own admin login; dropping it would strand every later DDL call.
+            throw GcpException.failedPrecondition("Built-in user cannot be deleted: " + user);
+        }
         if (dataPlaneEnabled) {
-            dataPlane.deleteUser(instanceMetadata, user, databaseNames(instance));
+            dataPlane.deleteUser(instanceMetadata, user, host, databaseNames(instance));
         }
         userStore.delete(key);
-        LOG.infof("delete Cloud SQL PostgreSQL user project=%s instance=%s user=%s", project, instance, user);
+        LOG.infof("delete Cloud SQL user project=%s instance=%s user=%s", project, instance, user);
         return createOperation(project, "DELETE_USER", instance, existing);
     }
 
     private Map<String, Object> normalizeInstance(String project, String instance, Map<String, Object> request) {
         Map<String, Object> stored = copy(request);
+        // rootPassword is write-only in the Admin API (instances.insert only) and never echoed back.
+        stored.remove("rootPassword");
         putDefault(stored, "kind", "sql#instance");
         stored.put("name", instance);
         stored.put("project", project);
@@ -443,7 +463,7 @@ public class CloudSqlService {
                 Map<String, Object> updated = dataPlane.ensureInstance(project, name, instance);
                 putInstance(project, name, updated);
             } catch (GcpException e) {
-                LOG.warnf("Cloud SQL PostgreSQL data plane was not restored project=%s instance=%s: %s",
+                LOG.warnf("Cloud SQL data plane was not restored project=%s instance=%s: %s",
                         project, name, e.getMessage());
             }
         }
@@ -471,22 +491,63 @@ public class CloudSqlService {
         instanceStore.put(instanceKey(instance), stored);
     }
 
-    private void createDefaultDatabase(String project, String instance) {
-        String key = databaseKey(instance, "postgres");
-        if (databaseStore.get(key).isEmpty()) {
-            databaseStore.put(key, normalizeDatabase(project, instance, "postgres", Map.of("name", "postgres")));
+    /** The databases a fresh instance already has, so {@code databases.list} matches the engine. */
+    private void createSystemDatabases(String project, String instance, CloudSqlEngine engine) {
+        for (String database : engine.systemDatabases()) {
+            String key = databaseKey(instance, database);
+            if (databaseStore.get(key).isEmpty()) {
+                databaseStore.put(key, normalizeDatabase(project, instance, engine, database, Map.of("name", database)));
+            }
         }
     }
 
-    private Map<String, Object> normalizeDatabase(String project, String instance,
+    /** The account the data plane is provisioned with ({@code root@%} on MySQL), listed like real Cloud SQL does. */
+    private void createBuiltInUser(String project, String instance, CloudSqlEngine engine) {
+        String user = engine.builtInUser();
+        if (user == null) {
+            return;
+        }
+        String host = engine.normalizeHost(null);
+        String key = userKey(instance, user, host);
+        if (userStore.get(key).isEmpty()) {
+            userStore.put(key, normalizeUser(project, instance, user, host, Map.of("name", user)));
+        }
+    }
+
+    /**
+     * The engine is fixed by the container an instance was provisioned with; the data plane
+     * dispatches on {@code databaseVersion}, so letting it cross engines would run the MySQL
+     * client against a PostgreSQL container (or restart the wrong image on the retained
+     * volume). Real Cloud SQL has no cross-engine update either. Same-engine version changes
+     * are left as they were.
+     */
+    private void rejectEngineChange(Map<String, Object> existing, Map<String, Object> request) {
+        String requested = stringValue(request.get("databaseVersion"));
+        if (requested != null && CloudSqlEngine.fromDatabaseVersion(requested) != engineOf(existing)) {
+            throw GcpException.invalidArgument("databaseVersion cannot change the instance engine from "
+                    + engineOf(existing) + " to " + CloudSqlEngine.fromDatabaseVersion(requested));
+        }
+    }
+
+    private CloudSqlEngine engineOf(Map<String, Object> instanceMetadata) {
+        return CloudSqlEngine.fromDatabaseVersion(stringValue(instanceMetadata.get("databaseVersion")));
+    }
+
+    private Map<String, Object> normalizeDatabase(String project, String instance, CloudSqlEngine engine,
                                                   String database, Map<String, Object> request) {
         Map<String, Object> stored = copy(request);
         putDefault(stored, "kind", "sql#database");
         stored.put("name", database);
         stored.put("project", project);
         stored.put("instance", instance);
-        putDefault(stored, "charset", "UTF8");
-        putDefault(stored, "collation", "en_US.UTF8");
+        // Charset and collation are a pair: a request naming only one of them gets nothing
+        // defaulted for the other, so the DDL never combines a caller's charset with the
+        // engine-default collation of a different charset. The engine defaults apply only when
+        // the request names neither.
+        if (isBlank(stored.get("charset")) && isBlank(stored.get("collation"))) {
+            stored.put("charset", engine.defaultCharset());
+            stored.put("collation", engine.defaultCollation());
+        }
         stored.put("selfLink", effectiveBaseUrl() + "/v1/projects/" + project
                 + "/instances/" + instance + "/databases/" + database);
         return stored;
@@ -514,10 +575,9 @@ public class CloudSqlService {
                 .toList();
     }
 
-    private List<String> userNames(String instance) {
+    private List<Map<String, Object>> users(String instance) {
         return userStore.scan(k -> k.startsWith(userPrefix(instance))).stream()
-                .map(user -> stringValue(user.get("name")))
-                .filter(name -> name != null && !name.isBlank())
+                .filter(user -> stringValue(user.get("name")) != null && !stringValue(user.get("name")).isBlank())
                 .toList();
     }
 
@@ -625,6 +685,10 @@ public class CloudSqlService {
         return objectMapper.convertValue(value, MAP_TYPE);
     }
 
+    private static boolean isBlank(Object value) {
+        return value == null || value.toString().isBlank();
+    }
+
     private void putDefault(Map<String, Object> map, String key, Object value) {
         if (!map.containsKey(key) || map.get(key) == null) {
             map.put(key, value);
@@ -634,12 +698,6 @@ public class CloudSqlService {
     private void validateUserName(String user) {
         if (user == null || user.isBlank()) {
             throw GcpException.invalidArgument("User name is required");
-        }
-    }
-
-    private void validatePostgresHost(String host) {
-        if (host != null && !host.isBlank()) {
-            throw GcpException.invalidArgument("PostgreSQL Cloud SQL users do not support host-qualified identities");
         }
     }
 
@@ -671,8 +729,14 @@ public class CloudSqlService {
         return "instances/" + instance + "/users/";
     }
 
+    /**
+     * {@code <encoded host>/<user>}: the host is percent-encoded so it can never contain the
+     * {@code /} separator (MySQL hosts may be CIDR ranges), which keeps the key unambiguous for
+     * any user name. PostgreSQL users have no host and keep their pre-existing {@code /user} key.
+     */
     private static String userKey(String instance, String user, String host) {
-        return userPrefix(instance) + (host == null ? "" : host) + "/" + user;
+        String encodedHost = host == null ? "" : java.net.URLEncoder.encode(host, java.nio.charset.StandardCharsets.UTF_8);
+        return userPrefix(instance) + encodedHost + "/" + user;
     }
 
     private static String operationKey(String operation) {

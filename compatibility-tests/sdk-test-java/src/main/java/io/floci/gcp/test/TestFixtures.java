@@ -419,6 +419,10 @@ public final class TestFixtures {
 
     public static SQLAdmin sqlAdminClient() {
         return new SQLAdmin.Builder(new NetHttpTransport(), GsonFactory.getDefaultInstance(), request -> {
+            // instances.insert answers only once the engine container accepts connections. A
+            // cold MySQL data directory takes 15-25 s to initialise (two server starts), past
+            // the client's default 20 s read timeout; PostgreSQL is ready in a few seconds.
+            request.setReadTimeout(120_000);
         })
                 .setApplicationName("floci-gcp-compat")
                 .setRootUrl(endpoint() + "/")
