@@ -72,7 +72,7 @@ public class KafkaService {
                 .enabled(config.services().kafka().enabled())
                 .storageKey("kafka")
                 .protocol(ServiceProtocol.REST)
-                .resourceClasses(KafkaController.class)
+                .resourceClasses(KafkaController.class, KafkaConnectController.class)
                 .build());
         if (!config.services().kafka().mock()) {
             startReadinessPoller();
@@ -122,6 +122,11 @@ public class KafkaService {
         String name = "projects/" + project + "/locations/" + location + "/clusters/" + clusterId;
         return clusterStore.get(name)
                 .orElseThrow(() -> GcpException.notFound("Cluster not found: " + name));
+    }
+
+    /** Whether a Kafka cluster exists under its full resource name; used by the Connect control plane. */
+    boolean clusterExists(String name) {
+        return clusterStore.get(name).isPresent();
     }
 
     public List<StoredCluster> listClusters(String project, String location) {

@@ -87,8 +87,25 @@ curl -X DELETE \
 - `CreateAcl`, `GetAcl`, `ListAcls`, `UpdateAcl`, `DeleteAcl`
 - `AddAclEntry`, `RemoveAclEntry`
 
-This is the full `ManagedKafka` v1 RPC surface. The sibling `ManagedKafkaConnect` and
-Schema Registry services are not served.
+**Kafka Connect (control plane only, no Connect runtime):**
+
+- `CreateConnectCluster`
+- `GetConnectCluster`
+- `ListConnectClusters`
+- `UpdateConnectCluster`
+- `DeleteConnectCluster`
+- `CreateConnector`
+- `GetConnector`
+- `ListConnectors`
+- `UpdateConnector`
+- `DeleteConnector`
+- `PauseConnector`
+- `ResumeConnector`
+- `RestartConnector`
+- `StopConnector`
+
+This is the full `ManagedKafka` v1 RPC surface plus the `ManagedKafkaConnect` control plane. The
+Schema Registry service is not served.
 
 ## ACLs
 
@@ -119,3 +136,39 @@ curl -s "$B/acls/topic/orders"
   is unconditional. `updateMask` may only name `aclEntries`.
 - ACLs are control-plane metadata, like topics in this emulator: the Redpanda container runs
   without an authorizer, so entries are recorded and read back but do not gate produce or consume.
+
+## Kafka Connect
+
+The `ManagedKafkaConnect` service (`connectClusters` and their `connectors`) is served as a control
+plane: a Connect cluster is attached to a Kafka cluster in the same project and location, becomes
+`ACTIVE` immediately, and connectors are created, updated, paused, resumed, restarted, stopped and
+deleted as metadata, with `state` following the lifecycle calls (`RUNNING`, `PAUSED`, `STOPPED`).
+No Connect runtime is started, in mock or Docker mode, so a connector does not move data yet;
+wiring a Connect sidecar to the cluster's Redpanda container is planned as a follow-up that keeps
+this API surface.
+
+```bash
+BASE=http://localhost:4588/v1/projects/floci-local/locations/us-central1
+
+# Create a Connect cluster bound to an existing Kafka cluster (returns a done LRO)
+curl -X POST "$BASE/connectClusters?connectClusterId=my-connect" -H 'Content-Type: application/json' -d '{
+  "kafkaCluster": "projects/floci-local/locations/us-central1/clusters/my-cluster",
+  "capacityConfig": {"vcpuCount": 12, "memoryBytes": "21474836480"},
+  "gcpConfig": {"accessConfig": {"networkConfigs": [
+    {"primarySubnet": "projects/floci-local/regions/us-central1/subnetworks/default"}]}}
+}'
+
+# Create a connector, then pause and resume it
+curl -X POST "$BASE/connectClusters/my-connect/connectors?connectorId=gcs-sink" -H 'Content-Type: application/json' -d '{
+  "configs": {"connector.class": "io.aiven.kafka.connect.gcs.GcsSinkConnector", "topics": "orders", "tasks.max": "1"},
+  "taskRestartPolicy": {"minimumBackoff": "60s", "maximumBackoff": "1800s"}
+}'
+curl -X POST "$BASE/connectClusters/my-connect/connectors/gcs-sink:pause" -H 'Content-Type: application/json' -d '{}'
+curl "$BASE/connectClusters/my-connect/connectors/gcs-sink"     # "state": "PAUSED"
+curl -X POST "$BASE/connectClusters/my-connect/connectors/gcs-sink:resume" -H 'Content-Type: application/json' -d '{}'
+```
+
+`kafkaCluster` is immutable after create; `PATCH` honours `updateMask` (`labels`, `capacityConfig`,
+`gcpConfig`, `config` on a Connect cluster; `configs`, `taskRestartPolicy` on a connector) and, like
+`UpdateCluster`, applies the mutable fields present in the body when no mask is sent. Deleting a
+Connect cluster deletes its connectors.
