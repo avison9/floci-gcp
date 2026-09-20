@@ -11,8 +11,9 @@ import java.util.regex.Pattern;
  * which a string comparison gets wrong. A version is {@code MAJOR.MINOR[.PATCH][-gke.N]}; a missing
  * patch or gke number counts as 0, so {@code 1.30} equals {@code 1.30.0-gke.0}. Anything outside
  * that shape (possible on {@code initialClusterVersion} and a node pool's explicit {@code version},
- * which are stored as sent) sorts after every well-formed version, among themselves by string, so
- * an unparseable value never becomes the minimum the cluster aggregate reports.
+ * which are stored as sent), including a numeric component too large for a {@code long}, sorts
+ * after every well-formed version, among themselves by string, so an unparseable value never
+ * becomes the minimum the cluster aggregate reports and never throws out of a comparison.
  */
 final class GkeVersions {
 
@@ -53,10 +54,14 @@ final class GkeVersions {
         if (!m.matches()) {
             return null;
         }
-        return new long[] {
-                Long.parseLong(m.group(1)),
-                Long.parseLong(m.group(2)),
-                m.group(3) == null ? 0 : Long.parseLong(m.group(3)),
-                m.group(4) == null ? 0 : Long.parseLong(m.group(4))};
+        try {
+            return new long[] {
+                    Long.parseLong(m.group(1)),
+                    Long.parseLong(m.group(2)),
+                    m.group(3) == null ? 0 : Long.parseLong(m.group(3)),
+                    m.group(4) == null ? 0 : Long.parseLong(m.group(4))};
+        } catch (NumberFormatException overflow) {
+            return null;
+        }
     }
 }

@@ -31,6 +31,10 @@ class GkeVersionsTest {
     @Test
     void unparseableVersionsSortLastAndNeverWinTheMinimum() {
         assertTrue(GkeVersions.compare("banana", "1.30.5-gke.1") > 0);
+        // A component beyond the long range is unparseable, not an exception out of the comparison.
+        String huge = "1.999999999999999999999.0-gke.1";
+        assertTrue(GkeVersions.compare(huge, "1.30.5-gke.1") > 0);
+        assertEquals(Optional.of("1.30.5-gke.1"), GkeVersions.minimum(List.of(huge, "1.30.5-gke.1")));
         assertTrue(GkeVersions.compare("apple", "banana") < 0);
         List<String> versions = Arrays.asList("banana", "1.30.5-gke.1014001", null, " ", "1.29.0-gke.1", "1.9.0-gke.1");
         assertEquals(Optional.of("1.9.0-gke.1"), GkeVersions.minimum(versions));

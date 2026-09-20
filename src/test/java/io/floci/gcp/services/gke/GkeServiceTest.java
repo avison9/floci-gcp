@@ -800,6 +800,37 @@ class GkeServiceTest {
     }
 
     @Test
+    void startupRefreshesAggregatesPersistedByEarlierBuilds() {
+        // A cluster written by a build that never recomputed the aggregate: the pool moved on to
+        // the default version through UpdateNodePool, the cluster still says 1.29.0-gke.1.
+        String clusterName = "projects/" + PROJECT + "/locations/" + LOCATION + "/clusters/stale";
+        StoredCluster stale = new StoredCluster();
+        stale.setName("stale");
+        stale.setProject(PROJECT);
+        stale.setLocation(LOCATION);
+        stale.setCurrentMasterVersion("1.29.0-gke.1");
+        stale.setCurrentNodeVersion("1.29.0-gke.1");
+        InMemoryStorage<String, StoredCluster> clusterStore = new InMemoryStorage<>();
+        clusterStore.put(clusterName, stale);
+        InMemoryStorage<String, StoredNodePool> poolStore = new InMemoryStorage<>();
+        for (String[] pool : new String[][] {{"default-pool", "1.30.5-gke.1014001"}, {"workers", "1.30.1-gke.7"}}) {
+            StoredNodePool p = new StoredNodePool();
+            p.setName(pool[0]);
+            p.setProject(PROJECT);
+            p.setLocation(LOCATION);
+            p.setClusterId("stale");
+            p.setVersion(pool[1]);
+            poolStore.put(clusterName + "/nodePools/" + pool[0], p);
+        }
+        GkeService restarted = new GkeService(clusterStore, poolStore, config, clusterManager,
+                new GkeOperationService(new InMemoryStorage<String, StoredOperation>()), null);
+
+        restarted.init();
+
+        assertEquals("1.30.1-gke.7", restarted.getCluster(PROJECT, LOCATION, "stale").getCurrentNodeVersion());
+    }
+
+    @Test
     void updateNodePoolMovesTheClusterNodeVersionAggregate() {
         // #233: only createCluster and UpdateCluster wrote currentNodeVersion, so a pool upgraded
         // through UpdateNodePool left the cluster reporting the version no pool ran any more.

@@ -112,6 +112,7 @@ public class GkeService {
     @PostConstruct
     public void init() {
         migrateEmbeddedNodePools();
+        refreshPersistedNodeVersionAggregates();
         if (!mock()) {
             poller.scheduleAtFixedRate(this::pollReadiness, 2, 3, TimeUnit.SECONDS);
         }
@@ -852,6 +853,20 @@ public class GkeService {
 
     private List<String> poolVersions(String project, String location, String clusterId) {
         return listNodePools(project, location, clusterId).stream().map(StoredNodePool::getVersion).toList();
+    }
+
+    /** Clusters persisted by a build that wrote {@code currentNodeVersion} only from
+     * {@code CreateCluster} and {@code UpdateCluster} may carry a stale aggregate. One pass at
+     * startup, after the embedded pools have moved into the pool store, brings every cluster to
+     * the minimum over its pools, so a read after the upgrade is right without waiting for the
+     * next pool mutation. Idempotent: a cluster already at the minimum is not rewritten. */
+    private void refreshPersistedNodeVersionAggregates() {
+        for (StoredCluster cluster : clusterStore.scan(k -> true)) {
+            if (cluster.getProject() == null || cluster.getLocation() == null || cluster.getName() == null) {
+                continue;
+            }
+            refreshCurrentNodeVersion(cluster.getProject(), cluster.getLocation(), cluster.getName(), cluster);
+        }
     }
 
     private StoredNodePool requireNodePool(String project, String location, String clusterId, String nodePoolId) {
