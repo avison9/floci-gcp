@@ -3,13 +3,16 @@ package io.floci.gcp.services.kafka;
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.floci.gcp.config.EmulatorConfig;
 import io.floci.gcp.core.common.GcpException;
+import io.floci.gcp.core.common.PageToken;
 import io.floci.gcp.core.common.ServiceDescriptor;
 import io.floci.gcp.core.common.ServiceProtocol;
 import io.floci.gcp.core.common.ServiceRegistry;
 import io.floci.gcp.core.common.docker.ContainerStorageHelper;
 import io.floci.gcp.core.storage.StorageBackend;
 import io.floci.gcp.core.storage.StorageFactory;
+import io.floci.gcp.services.kafka.model.AclEntry;
 import io.floci.gcp.services.kafka.model.ClusterState;
+import io.floci.gcp.services.kafka.model.StoredAcl;
 import io.floci.gcp.services.kafka.model.StoredCluster;
 import io.floci.gcp.services.kafka.model.StoredConsumerGroup;
 import io.floci.gcp.services.kafka.model.StoredTopic;
@@ -21,8 +24,13 @@ import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.security.SecureRandom;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -35,6 +43,7 @@ public class KafkaService {
     private final StorageBackend<String, StoredCluster> clusterStore;
     private final StorageBackend<String, StoredTopic> topicStore;
     private final StorageBackend<String, StoredConsumerGroup> consumerGroupStore;
+    private final StorageBackend<String, StoredAcl> aclStore;
     private final EmulatorConfig config;
     private final ServiceRegistry serviceRegistry;
     private final RedpandaManager redpandaManager;
@@ -51,6 +60,8 @@ public class KafkaService {
                 new TypeReference<Map<String, StoredTopic>>() {});
         this.consumerGroupStore = storageFactory.createGlobal("kafka", "kafka-consumer-groups.json",
                 new TypeReference<Map<String, StoredConsumerGroup>>() {});
+        this.aclStore = storageFactory.createGlobal("kafka", "kafka-acls.json",
+                new TypeReference<Map<String, StoredAcl>>() {});
         this.config = config;
         this.serviceRegistry = serviceRegistry;
         this.redpandaManager = redpandaManager;
@@ -137,6 +148,10 @@ public class KafkaService {
         String groupPrefix = name + "/consumerGroups/";
         consumerGroupStore.scan(k -> k.startsWith(groupPrefix))
                 .forEach(g -> consumerGroupStore.delete(g.getName()));
+
+        String aclPrefix = name + "/acls/";
+        aclStore.scan(k -> k.startsWith(aclPrefix))
+                .forEach(a -> aclStore.delete(a.getName()));
 
         clusterStore.delete(name);
     }
@@ -271,6 +286,203 @@ public class KafkaService {
         consumerGroupStore.get(groupName)
                 .orElseThrow(() -> GcpException.notFound("Consumer group not found: " + groupName));
         consumerGroupStore.delete(groupName);
+    }
+
+    // ── ACLs ──────────────────────────────────────────────────────────────────
+
+    /** The proto caps {@code acl_entries} at 100 per ACL. */
+    static final int MAX_ACL_ENTRIES = 100;
+    private static final Set<String> PERMISSION_TYPES = Set.of("ALLOW", "DENY");
+    private static final Set<String> OPERATIONS = Set.of("ALL", "READ", "WRITE", "CREATE", "DELETE", "ALTER",
+            "DESCRIBE", "CLUSTER_ACTION", "DESCRIBE_CONFIGS", "ALTER_CONFIGS", "IDEMPOTENT_WRITE");
+
+    /**
+     * ACLs are kept as control-plane metadata, like topics are in this emulator: the Redpanda
+     * container runs without an authorizer, so entries describe intent for tooling to read back
+     * rather than gate the data plane. Every field the proto derives from the id is derived here.
+     */
+    public StoredAcl createAcl(String project, String location, String clusterId, String aclId,
+                               StoredAcl body) {
+        String clusterName = requireCluster(project, location, clusterId);
+        AclResourcePattern pattern = AclResourcePattern.parse(aclId);
+        String name = clusterName + "/acls/" + aclId;
+        if (aclStore.get(name).isPresent()) {
+            throw GcpException.alreadyExists("Acl already exists: " + name);
+        }
+        List<AclEntry> entries = normalizeEntries(body == null ? null : body.getAclEntries());
+        if (entries.isEmpty()) {
+            throw GcpException.invalidArgument("aclEntries is required and must not be empty");
+        }
+        StoredAcl acl = new StoredAcl(name, pattern.resourceType(), pattern.resourceName(), pattern.patternType());
+        acl.setAclEntries(entries);
+        acl.setEtag(newEtag());
+        aclStore.put(name, acl);
+        return acl;
+    }
+
+    public StoredAcl getAcl(String project, String location, String clusterId, String aclId) {
+        String clusterName = requireCluster(project, location, clusterId);
+        String name = clusterName + "/acls/" + aclId;
+        return aclStore.get(name)
+                .orElseThrow(() -> GcpException.notFound("Acl not found: " + name));
+    }
+
+    public PageToken.Page<StoredAcl> listAcls(String project, String location, String clusterId,
+                                              int pageSize, String pageToken) {
+        String prefix = requireCluster(project, location, clusterId) + "/acls/";
+        List<StoredAcl> all = new ArrayList<>(aclStore.scan(k -> k.startsWith(prefix)));
+        all.sort(java.util.Comparator.comparing(StoredAcl::getName));
+        return PageToken.paginate(all, pageSize <= 0 ? 500 : Math.min(pageSize, 1000), pageToken);
+    }
+
+    /**
+     * {@code acl_entries} is the only mutable field. An {@code etag} on the request must match
+     * the stored one (AIP-154: mismatch is {@code ABORTED}); absent, the update is unconditional.
+     */
+    public StoredAcl updateAcl(String project, String location, String clusterId, String aclId,
+                               StoredAcl body, String updateMask) {
+        StoredAcl acl = getAcl(project, location, clusterId, aclId);
+        if (updateMask != null && !updateMask.isBlank()) {
+            boolean touchesEntries = false;
+            for (String path : updateMask.split(",")) {
+                String field = path.strip();
+                if (field.equals("*") || field.equals("aclEntries") || field.equals("acl_entries")) {
+                    touchesEntries = true;
+                } else if (!field.isEmpty()) {
+                    throw GcpException.invalidArgument("update_mask may only name acl_entries, got: " + field);
+                }
+            }
+            if (!touchesEntries) {
+                return acl;
+            }
+        }
+        if (body != null && body.getEtag() != null && !body.getEtag().isBlank()
+                && !body.getEtag().equals(acl.getEtag())) {
+            throw GcpException.aborted("Acl etag mismatch: the acl was modified since it was read");
+        }
+        List<AclEntry> entries = normalizeEntries(body == null ? null : body.getAclEntries());
+        if (entries.isEmpty()) {
+            throw GcpException.invalidArgument("aclEntries is required and must not be empty");
+        }
+        acl.setAclEntries(entries);
+        acl.setEtag(newEtag());
+        aclStore.put(acl.getName(), acl);
+        return acl;
+    }
+
+    public void deleteAcl(String project, String location, String clusterId, String aclId) {
+        StoredAcl acl = getAcl(project, location, clusterId, aclId);
+        aclStore.delete(acl.getName());
+    }
+
+    /** Incremental add; creates the ACL when it does not exist yet, which the response reports. */
+    public AddAclEntryResult addAclEntry(String project, String location, String clusterId, String aclId,
+                                         AclEntry entry) {
+        String clusterName = requireCluster(project, location, clusterId);
+        AclEntry normalized = normalizeEntry(entry);
+        String name = clusterName + "/acls/" + aclId;
+        StoredAcl existing = aclStore.get(name).orElse(null);
+        if (existing == null) {
+            AclResourcePattern pattern = AclResourcePattern.parse(aclId);
+            StoredAcl acl = new StoredAcl(name, pattern.resourceType(), pattern.resourceName(), pattern.patternType());
+            acl.setAclEntries(new ArrayList<>(List.of(normalized)));
+            acl.setEtag(newEtag());
+            aclStore.put(name, acl);
+            return new AddAclEntryResult(acl, true);
+        }
+        if (!existing.getAclEntries().contains(normalized)) {
+            if (existing.getAclEntries().size() >= MAX_ACL_ENTRIES) {
+                throw GcpException.invalidArgument("An acl may hold at most " + MAX_ACL_ENTRIES + " entries");
+            }
+            List<AclEntry> entries = new ArrayList<>(existing.getAclEntries());
+            entries.add(normalized);
+            existing.setAclEntries(entries);
+            existing.setEtag(newEtag());
+            aclStore.put(name, existing);
+        }
+        return new AddAclEntryResult(existing, false);
+    }
+
+    /** Incremental remove; deletes the ACL when the removed entry was its last, which the response reports. */
+    public RemoveAclEntryResult removeAclEntry(String project, String location, String clusterId, String aclId,
+                                               AclEntry entry) {
+        StoredAcl acl = getAcl(project, location, clusterId, aclId);
+        AclEntry normalized = normalizeEntry(entry);
+        if (!acl.getAclEntries().contains(normalized)) {
+            throw GcpException.notFound("Acl entry not found on " + acl.getName());
+        }
+        List<AclEntry> entries = new ArrayList<>(acl.getAclEntries());
+        entries.remove(normalized);
+        if (entries.isEmpty()) {
+            aclStore.delete(acl.getName());
+            return new RemoveAclEntryResult(null, true);
+        }
+        acl.setAclEntries(entries);
+        acl.setEtag(newEtag());
+        aclStore.put(acl.getName(), acl);
+        return new RemoveAclEntryResult(acl, false);
+    }
+
+    public record AddAclEntryResult(StoredAcl acl, boolean aclCreated) {}
+
+    public record RemoveAclEntryResult(StoredAcl acl, boolean aclDeleted) {}
+
+    private String requireCluster(String project, String location, String clusterId) {
+        String clusterName = "projects/" + project + "/locations/" + location + "/clusters/" + clusterId;
+        if (clusterStore.get(clusterName).isEmpty()) {
+            throw GcpException.notFound("Cluster not found: " + clusterName);
+        }
+        return clusterName;
+    }
+
+    /** Validates and canonicalises entries; identical entries collapse to one. */
+    private static List<AclEntry> normalizeEntries(List<AclEntry> entries) {
+        if (entries == null) {
+            return List.of();
+        }
+        if (entries.size() > MAX_ACL_ENTRIES) {
+            throw GcpException.invalidArgument("An acl may hold at most " + MAX_ACL_ENTRIES + " entries");
+        }
+        Set<AclEntry> unique = new LinkedHashSet<>();
+        for (AclEntry entry : entries) {
+            unique.add(normalizeEntry(entry));
+        }
+        return new ArrayList<>(unique);
+    }
+
+    /**
+     * Applies the {@code AclEntry} field rules from resources.proto: the principal carries the
+     * StandardAuthorizer {@code User:} prefix (or is {@code User:*}), permission and operation are
+     * matched case-insensitively and stored upper-case, and the host must be {@code *}.
+     */
+    private static AclEntry normalizeEntry(AclEntry entry) {
+        if (entry == null) {
+            throw GcpException.invalidArgument("aclEntry is required");
+        }
+        String principal = entry.getPrincipal();
+        if (principal == null || !principal.startsWith("User:") || principal.length() <= "User:".length()) {
+            throw GcpException.invalidArgument("aclEntry.principal must be \"User:<account>\" or \"User:*\"");
+        }
+        String permission = upper(entry.getPermissionType());
+        if (!PERMISSION_TYPES.contains(permission)) {
+            throw GcpException.invalidArgument("aclEntry.permissionType must be ALLOW or DENY");
+        }
+        String operation = upper(entry.getOperation());
+        if (!OPERATIONS.contains(operation)) {
+            throw GcpException.invalidArgument("aclEntry.operation must be one of " + String.join(", ", OPERATIONS));
+        }
+        if (!"*".equals(entry.getHost())) {
+            throw GcpException.invalidArgument("aclEntry.host must be \"*\"");
+        }
+        return new AclEntry(principal, permission, operation, "*");
+    }
+
+    private static String upper(String value) {
+        return value == null ? "" : value.strip().toUpperCase(Locale.ROOT);
+    }
+
+    private static String newEtag() {
+        return UUID.randomUUID().toString().replace("-", "").substring(0, 16);
     }
 
     // ── Internals ─────────────────────────────────────────────────────────────

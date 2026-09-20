@@ -147,6 +147,44 @@ class KafkaTest {
 
     @Test
     @Order(10)
+    void aclsFollowTheResourcePatternGrammarAndSupportIncrementalEntries() throws Exception {
+        String clusterPath = "/v1/projects/" + PROJECT + "/locations/" + LOCATION + "/clusters/" + CLUSTER_ID;
+        String entry = json.writeValueAsString(Map.of(
+                "principal", "User:reader@" + PROJECT + ".iam.gserviceaccount.com",
+                "permissionType", "ALLOW", "operation", "READ", "host", "*"));
+
+        JsonNode created = post(clusterPath + "/acls?aclId=topic/" + TOPIC_ID,
+                "{\"aclEntries\":[" + entry + "]}");
+        assertThat(created.path("name").asText()).endsWith("/acls/topic/" + TOPIC_ID);
+        assertThat(created.path("resourceType").asText()).isEqualTo("TOPIC");
+        assertThat(created.path("resourceName").asText()).isEqualTo(TOPIC_ID);
+        assertThat(created.path("patternType").asText()).isEqualTo("LITERAL");
+        assertThat(created.path("etag").asText()).isNotBlank();
+
+        JsonNode fetched = get(clusterPath + "/acls/topic/" + TOPIC_ID);
+        assertThat(fetched.path("aclEntries")).hasSize(1);
+
+        // addAclEntry creates the ACL when it does not exist yet
+        String writer = json.writeValueAsString(Map.of(
+                "principal", "User:writer@" + PROJECT + ".iam.gserviceaccount.com",
+                "permissionType", "ALLOW", "operation", "WRITE", "host", "*"));
+        JsonNode added = post(clusterPath + "/acls/allTopics:addAclEntry", writer);
+        assertThat(added.path("aclCreated").asBoolean()).isTrue();
+        assertThat(added.path("acl").path("resourceName").asText()).isEqualTo("*");
+
+        JsonNode listed = get(clusterPath + "/acls");
+        assertThat(listed.path("acls")).hasSize(2);
+
+        // removeAclEntry deletes the ACL when the last entry goes
+        JsonNode removed = post(clusterPath + "/acls/allTopics:removeAclEntry", writer);
+        assertThat(removed.path("aclDeleted").asBoolean()).isTrue();
+
+        delete(clusterPath + "/acls/topic/" + TOPIC_ID);
+        assertThat(get(clusterPath + "/acls").path("acls")).isEmpty();
+    }
+
+    @Test
+    @Order(11)
     void deleteTopic() throws Exception {
         delete("/v1/projects/" + PROJECT + "/locations/" + LOCATION
                 + "/clusters/" + CLUSTER_ID + "/topics/" + TOPIC_ID);
@@ -159,7 +197,7 @@ class KafkaTest {
     }
 
     @Test
-    @Order(11)
+    @Order(12)
     void deleteCluster() throws Exception {
         delete("/v1/projects/" + PROJECT + "/locations/" + LOCATION + "/clusters/" + CLUSTER_ID);
 
