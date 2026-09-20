@@ -1,5 +1,7 @@
 package io.floci.gcp.services.kafka;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.gcp.core.common.GcpException;
 import io.floci.gcp.core.common.PageToken;
 import io.floci.gcp.services.kafka.model.ConnectorState;
@@ -28,8 +30,10 @@ import java.util.UUID;
  * {@link KafkaController} on the same {@code /v1/projects/{p}/locations/{l}} root.
  *
  * <p>The Connect cluster RPCs return immediately-complete LROs ({@code done: true}), as the Kafka
- * cluster RPCs do. Connector RPCs return the resource directly, and the four lifecycle methods
- * return their empty {@code *ConnectorResponse} messages, as the proto declares.
+ * cluster RPCs do, with the {@code response} carrying its {@code Any} type URL so a generated
+ * client ({@code createConnectClusterAsync(...).get()}) can unpack it. Connector RPCs return the
+ * resource directly, and the four lifecycle methods return their empty
+ * {@code *ConnectorResponse} messages, as the proto declares.
  */
 @Path("/v1/projects/{project}/locations/{location}")
 @ApplicationScoped
@@ -37,11 +41,17 @@ import java.util.UUID;
 @Consumes(MediaType.APPLICATION_JSON)
 public class KafkaConnectController {
 
+    private static final String CONNECT_CLUSTER_TYPE = "type.googleapis.com/google.cloud.managedkafka.v1.ConnectCluster";
+    private static final String EMPTY_TYPE = "type.googleapis.com/google.protobuf.Empty";
+    private static final TypeReference<Map<String, Object>> MAP_TYPE = new TypeReference<>() {};
+
     private final KafkaConnectService service;
+    private final ObjectMapper objectMapper;
 
     @Inject
-    public KafkaConnectController(KafkaConnectService service) {
+    public KafkaConnectController(KafkaConnectService service, ObjectMapper objectMapper) {
         this.service = service;
+        this.objectMapper = objectMapper;
     }
 
     // ── Connect clusters ──────────────────────────────────────────────────────
@@ -56,7 +66,7 @@ public class KafkaConnectController {
             throw GcpException.invalidArgument("connectClusterId query parameter is required");
         }
         StoredConnectCluster cluster = service.createConnectCluster(project, location, connectClusterId, body);
-        return Response.ok(operationDone(project, location, cluster)).build();
+        return Response.ok(operationDone(project, location, any(CONNECT_CLUSTER_TYPE, cluster))).build();
     }
 
     @GET
@@ -86,7 +96,7 @@ public class KafkaConnectController {
                                          Map<String, Object> body) {
         StoredConnectCluster cluster =
                 service.updateConnectCluster(project, location, connectClusterId, updateMask, body);
-        return Response.ok(operationDone(project, location, cluster)).build();
+        return Response.ok(operationDone(project, location, any(CONNECT_CLUSTER_TYPE, cluster))).build();
     }
 
     @DELETE
@@ -95,7 +105,7 @@ public class KafkaConnectController {
                                          @PathParam("location") String location,
                                          @PathParam("connectClusterId") String connectClusterId) {
         service.deleteConnectCluster(project, location, connectClusterId);
-        return Response.ok(operationDone(project, location, Map.of())).build();
+        return Response.ok(operationDone(project, location, Map.of("@type", EMPTY_TYPE))).build();
     }
 
     // ── Connectors ────────────────────────────────────────────────────────────
@@ -213,6 +223,14 @@ public class KafkaConnectController {
                 "name", "projects/" + project + "/locations/" + location + "/operations/" + UUID.randomUUID(),
                 "done", true,
                 "response", response);
+    }
+
+    /** The JSON form of a {@code google.protobuf.Any}: the message's fields plus its type URL under {@code @type}. */
+    private Map<String, Object> any(String typeUrl, Object message) {
+        Map<String, Object> any = new LinkedHashMap<>();
+        any.put("@type", typeUrl);
+        any.putAll(objectMapper.convertValue(message, MAP_TYPE));
+        return any;
     }
 
     private static Map<String, Object> listResponse(String field, PageToken.Page<?> page) {

@@ -24,6 +24,15 @@
 
     <dependencyManagement>
         <dependencies>
+            <!-- Imported ahead of libraries-bom, whose managedkafka (0.12.0) predates the
+                 ManagedKafkaConnect client; first import wins for the three managedkafka artifacts. -->
+            <dependency>
+                <groupId>com.google.cloud</groupId>
+                <artifactId>google-cloud-managedkafka-bom</artifactId>
+                <version>0.17.0</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
             <dependency>
                 <groupId>com.google.cloud</groupId>
                 <artifactId>libraries-bom</artifactId>
@@ -96,6 +105,10 @@
         <dependency>
             <groupId>com.google.cloud</groupId>
             <artifactId>google-cloud-container</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.google.cloud</groupId>
+            <artifactId>google-cloud-managedkafka</artifactId>
         </dependency>
         <dependency>
             <groupId>com.google.cloud</groupId>

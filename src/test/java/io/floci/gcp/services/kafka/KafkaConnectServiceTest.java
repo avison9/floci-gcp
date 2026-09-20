@@ -169,6 +169,71 @@ class KafkaConnectServiceTest {
     }
 
     @Test
+    void nestedMaskPathsReplaceOnlyTheNamedLeaf() {
+        Map<String, Object> body = validBody();
+        body.put("labels", Map.of("env", "dev", "team", "data"));
+        service.createConnectCluster(PROJECT, LOCATION, "cc", body);
+
+        // capacityConfig.vcpuCount with only vcpuCount in the body: memoryBytes is kept, not required again.
+        StoredConnectCluster cpu = service.updateConnectCluster(PROJECT, LOCATION, "cc", "capacityConfig.vcpuCount",
+                Map.of("capacityConfig", Map.of("vcpuCount", 24)));
+        assertEquals(Map.of("vcpuCount", 24L, "memoryBytes", 21474836480L), cpu.getCapacityConfig());
+
+        // labels.env replaces one key and keeps the other; a masked leaf absent from the body is cleared.
+        StoredConnectCluster env = service.updateConnectCluster(PROJECT, LOCATION, "cc", "labels.env",
+                Map.of("labels", Map.of("env", "prod", "team", "ignored")));
+        assertEquals(Map.of("env", "prod", "team", "data"), env.getLabels());
+        StoredConnectCluster cleared = service.updateConnectCluster(PROJECT, LOCATION, "cc", "labels.team", Map.of());
+        assertEquals(Map.of("env", "prod"), cleared.getLabels());
+
+        // A deeper path merges into the stored structure and the whole is re-validated.
+        StoredConnectCluster secrets = service.updateConnectCluster(PROJECT, LOCATION, "cc", "gcp_config.secret_paths",
+                Map.of("gcpConfig", Map.of("secretPaths", List.of("projects/p/secrets/s/versions/1"))));
+        assertEquals(List.of("projects/p/secrets/s/versions/1"), secrets.getGcpConfig().get("secretPaths"));
+        assertEquals(GCP_CONFIG.get("accessConfig"), secrets.getGcpConfig().get("accessConfig"));
+        assertEquals("INVALID_ARGUMENT", assertThrows(GcpException.class, () -> service.updateConnectCluster(
+                PROJECT, LOCATION, "cc", "capacityConfig.memoryBytes", Map.of())).getGcpStatus());
+        assertEquals(24L, service.getConnectCluster(PROJECT, LOCATION, "cc").getCapacityConfig().get("vcpuCount"));
+
+        // The connector side: one backoff replaced, the other kept.
+        service.createConnector(PROJECT, LOCATION, "cc", "sink", Map.of(
+                "taskRestartPolicy", Map.of("minimumBackoff", "60s", "maximumBackoff", "1800s")));
+        StoredConnector connector = service.updateConnector(PROJECT, LOCATION, "cc", "sink", "taskRestartPolicy.minimumBackoff",
+                Map.of("taskRestartPolicy", Map.of("minimumBackoff", "5s")));
+        assertEquals(Map.of("minimumBackoff", "5s", "maximumBackoff", "1800s"), connector.getTaskRestartPolicy());
+    }
+
+    @Test
+    void int64FieldsMustBeWholeNumbersInRange() {
+        for (Object bad : new Object[] {12.5, "12.5", "1e3", "abc", " ", "99999999999999999999", 9.223372036854776E18,
+                -1, "0", Map.of()}) {
+            Map<String, Object> body = validBody();
+            body.put("capacityConfig", Map.of("vcpuCount", bad, "memoryBytes", 1));
+            GcpException error = assertThrows(GcpException.class,
+                    () -> service.createConnectCluster(PROJECT, LOCATION, "cc", body), String.valueOf(bad));
+            assertEquals("INVALID_ARGUMENT", error.getGcpStatus(), String.valueOf(bad));
+        }
+        Map<String, Object> max = validBody();
+        max.put("capacityConfig", Map.of("vcpuCount", "9223372036854775807", "memoryBytes", 12.0));
+        assertEquals(Map.of("vcpuCount", Long.MAX_VALUE, "memoryBytes", 12L),
+                service.createConnectCluster(PROJECT, LOCATION, "cc", max).getCapacityConfig());
+    }
+
+    @Test
+    void resourceIdsFollowTheDocumentedGrammar() {
+        service.createConnectCluster(PROJECT, LOCATION, "ok-1", validBody());
+        for (String bad : List.of("", "Upper", "-lead", "trail-", "a/b", "a:b", "a.b", "1abc", "a".repeat(64))) {
+            assertEquals("INVALID_ARGUMENT", assertThrows(GcpException.class,
+                    () -> service.createConnectCluster(PROJECT, LOCATION, bad, validBody())).getGcpStatus(), bad);
+            assertEquals("INVALID_ARGUMENT", assertThrows(GcpException.class,
+                    () -> service.createConnector(PROJECT, LOCATION, "ok-1", bad, Map.of())).getGcpStatus(), bad);
+        }
+        service.createConnector(PROJECT, LOCATION, "ok-1", "a".repeat(63), Map.of());
+        assertEquals(1, service.listConnectClusters(PROJECT, LOCATION, null, null).items().size());
+        assertEquals(1, service.listConnectors(PROJECT, LOCATION, "ok-1", null, null).items().size());
+    }
+
+    @Test
     void listsArePagedAndDeleteCascadesToConnectors() {
         for (String id : List.of("b", "a", "c")) {
             service.createConnectCluster(PROJECT, LOCATION, id, validBody());

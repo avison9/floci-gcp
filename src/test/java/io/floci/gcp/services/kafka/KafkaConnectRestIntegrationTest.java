@@ -64,6 +64,8 @@ class KafkaConnectRestIntegrationTest {
                 .statusCode(200)
                 .body("name", startsWith("projects/" + PROJECT + "/locations/" + LOCATION + "/operations/"))
                 .body("done", equalTo(true))
+                // the Any type URL a generated client needs to unpack the response
+                .body("response.'@type'", equalTo("type.googleapis.com/google.cloud.managedkafka.v1.ConnectCluster"))
                 .body("response.name", equalTo(connectName))
                 .body("response.kafkaCluster", equalTo(kafka))
                 .body("response.state", equalTo("ACTIVE"))
@@ -196,7 +198,7 @@ class KafkaConnectRestIntegrationTest {
                 .then()
                 .statusCode(200)
                 .body("done", equalTo(true))
-                .body("response", equalTo(java.util.Map.of()));
+                .body("response", equalTo(java.util.Map.of("@type", "type.googleapis.com/google.protobuf.Empty")));
         given().when().get(connectPath).then().statusCode(404);
         given().when().get(connector).then().statusCode(404);
 

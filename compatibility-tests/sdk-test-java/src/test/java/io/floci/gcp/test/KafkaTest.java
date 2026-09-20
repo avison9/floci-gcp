@@ -20,7 +20,6 @@ class KafkaTest {
     private static final String LOCATION = "us-central1";
     private static final String CLUSTER_ID = TestFixtures.uniqueName("java-cluster");
     private static final String TOPIC_ID = TestFixtures.uniqueName("java-topic");
-    private static final String CONNECT_ID = TestFixtures.uniqueName("java-connect");
 
     private static final HttpClient http = HttpClient.newHttpClient();
     private static final ObjectMapper json = new ObjectMapper();
@@ -31,7 +30,6 @@ class KafkaTest {
 
     @AfterAll
     static void tearDown() throws Exception {
-        delete("/v1/projects/" + PROJECT + "/locations/" + LOCATION + "/connectClusters/" + CONNECT_ID);
         delete("/v1/projects/" + PROJECT + "/locations/" + LOCATION + "/clusters/" + CLUSTER_ID);
     }
 
@@ -200,59 +198,6 @@ class KafkaTest {
 
     @Test
     @Order(12)
-    void connectClusterAndConnectorLifecycle() throws Exception {
-        // ManagedKafkaConnect control plane: a Connect cluster bound to the Kafka cluster above,
-        // then a connector moved through pause / resume / stop / restart.
-        String connectClusters = "/v1/projects/" + PROJECT + "/locations/" + LOCATION + "/connectClusters";
-        String connectCluster = connectClusters + "/" + CONNECT_ID;
-        String kafkaCluster = "projects/" + PROJECT + "/locations/" + LOCATION + "/clusters/" + CLUSTER_ID;
-
-        JsonNode created = post(connectClusters + "?connectClusterId=" + CONNECT_ID, json.writeValueAsString(Map.of(
-                "kafkaCluster", kafkaCluster,
-                "capacityConfig", Map.of("vcpuCount", 12, "memoryBytes", "21474836480"),
-                "gcpConfig", Map.of("accessConfig", Map.of("networkConfigs",
-                        List.of(Map.of("primarySubnet", "projects/test/regions/us-central1/subnetworks/default")))),
-                "labels", Map.of("env", "compat"))));
-        assertThat(created.path("done").asBoolean()).isTrue();
-        assertThat(created.path("response").path("name").asText()).endsWith("/connectClusters/" + CONNECT_ID);
-        assertThat(created.path("response").path("kafkaCluster").asText()).isEqualTo(kafkaCluster);
-        assertThat(created.path("response").path("state").asText()).isEqualTo("ACTIVE");
-        assertThat(created.path("response").path("capacityConfig").path("vcpuCount").asLong()).isEqualTo(12);
-
-        JsonNode updated = patch(connectCluster + "?updateMask=labels", json.writeValueAsString(Map.of(
-                "labels", Map.of("env", "compat", "team", "data"))));
-        assertThat(updated.path("response").path("labels").path("team").asText()).isEqualTo("data");
-
-        JsonNode connector = post(connectCluster + "/connectors?connectorId=gcs-sink", json.writeValueAsString(Map.of(
-                "configs", Map.of("connector.class", "io.aiven.kafka.connect.gcs.GcsSinkConnector",
-                        "topics", TOPIC_ID, "tasks.max", "1"),
-                "taskRestartPolicy", Map.of("minimumBackoff", "60s", "maximumBackoff", "1800s"))));
-        assertThat(connector.path("name").asText()).endsWith("/connectClusters/" + CONNECT_ID + "/connectors/gcs-sink");
-        assertThat(connector.path("state").asText()).isEqualTo("RUNNING");
-        assertThat(connector.path("taskRestartPolicy").path("minimumBackoff").asText()).isEqualTo("60s");
-
-        String connectorPath = connectCluster + "/connectors/gcs-sink";
-        post(connectorPath + ":pause", "{}");
-        assertThat(get(connectorPath).path("state").asText()).isEqualTo("PAUSED");
-        post(connectorPath + ":resume", "{}");
-        assertThat(get(connectorPath).path("state").asText()).isEqualTo("RUNNING");
-        post(connectorPath + ":stop", "{}");
-        assertThat(get(connectorPath).path("state").asText()).isEqualTo("STOPPED");
-        post(connectorPath + ":restart", "{}");
-        assertThat(get(connectorPath).path("state").asText()).isEqualTo("RUNNING");
-
-        assertThat(get(connectCluster + "/connectors").path("connectors")).hasSize(1);
-        delete(connectorPath);
-        assertThat(get(connectCluster + "/connectors").path("connectors")).isEmpty();
-
-        delete(connectCluster);
-        for (JsonNode c : get(connectClusters).path("connectClusters")) {
-            assertThat(c.path("name").asText()).doesNotContain(CONNECT_ID);
-        }
-    }
-
-    @Test
-    @Order(13)
     void deleteCluster() throws Exception {
         delete("/v1/projects/" + PROJECT + "/locations/" + LOCATION + "/clusters/" + CLUSTER_ID);
 

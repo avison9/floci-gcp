@@ -48,6 +48,9 @@ public class KafkaConnectService {
 
     private static final Pattern KAFKA_CLUSTER_NAME =
             Pattern.compile("^projects/([^/]+)/locations/([^/]+)/clusters/([^/]+)$");
+    /** The resource id grammar the API documents for {@code connect_cluster_id} and {@code connector_id}. */
+    private static final Pattern RESOURCE_ID = Pattern.compile("^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$");
+    private static final java.math.BigDecimal MAX_INT64 = java.math.BigDecimal.valueOf(Long.MAX_VALUE);
     /** {@code ConnectCluster} fields {@code update_mask} may name; {@code kafka_cluster} is IMMUTABLE. */
     private static final Set<String> CONNECT_CLUSTER_MUTABLE = Set.of("labels", "capacityConfig", "gcpConfig", "config");
     private static final Set<String> CONNECTOR_MUTABLE = Set.of("configs", "taskRestartPolicy");
@@ -80,6 +83,7 @@ public class KafkaConnectService {
 
     public StoredConnectCluster createConnectCluster(String project, String location, String connectClusterId,
                                                      Map<String, Object> body) {
+        requireResourceId(connectClusterId, "connectClusterId");
         String name = connectClusterName(project, location, connectClusterId);
         if (body == null) {
             throw GcpException.invalidArgument("Missing connectCluster body");
@@ -122,7 +126,7 @@ public class KafkaConnectService {
                                                      String updateMask, Map<String, Object> body) {
         String name = connectClusterName(project, location, connectClusterId);
         Map<String, Object> update = body == null ? Map.of() : body;
-        Set<String> fields = fieldsToApply(updateMask, update, CONNECT_CLUSTER_MUTABLE, "ConnectCluster");
+        FieldMask mask = FieldMask.of(updateMask, update, CONNECT_CLUSTER_MUTABLE, "ConnectCluster");
         synchronized (clusterLock(name)) {
             StoredConnectCluster cluster = requireConnectCluster(name);
             Object requestedKafkaCluster = update.get("kafkaCluster");
@@ -131,21 +135,24 @@ public class KafkaConnectService {
             }
             // Validate everything before the first setter, so a rejected body leaves the stored
             // object (the live reference in memory mode) exactly as it was.
-            Map<String, String> labels = fields.contains("labels") ? stringMap(update.get("labels"), "labels") : null;
-            Map<String, Object> capacity = fields.contains("capacityConfig")
-                    ? requireCapacityConfig(update.get("capacityConfig")) : null;
-            Map<String, Object> gcpConfig = fields.contains("gcpConfig") ? requireGcpConfig(update.get("gcpConfig")) : null;
-            Map<String, String> config = fields.contains("config") ? stringMap(update.get("config"), "config") : null;
-            if (fields.contains("labels")) {
+            Map<String, String> labels = mask.touches("labels")
+                    ? stringMap(mask.apply("labels", cluster.getLabels()), "labels") : null;
+            Map<String, Object> capacity = mask.touches("capacityConfig")
+                    ? requireCapacityConfig(mask.apply("capacityConfig", cluster.getCapacityConfig())) : null;
+            Map<String, Object> gcpConfig = mask.touches("gcpConfig")
+                    ? requireGcpConfig(mask.apply("gcpConfig", cluster.getGcpConfig())) : null;
+            Map<String, String> config = mask.touches("config")
+                    ? stringMap(mask.apply("config", cluster.getConfig()), "config") : null;
+            if (mask.touches("labels")) {
                 cluster.setLabels(labels);
             }
-            if (fields.contains("capacityConfig")) {
+            if (mask.touches("capacityConfig")) {
                 cluster.setCapacityConfig(capacity);
             }
-            if (fields.contains("gcpConfig")) {
+            if (mask.touches("gcpConfig")) {
                 cluster.setGcpConfig(gcpConfig);
             }
-            if (fields.contains("config")) {
+            if (mask.touches("config")) {
                 cluster.setConfig(config);
             }
             cluster.setUpdateTime(Instant.now());
@@ -173,6 +180,7 @@ public class KafkaConnectService {
 
     public StoredConnector createConnector(String project, String location, String connectClusterId,
                                            String connectorId, Map<String, Object> body) {
+        requireResourceId(connectorId, "connectorId");
         String clusterName = connectClusterName(project, location, connectClusterId);
         String name = clusterName + "/connectors/" + connectorId;
         Map<String, Object> request = body == null ? Map.of() : body;
@@ -214,16 +222,17 @@ public class KafkaConnectService {
         String clusterName = connectClusterName(project, location, connectClusterId);
         String name = clusterName + "/connectors/" + connectorId;
         Map<String, Object> update = body == null ? Map.of() : body;
-        Set<String> fields = fieldsToApply(updateMask, update, CONNECTOR_MUTABLE, "Connector");
-        Map<String, String> configs = fields.contains("configs") ? stringMap(update.get("configs"), "configs") : null;
-        Map<String, Object> policy = fields.contains("taskRestartPolicy")
-                ? taskRestartPolicy(update.get("taskRestartPolicy")) : null;
+        FieldMask mask = FieldMask.of(updateMask, update, CONNECTOR_MUTABLE, "Connector");
         synchronized (clusterLock(clusterName)) {
             StoredConnector connector = requireConnector(name);
-            if (fields.contains("configs")) {
+            Map<String, String> configs = mask.touches("configs")
+                    ? stringMap(mask.apply("configs", connector.getConfigs()), "configs") : null;
+            Map<String, Object> policy = mask.touches("taskRestartPolicy")
+                    ? taskRestartPolicy(mask.apply("taskRestartPolicy", connector.getTaskRestartPolicy())) : null;
+            if (mask.touches("configs")) {
                 connector.setConfigs(configs);
             }
-            if (fields.contains("taskRestartPolicy")) {
+            if (mask.touches("taskRestartPolicy")) {
                 connector.setTaskRestartPolicy(policy);
             }
             connectorStore.put(name, connector);
@@ -380,61 +389,145 @@ public class KafkaConnectService {
         return new LinkedHashMap<>((Map<String, Object>) map);
     }
 
+    /**
+     * An int64 that must be a positive whole number. Accepts a JSON number or the string form
+     * proto3 JSON uses for int64 (what the SDKs send); {@code 12.5}, a value outside the signed
+     * 64-bit range and anything unparseable are 400s rather than a truncated value or a 500.
+     */
     private static long requirePositiveLong(Object value, String field) {
-        long parsed;
-        if (value instanceof Number n) {
-            parsed = n.longValue();
-        } else if (value instanceof String s && s.matches("^\\d+$")) {
-            // int64 is a JSON string in proto3 JSON; the SDKs send it that way.
-            parsed = Long.parseLong(s);
-        } else {
-            throw GcpException.invalidArgument(field + " is required");
+        java.math.BigDecimal number;
+        try {
+            if (value instanceof Number n) {
+                number = new java.math.BigDecimal(n.toString());
+            } else if (value instanceof String s && s.strip().matches("^-?\\d+$")) {
+                // proto3 JSON spells int64 as a plain decimal string; no exponent or fraction.
+                number = new java.math.BigDecimal(s.strip());
+            } else if (value instanceof String) {
+                throw GcpException.invalidArgument(field + " must be an integer");
+            } else {
+                throw GcpException.invalidArgument(field + " is required");
+            }
+        } catch (NumberFormatException e) {
+            throw GcpException.invalidArgument(field + " must be an integer");
         }
-        if (parsed <= 0) {
+        if (number.stripTrailingZeros().scale() > 0) {
+            throw GcpException.invalidArgument(field + " must be an integer");
+        }
+        if (number.compareTo(MAX_INT64) > 0) {
+            throw GcpException.invalidArgument(field + " exceeds the int64 range");
+        }
+        if (number.signum() <= 0) {
             throw GcpException.invalidArgument(field + " must be positive");
         }
-        return parsed;
+        return number.longValueExact();
     }
 
     /**
-     * The fields an update applies: those named by {@code update_mask} when one is sent, otherwise
-     * whichever mutable fields the body carries (the same leniency the Kafka cluster update has).
-     * A mask naming a field outside the mutable set is rejected rather than silently ignored, so
-     * a client asking to change {@code kafkaCluster} learns that it is immutable.
+     * {@code connect_cluster_id} and {@code connector_id} follow the resource id grammar the API
+     * documents: 1 to 63 characters, lowercase letters, digits and hyphens, starting with a letter
+     * and ending with a letter or digit. Anything else (a slash, a colon, upper case) would become
+     * a stored resource the declared routes cannot address.
      */
-    private static Set<String> fieldsToApply(String updateMask, Map<String, Object> body,
-                                             Set<String> mutable, String resource) {
-        if (updateMask == null || updateMask.isBlank()) {
-            return body.keySet().stream().filter(mutable::contains).collect(java.util.stream.Collectors.toSet());
+    private static void requireResourceId(String id, String field) {
+        if (id == null || !RESOURCE_ID.matcher(id).matches()) {
+            throw GcpException.invalidArgument(field + " must match [a-z]([-a-z0-9]*[a-z0-9])? and be at most 63 characters");
         }
-        Set<String> fields = Arrays.stream(updateMask.split(","))
-                .map(String::trim)
-                .filter(f -> !f.isEmpty())
-                .map(f -> f.contains(".") ? f.substring(0, f.indexOf('.')) : f)
-                .map(KafkaConnectService::lowerCamel)
-                .collect(java.util.stream.Collectors.toSet());
-        for (String field : fields) {
-            if (!mutable.contains(field)) {
-                throw GcpException.invalidArgument("updateMask names a field that cannot be updated on a "
-                        + resource + ": " + field);
-            }
-        }
-        return fields;
     }
 
-    /** FieldMask paths are lowerCamelCase in proto3 JSON, but gcloud sends the proto spelling ({@code capacity_config}). */
-    private static String lowerCamel(String path) {
-        StringBuilder out = new StringBuilder();
-        boolean upper = false;
-        for (char c : path.toCharArray()) {
-            if (c == '_') {
-                upper = true;
-            } else {
-                out.append(upper ? Character.toUpperCase(c) : c);
-                upper = false;
+    /**
+     * The fields an update applies. With an {@code update_mask}, exactly the paths it names; a path
+     * naming a field outside the mutable set is rejected rather than silently ignored, so a client
+     * asking to change {@code kafkaCluster} learns that it is immutable. Without a mask, whichever
+     * mutable top-level fields the body carries (the leniency the Kafka cluster update has).
+     *
+     * <p>Nested paths ({@code capacityConfig.vcpuCount}, {@code taskRestartPolicy.minimumBackoff},
+     * {@code labels.env}) replace only that leaf in a copy of the stored value: the body's value
+     * at the path is written, or the leaf is cleared when the body does not carry it, and every
+     * sibling outside the mask keeps its stored value. The merged value is then validated as a
+     * whole, so a masked change can never leave a field in a shape create would have refused.
+     */
+    private record FieldMask(Set<String> paths, Map<String, Object> body, boolean explicit) {
+
+        static FieldMask of(String updateMask, Map<String, Object> body, Set<String> mutable, String resource) {
+            if (updateMask == null || updateMask.isBlank()) {
+                Set<String> present = body.keySet().stream().filter(mutable::contains)
+                        .collect(java.util.stream.Collectors.toSet());
+                return new FieldMask(present, body, false);
             }
+            Set<String> paths = Arrays.stream(updateMask.split(","))
+                    .map(String::trim)
+                    .filter(f -> !f.isEmpty())
+                    .map(FieldMask::lowerCamel)
+                    .collect(java.util.stream.Collectors.toCollection(java.util.LinkedHashSet::new));
+            for (String path : paths) {
+                String top = path.contains(".") ? path.substring(0, path.indexOf('.')) : path;
+                if (!mutable.contains(top)) {
+                    throw GcpException.invalidArgument("updateMask names a field that cannot be updated on a "
+                            + resource + ": " + path);
+                }
+            }
+            return new FieldMask(paths, body, true);
         }
-        return out.toString();
+
+        boolean touches(String field) {
+            return paths.contains(field) || paths.stream().anyMatch(p -> p.startsWith(field + "."));
+        }
+
+        /** The value {@code field} should take: the body's whole value, or the stored value with the masked leaves replaced. */
+        @SuppressWarnings("unchecked")
+        Object apply(String field, Object stored) {
+            if (!explicit || paths.contains(field)) {
+                return body.get(field);
+            }
+            Map<String, Object> merged = deepCopy(stored instanceof Map<?, ?> m ? (Map<String, Object>) m : Map.of());
+            for (String path : paths) {
+                if (!path.startsWith(field + ".")) {
+                    continue;
+                }
+                String[] segments = path.substring(field.length() + 1).split("\\.");
+                Object source = body.get(field);
+                Map<String, Object> target = merged;
+                for (int i = 0; i < segments.length - 1; i++) {
+                    source = source instanceof Map<?, ?> sm ? sm.get(segments[i]) : null;
+                    Object next = target.get(segments[i]);
+                    if (!(next instanceof Map<?, ?>)) {
+                        next = new LinkedHashMap<String, Object>();
+                        target.put(segments[i], next);
+                    }
+                    target = (Map<String, Object>) next;
+                }
+                String leaf = segments[segments.length - 1];
+                Object value = source instanceof Map<?, ?> sm ? sm.get(leaf) : null;
+                if (value == null) {
+                    target.remove(leaf);
+                } else {
+                    target.put(leaf, value);
+                }
+            }
+            return merged;
+        }
+
+        @SuppressWarnings("unchecked")
+        private static Map<String, Object> deepCopy(Map<String, Object> map) {
+            Map<String, Object> copy = new LinkedHashMap<>();
+            map.forEach((k, v) -> copy.put(k, v instanceof Map<?, ?> m ? deepCopy((Map<String, Object>) m) : v));
+            return copy;
+        }
+
+        /** FieldMask paths are lowerCamelCase in proto3 JSON, but gcloud sends the proto spelling ({@code capacity_config}). */
+        private static String lowerCamel(String path) {
+            StringBuilder out = new StringBuilder();
+            boolean upper = false;
+            for (char c : path.toCharArray()) {
+                if (c == '_') {
+                    upper = true;
+                } else {
+                    out.append(upper ? Character.toUpperCase(c) : c);
+                    upper = false;
+                }
+            }
+            return out.toString();
+        }
     }
 
     private static int pageSize(Integer pageSize) {
