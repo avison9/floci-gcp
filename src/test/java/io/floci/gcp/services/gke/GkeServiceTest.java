@@ -798,6 +798,59 @@ class GkeServiceTest {
     }
 
     @Test
+    void updateNodePoolResolvesNodeVersionAliasesAgainstTheMaster() {
+        // UpdateNodePoolRequest.node_version documents the same aliases as desired_node_version
+        // (#229): stored verbatim, GetNodePool reported "latest" or "-" as the pool's version.
+        service.createCluster(PROJECT, LOCATION, Map.of("name", "pool-alias",
+                "initialClusterVersion", "1.29.0-gke.1"));
+        String advertised = (String) service.getServerConfig().get("defaultClusterVersion");
+        assertNotEquals(advertised, "1.29.0-gke.1");
+
+        service.updateNodePool(PROJECT, LOCATION, "pool-alias", "default-pool", Map.of("nodeVersion", "latest"));
+        assertEquals(advertised, service.getNodePool(PROJECT, LOCATION, "pool-alias", "default-pool").getVersion());
+
+        // "-" picks the cluster's master version, not the server default.
+        service.updateNodePool(PROJECT, LOCATION, "pool-alias", "default-pool", Map.of("nodeVersion", "-"));
+        assertEquals("1.29.0-gke.1", service.getNodePool(PROJECT, LOCATION, "pool-alias", "default-pool").getVersion());
+
+        // A 1.X alias that matches the advertised version resolves to it; one that matches
+        // nothing is kept verbatim, as the other three version fields already do.
+        String advertisedMinor = advertised.substring(0, advertised.indexOf('.', advertised.indexOf('.') + 1));
+        service.updateNodePool(PROJECT, LOCATION, "pool-alias", "default-pool", Map.of("nodeVersion", advertisedMinor));
+        assertEquals(advertised, service.getNodePool(PROJECT, LOCATION, "pool-alias", "default-pool").getVersion());
+        service.updateNodePool(PROJECT, LOCATION, "pool-alias", "default-pool", Map.of("nodeVersion", "1.27"));
+        assertEquals("1.27", service.getNodePool(PROJECT, LOCATION, "pool-alias", "default-pool").getVersion());
+
+        // Only upgradeSettings: the version is left alone, as before.
+        service.updateNodePool(PROJECT, LOCATION, "pool-alias", "default-pool",
+                Map.of("upgradeSettings", Map.of("maxSurge", 2)));
+        assertEquals("1.27", service.getNodePool(PROJECT, LOCATION, "pool-alias", "default-pool").getVersion());
+    }
+
+    @Test
+    void updateNodePoolRejectsInvalidVersionsWithoutTouchingThePool() {
+        service.createCluster(PROJECT, LOCATION, Map.of("name", "pool-shape"));
+        // Copies, not the stored object: the in-memory store hands back the live reference.
+        StoredNodePool before = service.getNodePool(PROJECT, LOCATION, "pool-shape", "default-pool");
+        String versionBefore = before.getVersion();
+        String etagBefore = before.getEtag();
+
+        // A bare major is a character prefix of the advertised version but not a documented
+        // spelling, and a non-string used to escape as an unmapped ClassCastException (a 500).
+        GcpException bareMajor = assertThrows(GcpException.class,
+                () -> service.updateNodePool(PROJECT, LOCATION, "pool-shape", "default-pool", Map.of("nodeVersion", "1")));
+        assertEquals(400, bareMajor.getHttpStatus());
+        assertTrue(bareMajor.getMessage().startsWith("Invalid nodeVersion \"1\""), bareMajor.getMessage());
+        GcpException notAString = assertThrows(GcpException.class,
+                () -> service.updateNodePool(PROJECT, LOCATION, "pool-shape", "default-pool", Map.of("nodeVersion", 123)));
+        assertEquals(400, notAString.getHttpStatus());
+
+        StoredNodePool after = service.getNodePool(PROJECT, LOCATION, "pool-shape", "default-pool");
+        assertEquals(versionBefore, after.getVersion());
+        assertEquals(etagBefore, after.getEtag());
+    }
+
+    @Test
     void invalidVersionErrorsNameTheFieldThatCarriedThem() {
         // Review follow-up on #198: the three version fields share one resolver, and a bad
         // desiredNodeVersion used to come back as 'Invalid master version ...'.
