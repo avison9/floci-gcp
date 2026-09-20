@@ -25,6 +25,7 @@ import org.jboss.logging.Logger;
 
 import java.security.SecureRandom;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
@@ -48,20 +49,41 @@ public class KafkaService {
     private final ServiceRegistry serviceRegistry;
     private final RedpandaManager redpandaManager;
     private final ScheduledExecutorService poller = Executors.newSingleThreadScheduledExecutor();
+    /**
+     * One lock per cluster, striped on the cluster name. Held by {@link #deleteCluster} and by
+     * every ACL operation, so an ACL cannot be written under a cluster that is being deleted and
+     * two ACL mutations cannot lose each other's entries. Topic and consumer group paths predate
+     * the lock and are not yet serialized with deletion; they are unchanged by the ACL work.
+     */
+    private final Object[] clusterLocks = createClusterLocks();
 
     @Inject
     public KafkaService(StorageFactory storageFactory,
                         EmulatorConfig config,
                         ServiceRegistry serviceRegistry,
                         RedpandaManager redpandaManager) {
-        this.clusterStore = storageFactory.createGlobal("kafka", "kafka-clusters.json",
-                new TypeReference<Map<String, StoredCluster>>() {});
-        this.topicStore = storageFactory.createGlobal("kafka", "kafka-topics.json",
-                new TypeReference<Map<String, StoredTopic>>() {});
-        this.consumerGroupStore = storageFactory.createGlobal("kafka", "kafka-consumer-groups.json",
-                new TypeReference<Map<String, StoredConsumerGroup>>() {});
-        this.aclStore = storageFactory.createGlobal("kafka", "kafka-acls.json",
-                new TypeReference<Map<String, StoredAcl>>() {});
+        this(storageFactory.createGlobal("kafka", "kafka-clusters.json",
+                        new TypeReference<Map<String, StoredCluster>>() {}),
+                storageFactory.createGlobal("kafka", "kafka-topics.json",
+                        new TypeReference<Map<String, StoredTopic>>() {}),
+                storageFactory.createGlobal("kafka", "kafka-consumer-groups.json",
+                        new TypeReference<Map<String, StoredConsumerGroup>>() {}),
+                storageFactory.createGlobal("kafka", "kafka-acls.json",
+                        new TypeReference<Map<String, StoredAcl>>() {}),
+                config, serviceRegistry, redpandaManager);
+    }
+
+    KafkaService(StorageBackend<String, StoredCluster> clusterStore,
+                 StorageBackend<String, StoredTopic> topicStore,
+                 StorageBackend<String, StoredConsumerGroup> consumerGroupStore,
+                 StorageBackend<String, StoredAcl> aclStore,
+                 EmulatorConfig config,
+                 ServiceRegistry serviceRegistry,
+                 RedpandaManager redpandaManager) {
+        this.clusterStore = clusterStore;
+        this.topicStore = topicStore;
+        this.consumerGroupStore = consumerGroupStore;
+        this.aclStore = aclStore;
         this.config = config;
         this.serviceRegistry = serviceRegistry;
         this.redpandaManager = redpandaManager;
@@ -129,31 +151,35 @@ public class KafkaService {
         return clusterStore.scan(k -> k.startsWith(prefix));
     }
 
+    /** Children go before the cluster record, all under the cluster lock, so no ACL operation can
+     * observe the cluster present and then publish under a parent that is gone. */
     public void deleteCluster(String project, String location, String clusterId) {
         String name = "projects/" + project + "/locations/" + location + "/clusters/" + clusterId;
-        StoredCluster cluster = clusterStore.get(name)
-                .orElseThrow(() -> GcpException.notFound("Cluster not found: " + name));
+        synchronized (clusterLock(name)) {
+            StoredCluster cluster = clusterStore.get(name)
+                    .orElseThrow(() -> GcpException.notFound("Cluster not found: " + name));
 
-        cluster.setState(ClusterState.DELETING);
-        if (!config.services().kafka().mock()) {
-            redpandaManager.stopContainer(cluster);
-            redpandaManager.removeClusterStorage(cluster);
+            cluster.setState(ClusterState.DELETING);
+            if (!config.services().kafka().mock()) {
+                redpandaManager.stopContainer(cluster);
+                redpandaManager.removeClusterStorage(cluster);
+            }
+
+            // Remove all topics and consumer groups for this cluster
+            String topicPrefix = name + "/topics/";
+            topicStore.scan(k -> k.startsWith(topicPrefix))
+                    .forEach(t -> topicStore.delete(t.getName()));
+
+            String groupPrefix = name + "/consumerGroups/";
+            consumerGroupStore.scan(k -> k.startsWith(groupPrefix))
+                    .forEach(g -> consumerGroupStore.delete(g.getName()));
+
+            String aclPrefix = name + "/acls/";
+            aclStore.scan(k -> k.startsWith(aclPrefix))
+                    .forEach(a -> aclStore.delete(a.getName()));
+
+            clusterStore.delete(name);
         }
-
-        // Remove all topics and consumer groups for this cluster
-        String topicPrefix = name + "/topics/";
-        topicStore.scan(k -> k.startsWith(topicPrefix))
-                .forEach(t -> topicStore.delete(t.getName()));
-
-        String groupPrefix = name + "/consumerGroups/";
-        consumerGroupStore.scan(k -> k.startsWith(groupPrefix))
-                .forEach(g -> consumerGroupStore.delete(g.getName()));
-
-        String aclPrefix = name + "/acls/";
-        aclStore.scan(k -> k.startsWith(aclPrefix))
-                .forEach(a -> aclStore.delete(a.getName()));
-
-        clusterStore.delete(name);
     }
 
     // ── Topics ────────────────────────────────────────────────────────────────
@@ -303,36 +329,42 @@ public class KafkaService {
      */
     public StoredAcl createAcl(String project, String location, String clusterId, String aclId,
                                StoredAcl body) {
-        String clusterName = requireCluster(project, location, clusterId);
-        AclResourcePattern pattern = AclResourcePattern.parse(aclId);
-        String name = clusterName + "/acls/" + aclId;
-        if (aclStore.get(name).isPresent()) {
-            throw GcpException.alreadyExists("Acl already exists: " + name);
+        synchronized (clusterLock(clusterName(project, location, clusterId))) {
+            String clusterName = requireCluster(project, location, clusterId);
+            AclResourcePattern pattern = AclResourcePattern.parse(aclId);
+            String name = clusterName + "/acls/" + aclId;
+            if (aclStore.get(name).isPresent()) {
+                throw GcpException.alreadyExists("Acl already exists: " + name);
+            }
+            List<AclEntry> entries = normalizeEntries(body == null ? null : body.getAclEntries());
+            if (entries.isEmpty()) {
+                throw GcpException.invalidArgument("aclEntries is required and must not be empty");
+            }
+            StoredAcl acl = new StoredAcl(name, pattern.resourceType(), pattern.resourceName(), pattern.patternType());
+            acl.setAclEntries(entries);
+            acl.setEtag(newEtag());
+            aclStore.put(name, acl);
+            return acl;
         }
-        List<AclEntry> entries = normalizeEntries(body == null ? null : body.getAclEntries());
-        if (entries.isEmpty()) {
-            throw GcpException.invalidArgument("aclEntries is required and must not be empty");
-        }
-        StoredAcl acl = new StoredAcl(name, pattern.resourceType(), pattern.resourceName(), pattern.patternType());
-        acl.setAclEntries(entries);
-        acl.setEtag(newEtag());
-        aclStore.put(name, acl);
-        return acl;
     }
 
     public StoredAcl getAcl(String project, String location, String clusterId, String aclId) {
-        String clusterName = requireCluster(project, location, clusterId);
-        String name = clusterName + "/acls/" + aclId;
-        return aclStore.get(name)
-                .orElseThrow(() -> GcpException.notFound("Acl not found: " + name));
+        synchronized (clusterLock(clusterName(project, location, clusterId))) {
+            String clusterName = requireCluster(project, location, clusterId);
+            String name = clusterName + "/acls/" + aclId;
+            return aclStore.get(name)
+                    .orElseThrow(() -> GcpException.notFound("Acl not found: " + name));
+        }
     }
 
     public PageToken.Page<StoredAcl> listAcls(String project, String location, String clusterId,
                                               int pageSize, String pageToken) {
-        String prefix = requireCluster(project, location, clusterId) + "/acls/";
-        List<StoredAcl> all = new ArrayList<>(aclStore.scan(k -> k.startsWith(prefix)));
-        all.sort(java.util.Comparator.comparing(StoredAcl::getName));
-        return PageToken.paginate(all, pageSize <= 0 ? 500 : Math.min(pageSize, 1000), pageToken);
+        synchronized (clusterLock(clusterName(project, location, clusterId))) {
+            String prefix = requireCluster(project, location, clusterId) + "/acls/";
+            List<StoredAcl> all = new ArrayList<>(aclStore.scan(k -> k.startsWith(prefix)));
+            all.sort(java.util.Comparator.comparing(StoredAcl::getName));
+            return PageToken.paginate(all, pageSize <= 0 ? 500 : Math.min(pageSize, 1000), pageToken);
+        }
     }
 
     /**
@@ -341,86 +373,94 @@ public class KafkaService {
      */
     public StoredAcl updateAcl(String project, String location, String clusterId, String aclId,
                                StoredAcl body, String updateMask) {
-        StoredAcl acl = getAcl(project, location, clusterId, aclId);
-        if (updateMask != null && !updateMask.isBlank()) {
-            boolean touchesEntries = false;
-            for (String path : updateMask.split(",")) {
-                String field = path.strip();
-                if (field.equals("*") || field.equals("aclEntries") || field.equals("acl_entries")) {
-                    touchesEntries = true;
-                } else if (!field.isEmpty()) {
-                    throw GcpException.invalidArgument("update_mask may only name acl_entries, got: " + field);
+        synchronized (clusterLock(clusterName(project, location, clusterId))) {
+            StoredAcl acl = getAcl(project, location, clusterId, aclId);
+            if (updateMask != null && !updateMask.isBlank()) {
+                boolean touchesEntries = false;
+                for (String path : updateMask.split(",")) {
+                    String field = path.strip();
+                    if (field.equals("*") || field.equals("aclEntries") || field.equals("acl_entries")) {
+                        touchesEntries = true;
+                    } else if (!field.isEmpty()) {
+                        throw GcpException.invalidArgument("update_mask may only name acl_entries, got: " + field);
+                    }
+                }
+                if (!touchesEntries) {
+                    return acl;
                 }
             }
-            if (!touchesEntries) {
-                return acl;
+            if (body != null && body.getEtag() != null && !body.getEtag().isBlank()
+                    && !body.getEtag().equals(acl.getEtag())) {
+                throw GcpException.aborted("Acl etag mismatch: the acl was modified since it was read");
             }
+            List<AclEntry> entries = normalizeEntries(body == null ? null : body.getAclEntries());
+            if (entries.isEmpty()) {
+                throw GcpException.invalidArgument("aclEntries is required and must not be empty");
+            }
+            acl.setAclEntries(entries);
+            acl.setEtag(newEtag());
+            aclStore.put(acl.getName(), acl);
+            return acl;
         }
-        if (body != null && body.getEtag() != null && !body.getEtag().isBlank()
-                && !body.getEtag().equals(acl.getEtag())) {
-            throw GcpException.aborted("Acl etag mismatch: the acl was modified since it was read");
-        }
-        List<AclEntry> entries = normalizeEntries(body == null ? null : body.getAclEntries());
-        if (entries.isEmpty()) {
-            throw GcpException.invalidArgument("aclEntries is required and must not be empty");
-        }
-        acl.setAclEntries(entries);
-        acl.setEtag(newEtag());
-        aclStore.put(acl.getName(), acl);
-        return acl;
     }
 
     public void deleteAcl(String project, String location, String clusterId, String aclId) {
-        StoredAcl acl = getAcl(project, location, clusterId, aclId);
-        aclStore.delete(acl.getName());
+        synchronized (clusterLock(clusterName(project, location, clusterId))) {
+            StoredAcl acl = getAcl(project, location, clusterId, aclId);
+            aclStore.delete(acl.getName());
+        }
     }
 
     /** Incremental add; creates the ACL when it does not exist yet, which the response reports. */
     public AddAclEntryResult addAclEntry(String project, String location, String clusterId, String aclId,
                                          AclEntry entry) {
-        String clusterName = requireCluster(project, location, clusterId);
-        AclEntry normalized = normalizeEntry(entry);
-        String name = clusterName + "/acls/" + aclId;
-        StoredAcl existing = aclStore.get(name).orElse(null);
-        if (existing == null) {
-            AclResourcePattern pattern = AclResourcePattern.parse(aclId);
-            StoredAcl acl = new StoredAcl(name, pattern.resourceType(), pattern.resourceName(), pattern.patternType());
-            acl.setAclEntries(new ArrayList<>(List.of(normalized)));
-            acl.setEtag(newEtag());
-            aclStore.put(name, acl);
-            return new AddAclEntryResult(acl, true);
-        }
-        if (!existing.getAclEntries().contains(normalized)) {
-            if (existing.getAclEntries().size() >= MAX_ACL_ENTRIES) {
-                throw GcpException.invalidArgument("An acl may hold at most " + MAX_ACL_ENTRIES + " entries");
+        synchronized (clusterLock(clusterName(project, location, clusterId))) {
+            String clusterName = requireCluster(project, location, clusterId);
+            AclEntry normalized = normalizeEntry(entry);
+            String name = clusterName + "/acls/" + aclId;
+            StoredAcl existing = aclStore.get(name).orElse(null);
+            if (existing == null) {
+                AclResourcePattern pattern = AclResourcePattern.parse(aclId);
+                StoredAcl acl = new StoredAcl(name, pattern.resourceType(), pattern.resourceName(), pattern.patternType());
+                acl.setAclEntries(new ArrayList<>(List.of(normalized)));
+                acl.setEtag(newEtag());
+                aclStore.put(name, acl);
+                return new AddAclEntryResult(acl, true);
             }
-            List<AclEntry> entries = new ArrayList<>(existing.getAclEntries());
-            entries.add(normalized);
-            existing.setAclEntries(entries);
-            existing.setEtag(newEtag());
-            aclStore.put(name, existing);
+            if (!existing.getAclEntries().contains(normalized)) {
+                if (existing.getAclEntries().size() >= MAX_ACL_ENTRIES) {
+                    throw GcpException.invalidArgument("An acl may hold at most " + MAX_ACL_ENTRIES + " entries");
+                }
+                List<AclEntry> entries = new ArrayList<>(existing.getAclEntries());
+                entries.add(normalized);
+                existing.setAclEntries(entries);
+                existing.setEtag(newEtag());
+                aclStore.put(name, existing);
+            }
+            return new AddAclEntryResult(existing, false);
         }
-        return new AddAclEntryResult(existing, false);
     }
 
     /** Incremental remove; deletes the ACL when the removed entry was its last, which the response reports. */
     public RemoveAclEntryResult removeAclEntry(String project, String location, String clusterId, String aclId,
                                                AclEntry entry) {
-        StoredAcl acl = getAcl(project, location, clusterId, aclId);
-        AclEntry normalized = normalizeEntry(entry);
-        if (!acl.getAclEntries().contains(normalized)) {
-            throw GcpException.notFound("Acl entry not found on " + acl.getName());
+        synchronized (clusterLock(clusterName(project, location, clusterId))) {
+            StoredAcl acl = getAcl(project, location, clusterId, aclId);
+            AclEntry normalized = normalizeEntry(entry);
+            if (!acl.getAclEntries().contains(normalized)) {
+                throw GcpException.notFound("Acl entry not found on " + acl.getName());
+            }
+            List<AclEntry> entries = new ArrayList<>(acl.getAclEntries());
+            entries.remove(normalized);
+            if (entries.isEmpty()) {
+                aclStore.delete(acl.getName());
+                return new RemoveAclEntryResult(null, true);
+            }
+            acl.setAclEntries(entries);
+            acl.setEtag(newEtag());
+            aclStore.put(acl.getName(), acl);
+            return new RemoveAclEntryResult(acl, false);
         }
-        List<AclEntry> entries = new ArrayList<>(acl.getAclEntries());
-        entries.remove(normalized);
-        if (entries.isEmpty()) {
-            aclStore.delete(acl.getName());
-            return new RemoveAclEntryResult(null, true);
-        }
-        acl.setAclEntries(entries);
-        acl.setEtag(newEtag());
-        aclStore.put(acl.getName(), acl);
-        return new RemoveAclEntryResult(acl, false);
     }
 
     public record AddAclEntryResult(StoredAcl acl, boolean aclCreated) {}
@@ -428,11 +468,26 @@ public class KafkaService {
     public record RemoveAclEntryResult(StoredAcl acl, boolean aclDeleted) {}
 
     private String requireCluster(String project, String location, String clusterId) {
-        String clusterName = "projects/" + project + "/locations/" + location + "/clusters/" + clusterId;
+        String clusterName = clusterName(project, location, clusterId);
         if (clusterStore.get(clusterName).isEmpty()) {
             throw GcpException.notFound("Cluster not found: " + clusterName);
         }
         return clusterName;
+    }
+
+    private static String clusterName(String project, String location, String clusterId) {
+        return "projects/" + project + "/locations/" + location + "/clusters/" + clusterId;
+    }
+
+    /** The only lock this service takes, one per cluster, so there is no lock order to preserve. */
+    private Object clusterLock(String clusterName) {
+        return clusterLocks[Math.floorMod(clusterName.hashCode(), clusterLocks.length)];
+    }
+
+    private static Object[] createClusterLocks() {
+        Object[] locks = new Object[256];
+        Arrays.setAll(locks, ignored -> new Object());
+        return locks;
     }
 
     /** Validates and canonicalises entries; identical entries collapse to one. */
