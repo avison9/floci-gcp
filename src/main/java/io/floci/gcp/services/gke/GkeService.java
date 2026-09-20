@@ -240,6 +240,8 @@ public class GkeService {
         cluster.setDescription(stringField(clusterMap, "description", null));
         cluster.setCreateTime(Instant.now().toString());
         cluster.setCurrentMasterVersion(stringField(clusterMap, "initialClusterVersion", DEFAULT_MASTER_VERSION));
+        // Seeds the pools created below; refreshCurrentNodeVersion then derives the aggregate
+        // from them, so pools created with an explicit older version are reflected.
         cluster.setCurrentNodeVersion(cluster.getCurrentMasterVersion());
         cluster.setInitialClusterVersion(cluster.getCurrentMasterVersion());
         Object initialNodeCount = clusterMap.get("initialNodeCount");
@@ -273,6 +275,7 @@ public class GkeService {
 
         clusterStore.put(key, cluster);
         createInitialNodePools(project, location, name, clusterMap);
+        refreshCurrentNodeVersion(project, location, name, cluster);
 
         return operationService.createOperation(project, location, name, OperationType.CREATE_CLUSTER);
     }
@@ -333,7 +336,6 @@ public class GkeService {
                 List<StoredNodePool> targets =
                         nodeVersionUpdateTargets(project, location, clusterId, updateMap);
                 String nodeVersion = resolveNodeVersion("desiredNodeVersion", desiredNodeVersion, cluster);
-                cluster.setCurrentNodeVersion(nodeVersion);
                 // The pool carries its own `version`, and GetNodePool/ListNodePools read it from
                 // the pool store, so moving only the cluster aggregate would report the new
                 // version on the cluster while the pool still reported the old one.
@@ -342,6 +344,10 @@ public class GkeService {
                     pool.setEtag(newFingerprint());
                     nodePoolStore.put(nodePoolKey(project, location, clusterId, pool.getName()), pool);
                 }
+                // currentNodeVersion is the minimum across pools, not the last version written:
+                // upgrading one pool of two leaves the aggregate on the other's version.
+                cluster.setCurrentNodeVersion(
+                        GkeVersions.minimum(poolVersions(project, location, clusterId)).orElse(nodeVersion));
             }
             String desiredMasterVersion = (String) updateMap.get("desiredMasterVersion");
             if (desiredMasterVersion != null) {
@@ -611,8 +617,9 @@ public class GkeService {
 
     public StoredOperation createNodePool(String project, String location, String clusterId,
                                           Map<String, Object> nodePoolMap) {
-        requireCluster(project, location, clusterId);
+        StoredCluster cluster = requireCluster(project, location, clusterId);
         StoredNodePool pool = createNodePoolInternal(project, location, clusterId, nodePoolMap);
+        refreshCurrentNodeVersion(project, location, clusterId, cluster);
         return operationService.createNodePoolOperation(
                 project, location, clusterId, pool.getName(), OperationType.CREATE_NODE_POOL);
     }
@@ -635,6 +642,8 @@ public class GkeService {
             throw GcpException.notFound("Not found: nodePool " + nodePoolId);
         }
         nodePoolStore.delete(key);
+        clusterStore.get(clusterKey(project, location, clusterId))
+                .ifPresent(cluster -> refreshCurrentNodeVersion(project, location, clusterId, cluster));
         return operationService.createNodePoolOperation(
                 project, location, clusterId, nodePoolId, OperationType.DELETE_NODE_POOL);
     }
@@ -667,6 +676,7 @@ public class GkeService {
         }
         pool.setEtag(newFingerprint());
         nodePoolStore.put(nodePoolKey(project, location, clusterId, nodePoolId), pool);
+        refreshCurrentNodeVersion(project, location, clusterId, cluster);
         return operationService.createNodePoolOperation(
                 project, location, clusterId, nodePoolId, OperationType.UPGRADE_NODES);
     }
@@ -823,6 +833,25 @@ public class GkeService {
     private StoredCluster requireCluster(String project, String location, String clusterId) {
         return clusterStore.get(clusterKey(project, location, clusterId))
                 .orElseThrow(() -> GcpException.notFound("Not found: cluster " + clusterId));
+    }
+
+    /**
+     * {@code Cluster.currentNodeVersion} is an aggregate over the pools: "the minimum version of
+     * all nodes" (cluster_service.proto, {@code Cluster.current_node_version}). Recomputed from the
+     * stored pools whenever the pool set or a pool's version changes, so the cluster never reports
+     * a version no pool runs. A cluster with no pools keeps whatever it already reports.
+     */
+    private void refreshCurrentNodeVersion(String project, String location, String clusterId, StoredCluster cluster) {
+        GkeVersions.minimum(poolVersions(project, location, clusterId)).ifPresent(minimum -> {
+            if (!minimum.equals(cluster.getCurrentNodeVersion())) {
+                cluster.setCurrentNodeVersion(minimum);
+                clusterStore.put(clusterKey(project, location, clusterId), cluster);
+            }
+        });
+    }
+
+    private List<String> poolVersions(String project, String location, String clusterId) {
+        return listNodePools(project, location, clusterId).stream().map(StoredNodePool::getVersion).toList();
     }
 
     private StoredNodePool requireNodePool(String project, String location, String clusterId, String nodePoolId) {

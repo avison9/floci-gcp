@@ -800,6 +800,48 @@ class GkeServiceTest {
     }
 
     @Test
+    void updateNodePoolMovesTheClusterNodeVersionAggregate() {
+        // #233: only createCluster and UpdateCluster wrote currentNodeVersion, so a pool upgraded
+        // through UpdateNodePool left the cluster reporting the version no pool ran any more.
+        service.createCluster(PROJECT, LOCATION, Map.of("name", "agg", "initialClusterVersion", "1.29.0-gke.1"));
+        String advertised = (String) service.getServerConfig().get("defaultClusterVersion");
+        assertEquals("1.29.0-gke.1", service.getCluster(PROJECT, LOCATION, "agg").getCurrentNodeVersion());
+
+        service.updateNodePool(PROJECT, LOCATION, "agg", "default-pool", Map.of("nodeVersion", "latest"));
+
+        assertEquals(advertised, service.getNodePool(PROJECT, LOCATION, "agg", "default-pool").getVersion());
+        assertEquals(advertised, service.getCluster(PROJECT, LOCATION, "agg").getCurrentNodeVersion());
+    }
+
+    @Test
+    void currentNodeVersionIsTheMinimumAcrossPools() {
+        // Two pools created below the master version: the aggregate follows the pools, not the master.
+        service.createCluster(PROJECT, LOCATION, Map.of("name", "min-agg", "nodePools", List.of(
+                Map.of("name", "default-pool", "version", "1.30.0-gke.1"),
+                Map.of("name", "workers", "version", "1.30.0-gke.1"))));
+        assertEquals("1.30.0-gke.1", service.getCluster(PROJECT, LOCATION, "min-agg").getCurrentNodeVersion());
+
+        // One pool upgraded: the aggregate stays on the pool still behind (minimum, not last write).
+        service.updateNodePool(PROJECT, LOCATION, "min-agg", "workers", Map.of("nodeVersion", "1.31.5-gke.1"));
+        assertEquals("1.30.0-gke.1", service.getCluster(PROJECT, LOCATION, "min-agg").getCurrentNodeVersion());
+        // Same through UpdateCluster targeting the other pool: both pools now at 1.31.5, so it moves.
+        service.updateCluster(PROJECT, LOCATION, "min-agg",
+                Map.of("desiredNodeVersion", "1.31.5-gke.1", "desiredNodePoolId", "default-pool"));
+        assertEquals("1.31.5-gke.1", service.getCluster(PROJECT, LOCATION, "min-agg").getCurrentNodeVersion());
+
+        // A new pool on an older version lowers it; "1.9" is a string comparison trap ("1.9" > "1.31").
+        service.createNodePool(PROJECT, LOCATION, "min-agg", Map.of("name", "legacy", "version", "1.9.0-gke.1"));
+        assertEquals("1.9.0-gke.1", service.getCluster(PROJECT, LOCATION, "min-agg").getCurrentNodeVersion());
+        // Deleting that pool raises it again.
+        service.deleteNodePool(PROJECT, LOCATION, "min-agg", "legacy");
+        assertEquals("1.31.5-gke.1", service.getCluster(PROJECT, LOCATION, "min-agg").getCurrentNodeVersion());
+        // Deleting every pool: nothing to aggregate, the cluster keeps what it reports.
+        service.deleteNodePool(PROJECT, LOCATION, "min-agg", "workers");
+        service.deleteNodePool(PROJECT, LOCATION, "min-agg", "default-pool");
+        assertEquals("1.31.5-gke.1", service.getCluster(PROJECT, LOCATION, "min-agg").getCurrentNodeVersion());
+    }
+
+    @Test
     void updateNodePoolResolvesNodeVersionAliasesAgainstTheMaster() {
         // UpdateNodePoolRequest.node_version documents the same aliases as desired_node_version
         // (#229): stored verbatim, GetNodePool reported "latest" or "-" as the pool's version.
