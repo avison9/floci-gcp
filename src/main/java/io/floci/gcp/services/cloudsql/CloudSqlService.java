@@ -104,8 +104,34 @@ public class CloudSqlService {
                         CloudSqlLegacyController.class, CloudSqlGlobalController.class,
                         CloudSqlV1Beta4GlobalController.class, CloudSqlLegacyGlobalController.class)
                 .build());
+        if (config.services().cloudsql().enabled()) {
+            backfillBuiltInUsers();
+        }
         if (config.services().cloudsql().enabled() && dataPlaneEnabled) {
             restartPersistedInstances();
+        }
+    }
+
+    /**
+     * Instances persisted by a build that did not list the engine's built-in user gain it on
+     * their first startup after the upgrade, so {@code users.list} answers the same before and
+     * after. Each instance is seeded once, tracked by a marker, never by whether the user record
+     * happens to be present: {@code root@%} can be deleted through the API (the Terraform provider
+     * does so right after creating every MySQL instance), and a presence check would bring it
+     * back on every restart.
+     */
+    void backfillBuiltInUsers() {
+        for (Map<String, Object> instance : allInstances()) {
+            String project = stringValue(instance.get("project"));
+            String name = stringValue(instance.get("name"));
+            if (project == null || name == null) {
+                continue;
+            }
+            try {
+                seedBuiltInUser(project, name, engineOf(instance));
+            } catch (GcpException e) {
+                LOG.warnf("Skipping built-in user backfill project=%s instance=%s: %s", project, name, e.getMessage());
+            }
         }
     }
 
@@ -140,7 +166,7 @@ public class CloudSqlService {
         }
         putInstance(project, instance, stored);
         createSystemDatabases(project, instance, engine);
-        createBuiltInUser(project, instance, engine);
+        seedBuiltInUser(project, instance, engine);
 
         LOG.infof("create Cloud SQL %s instance project=%s instance=%s", engine, project, instance);
         return createOperation(project, "CREATE", instance, stored);
@@ -201,6 +227,7 @@ public class CloudSqlService {
             dataPlane.stopInstance(project, instance, existing, true);
         }
         instanceStore.delete(instanceKey(instance));
+        instanceStore.delete(builtInUserSeededKey(instance));
         deleteByPrefix(databaseStore, databasePrefix(instance));
         deleteByPrefix(userStore, userPrefix(instance));
         LOG.infof("delete Cloud SQL instance project=%s instance=%s", project, instance);
@@ -501,17 +528,26 @@ public class CloudSqlService {
         }
     }
 
-    /** The account the data plane is provisioned with ({@code root@%} on MySQL), listed like real Cloud SQL does. */
-    private void createBuiltInUser(String project, String instance, CloudSqlEngine engine) {
-        String user = engine.builtInUser();
-        if (user == null) {
+    /**
+     * Lists the account the data plane is provisioned with ({@code root@%} on MySQL,
+     * {@code postgres} on PostgreSQL) like real Cloud SQL does, once per instance. The marker is a
+     * sibling key in the instance store rather than a field on the instance record, so it never
+     * shows up in {@code instances.get}; {@link #deleteInstance} removes it with the instance.
+     */
+    private void seedBuiltInUser(String project, String instance, CloudSqlEngine engine) {
+        String marker = builtInUserSeededKey(instance);
+        if (getForProject(instanceStore, project, marker).isPresent()) {
             return;
         }
-        String host = engine.normalizeHost(null);
-        String key = userKey(instance, user, host);
-        if (userStore.get(key).isEmpty()) {
-            userStore.put(key, normalizeUser(project, instance, user, host, Map.of("name", user)));
+        String user = engine.builtInUser();
+        if (user != null) {
+            String host = engine.normalizeHost(null);
+            String key = userKey(instance, user, host);
+            if (getForProject(userStore, project, key).isEmpty()) {
+                putForProject(userStore, project, key, normalizeUser(project, instance, user, host, Map.of("name", user)));
+            }
         }
+        putForProject(instanceStore, project, marker, mapOf("instance", instance));
     }
 
     /**
@@ -527,6 +563,25 @@ public class CloudSqlService {
             throw GcpException.invalidArgument("databaseVersion cannot change the instance engine from "
                     + engineOf(existing) + " to " + CloudSqlEngine.fromDatabaseVersion(requested));
         }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static java.util.Optional<Map<String, Object>> getForProject(
+            StorageBackend<String, Map<String, Object>> store, String project, String key) {
+        if (store instanceof ProjectAwareStorageBackend<?> projectAware) {
+            return ((ProjectAwareStorageBackend<Map<String, Object>>) projectAware).getForProject(project, key);
+        }
+        return store.get(key);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void putForProject(StorageBackend<String, Map<String, Object>> store, String project,
+                                      String key, Map<String, Object> value) {
+        if (store instanceof ProjectAwareStorageBackend<?> projectAware) {
+            ((ProjectAwareStorageBackend<Map<String, Object>>) projectAware).putForProject(project, key, value);
+            return;
+        }
+        store.put(key, value);
     }
 
     private CloudSqlEngine engineOf(Map<String, Object> instanceMetadata) {
@@ -715,6 +770,11 @@ public class CloudSqlService {
 
     private static String instanceKey(String instance) {
         return "instances/" + instance;
+    }
+
+    /** Outside the {@code instances/} prefix, so instance scans never see it. */
+    private static String builtInUserSeededKey(String instance) {
+        return "built-in-user-seeded/" + instance;
     }
 
     private static String databasePrefix(String instance) {

@@ -103,6 +103,10 @@ class CloudSqlAdminTest {
                         .extracting(User::getName).doesNotContain("root");
                 assertDone(client.users().insert(PROJECT_ID, instanceId,
                         new User().setName("root").setPassword("new-root")).execute(), "CREATE_USER");
+            } else {
+                // The postgres admin role the instance is provisioned with is listed too.
+                assertThat(users).filteredOn(user -> "postgres".equals(user.getName()))
+                        .extracting(User::getType).containsExactly("BUILT_IN");
             }
 
             DatabaseInstance running = client.instances().get(PROJECT_ID, instanceId).execute();
