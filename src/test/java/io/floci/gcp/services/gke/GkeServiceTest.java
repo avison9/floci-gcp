@@ -258,7 +258,9 @@ class GkeServiceTest {
         service.createCluster(PROJECT, LOCATION, Map.of("name", "abac-cluster"));
         StoredOperation op = service.setLegacyAbac(PROJECT, LOCATION, "abac-cluster", Map.of("enabled", true));
 
-        assertEquals(OperationType.SET_LEGACY_ABAC, op.getOperationType());
+        // Real GKE reports every cluster-level set* RPC as UPDATE_CLUSTER; Operation.Type has no
+        // SET_LEGACY_ABAC (#228).
+        assertEquals(OperationType.UPDATE_CLUSTER, op.getOperationType());
         StoredCluster cluster = service.getCluster(PROJECT, LOCATION, "abac-cluster");
         assertEquals(Map.of("enabled", true), cluster.getExtraConfig().get("legacyAbac"));
     }
@@ -282,10 +284,10 @@ class GkeServiceTest {
         service.createCluster(PROJECT, LOCATION, Map.of("name", "rotate-me"));
 
         StoredOperation start = service.startIpRotation(PROJECT, LOCATION, "rotate-me");
-        assertEquals(OperationType.START_IP_ROTATION, start.getOperationType());
+        assertEquals(OperationType.UPDATE_CLUSTER, start.getOperationType());
 
         StoredOperation complete = service.completeIpRotation(PROJECT, LOCATION, "rotate-me");
-        assertEquals(OperationType.COMPLETE_IP_ROTATION, complete.getOperationType());
+        assertEquals(OperationType.UPDATE_CLUSTER, complete.getOperationType());
     }
 
     @Test
@@ -297,7 +299,7 @@ class GkeServiceTest {
         service.completeNodePoolUpgrade(PROJECT, LOCATION, "upgrade-me", "default-pool");
 
         StoredOperation rollback = service.rollbackNodePoolUpgrade(PROJECT, LOCATION, "upgrade-me", "default-pool");
-        assertEquals(OperationType.ROLLBACK_NODE_POOL_UPGRADE, rollback.getOperationType());
+        assertEquals(OperationType.UPGRADE_NODES, rollback.getOperationType());
 
         assertThrows(GcpException.class,
                 () -> service.completeNodePoolUpgrade(PROJECT, LOCATION, "upgrade-me", "no-such-pool"));

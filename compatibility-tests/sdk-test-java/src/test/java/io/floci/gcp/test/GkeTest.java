@@ -6,7 +6,10 @@ import com.google.container.v1.CreateClusterRequest;
 import com.google.container.v1.DeleteClusterRequest;
 import com.google.container.v1.GetClusterRequest;
 import com.google.container.v1.ListClustersRequest;
+import com.google.container.v1.NodePool;
 import com.google.container.v1.Operation;
+import com.google.container.v1.SetLocationsRequest;
+import com.google.container.v1.SetNodePoolSizeRequest;
 import com.google.container.v1.UpdateMasterRequest;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -108,6 +111,44 @@ class GkeTest {
 
     @Test
     @Order(5)
+    void setNodePoolSizeReportsItsOwnOperationType() {
+        // The generated client parses operationType into the closed Operation.Type enum, so this
+        // exercises the decode path, not just the string the emulator writes (#228).
+        Operation op = client.setNodePoolSize(SetNodePoolSizeRequest.newBuilder()
+                .setName(CLUSTER_NAME + "/nodePools/default-pool")
+                .setNodeCount(3)
+                .build());
+
+        assertThat(op.getOperationType()).isEqualTo(Operation.Type.SET_NODE_POOL_SIZE);
+        assertThat(op.getStatus()).isEqualTo(Operation.Status.DONE);
+
+        NodePool pool = client.getNodePool(CLUSTER_NAME + "/nodePools/default-pool");
+        assertThat(pool.getInitialNodeCount()).isEqualTo(3);
+    }
+
+    @Test
+    @Order(6)
+    @SuppressWarnings("deprecation")
+    void setLocationsIsAnUpdateClusterOperation() {
+        // Operation.Type has no SET_LOCATIONS; real GKE reports the cluster-level set* RPCs as
+        // UPDATE_CLUSTER. An invented value would decode as TYPE_UNSPECIFIED or fail here.
+        Operation op = client.setLocations(SetLocationsRequest.newBuilder()
+                .setName(CLUSTER_NAME)
+                .addLocations("us-central1-a")
+                .addLocations("us-central1-b")
+                .build());
+
+        assertThat(op.getOperationType()).isEqualTo(Operation.Type.UPDATE_CLUSTER);
+        assertThat(op.getStatus()).isEqualTo(Operation.Status.DONE);
+
+        Cluster after = client.getCluster(GetClusterRequest.newBuilder()
+                .setName(CLUSTER_NAME)
+                .build());
+        assertThat(after.getLocationsList()).containsExactly("us-central1-a", "us-central1-b");
+    }
+
+    @Test
+    @Order(7)
     void deleteCluster() {
         Operation op = client.deleteCluster(DeleteClusterRequest.newBuilder()
                 .setName(CLUSTER_NAME)
