@@ -352,10 +352,13 @@ class GkeServiceTest {
         service.updateMaster(PROJECT, LOCATION, "alias-cluster", Map.of("masterVersion", minor));
         assertEquals(advertised, service.getCluster(PROJECT, LOCATION, "alias-cluster").getCurrentMasterVersion());
 
-        // A prefix that only shares leading characters is not a match ("1.3" is not "1.30").
+        // A prefix that only shares leading characters is not a match ("1.3" is not "1.30"), and
+        // an alias that matches no valid version has nothing to pick, so it is rejected (#231).
         String notAPrefix = minor.substring(0, minor.length() - 1);
-        service.updateMaster(PROJECT, LOCATION, "alias-cluster", Map.of("masterVersion", notAPrefix));
-        assertEquals(notAPrefix, service.getCluster(PROJECT, LOCATION, "alias-cluster").getCurrentMasterVersion());
+        GcpException unmatched = assertThrows(GcpException.class,
+                () -> service.updateMaster(PROJECT, LOCATION, "alias-cluster", Map.of("masterVersion", notAPrefix)));
+        assertEquals(400, unmatched.getHttpStatus());
+        assertEquals(advertised, service.getCluster(PROJECT, LOCATION, "alias-cluster").getCurrentMasterVersion());
     }
 
     @Test
@@ -889,17 +892,61 @@ class GkeServiceTest {
         assertEquals("1.29.0-gke.1", service.getNodePool(PROJECT, LOCATION, "pool-alias", "default-pool").getVersion());
 
         // A 1.X alias that matches the advertised version resolves to it; one that matches
-        // nothing is kept verbatim, as the other three version fields already do.
+        // nothing is rejected and leaves the pool alone (#231).
         String advertisedMinor = advertised.substring(0, advertised.indexOf('.', advertised.indexOf('.') + 1));
         service.updateNodePool(PROJECT, LOCATION, "pool-alias", "default-pool", Map.of("nodeVersion", advertisedMinor));
         assertEquals(advertised, service.getNodePool(PROJECT, LOCATION, "pool-alias", "default-pool").getVersion());
-        service.updateNodePool(PROJECT, LOCATION, "pool-alias", "default-pool", Map.of("nodeVersion", "1.27"));
-        assertEquals("1.27", service.getNodePool(PROJECT, LOCATION, "pool-alias", "default-pool").getVersion());
+        assertEquals(400, assertThrows(GcpException.class, () -> service.updateNodePool(
+                PROJECT, LOCATION, "pool-alias", "default-pool", Map.of("nodeVersion", "1.27"))).getHttpStatus());
+        assertEquals(advertised, service.getNodePool(PROJECT, LOCATION, "pool-alias", "default-pool").getVersion());
 
         // Only upgradeSettings: the version is left alone, as before.
         service.updateNodePool(PROJECT, LOCATION, "pool-alias", "default-pool",
                 Map.of("upgradeSettings", Map.of("maxSurge", 2)));
-        assertEquals("1.27", service.getNodePool(PROJECT, LOCATION, "pool-alias", "default-pool").getVersion());
+        assertEquals(advertised, service.getNodePool(PROJECT, LOCATION, "pool-alias", "default-pool").getVersion());
+    }
+
+    @Test
+    void unmatchedVersionAliasesAreRejectedOnEveryVersionField() {
+        // #231: "1.X" picks the highest valid version under that prefix. The emulator advertises
+        // exactly one valid version, so an alias outside it has nothing to pick and used to be
+        // stored verbatim, leaving a pool or cluster on a version getServerConfig() calls invalid.
+        service.createCluster(PROJECT, LOCATION, Map.of("name", "unmatched"));
+        StoredCluster before = service.getCluster(PROJECT, LOCATION, "unmatched");
+        String masterBefore = before.getCurrentMasterVersion();
+        String nodeBefore = before.getCurrentNodeVersion();
+        String poolBefore = service.getNodePool(PROJECT, LOCATION, "unmatched", "default-pool").getVersion();
+        String advertised = (String) service.getServerConfig().get("defaultClusterVersion");
+        assertTrue(((List<?>) service.getServerConfig().get("validNodeVersions")).contains(advertised));
+
+        for (String alias : List.of("1.27", "1.27.3", "2.0")) {
+            GcpException master = assertThrows(GcpException.class,
+                    () -> service.updateMaster(PROJECT, LOCATION, "unmatched", Map.of("masterVersion", alias)), alias);
+            assertEquals(400, master.getHttpStatus());
+            assertTrue(master.getMessage().startsWith("Invalid masterVersion \"" + alias + "\""), master.getMessage());
+            assertTrue(master.getMessage().contains(advertised), "the rejection names what is valid: " + master.getMessage());
+
+            GcpException desiredMaster = assertThrows(GcpException.class, () -> service.updateCluster(
+                    PROJECT, LOCATION, "unmatched", Map.of("desiredMasterVersion", alias)), alias);
+            assertTrue(desiredMaster.getMessage().startsWith("Invalid desiredMasterVersion \"" + alias + "\""));
+
+            GcpException desiredNode = assertThrows(GcpException.class, () -> service.updateCluster(
+                    PROJECT, LOCATION, "unmatched", Map.of("desiredNodeVersion", alias)), alias);
+            assertTrue(desiredNode.getMessage().startsWith("Invalid desiredNodeVersion \"" + alias + "\""));
+
+            GcpException node = assertThrows(GcpException.class, () -> service.updateNodePool(
+                    PROJECT, LOCATION, "unmatched", "default-pool", Map.of("nodeVersion", alias)), alias);
+            assertTrue(node.getMessage().startsWith("Invalid nodeVersion \"" + alias + "\""));
+        }
+
+        StoredCluster after = service.getCluster(PROJECT, LOCATION, "unmatched");
+        assertEquals(masterBefore, after.getCurrentMasterVersion());
+        assertEquals(nodeBefore, after.getCurrentNodeVersion());
+        assertEquals(poolBefore, service.getNodePool(PROJECT, LOCATION, "unmatched", "default-pool").getVersion());
+
+        // An explicit 1.X.Y-gke.N outside the advertised one is still kept verbatim: a pin, not an alias.
+        service.updateNodePool(PROJECT, LOCATION, "unmatched", "default-pool", Map.of("nodeVersion", "1.27.3-gke.100"));
+        assertEquals("1.27.3-gke.100", service.getNodePool(PROJECT, LOCATION, "unmatched", "default-pool").getVersion());
     }
 
     @Test
