@@ -16,13 +16,15 @@ import java.util.regex.Pattern;
 
 /**
  * MySQL data plane: the official {@code mysql} image, one container per instance, DDL issued
- * through the {@code mysql} client inside the container as {@code root}.
+ * through the {@code mysql} client inside the container over the Unix socket, which the server
+ * authenticates as {@code root@localhost}.
  *
  * <p>Users are {@code 'name'@'host'} identities, so every user operation takes the host the
- * control plane resolved ({@code %} unless the request set one). The {@code root@%} account the
- * image provisions is the emulator's own admin login: its password stays {@code root} and the
- * control plane does not let it be dropped, so a {@code users.update} on it is acknowledged
- * without touching the server.
+ * control plane resolved ({@code %} unless the request set one). {@code root@localhost} is the
+ * emulator's own admin login: its password stays {@code root} and it is never touched. The
+ * {@code root@%} account the image also provisions is an ordinary user of the instance, as it
+ * is on Cloud SQL: it can be re-passworded, dropped and recreated through the API (the Terraform
+ * provider deletes it right after creating every MySQL instance).
  */
 @ApplicationScoped
 public class CloudSqlMySqlDataPlane extends CloudSqlContainerDataPlane {
@@ -31,6 +33,8 @@ public class CloudSqlMySqlDataPlane extends CloudSqlContainerDataPlane {
     private static final int MYSQL_PORT = 3306;
     private static final String ADMIN_USER = "root";
     private static final String ADMIN_PASSWORD = "root";
+    /** The socket the image's {@code my.cnf} configures for both the server and the client, 8.0 and 8.4. */
+    private static final String MYSQL_SOCKET = "/var/run/mysqld/mysqld.sock";
     private static final String MYSQL_DATA_DIR = "/var/lib/mysql";
     /** {@code MYSQL_8_0} or a minor-pinned {@code MYSQL_8_0_NN}; nothing looser. */
     private static final Pattern MYSQL_8_0_VERSION = Pattern.compile("^MYSQL_8_0(?:_\\d+)?$");
@@ -178,17 +182,20 @@ public class CloudSqlMySqlDataPlane extends CloudSqlContainerDataPlane {
     }
 
     private ExecResult mysql(Map<String, Object> instanceMetadata, String sql) {
+        // Over the socket, not TCP: a TCP connection from 127.0.0.1 authenticates as root@%
+        // (the image runs with skip-name-resolve), which would make dropping root@% strand every
+        // later DDL call. The socket authenticates as root@localhost, which the API never exposes.
         // MYSQL_PWD rather than -p so the client does not print its insecure-password warning
         // on stderr, which errorOf would otherwise surface as the failure text.
         return lifecycleManager.exec(requireContainerId(instanceMetadata),
                 List.of("MYSQL_PWD=" + ADMIN_PASSWORD),
-                List.of("mysql", "-h", "127.0.0.1", "-P", String.valueOf(MYSQL_PORT),
+                List.of("mysql", "--protocol=socket", "--socket=" + MYSQL_SOCKET,
                         "-u", ADMIN_USER, "--batch", "--skip-column-names", "-e", sql));
     }
 
     /**
-     * The identities the image provisions and this plane logs in through; see
-     * {@link CloudSqlEngine#isReservedIdentity}. Defensive: the control plane refuses these
+     * The identity this plane logs in through ({@code root@localhost}); see
+     * {@link CloudSqlEngine#isReservedIdentity}. Defensive: the control plane refuses it
      * before reaching here.
      */
     private static boolean isAdminAccount(String user, String host) {

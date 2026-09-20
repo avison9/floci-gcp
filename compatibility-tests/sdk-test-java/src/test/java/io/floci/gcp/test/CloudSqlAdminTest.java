@@ -95,6 +95,14 @@ class CloudSqlAdminTest {
                 assertThat(users).extracting(User::getName).contains("root");
                 assertThat(users).filteredOn(user -> USER_ID.equals(user.getName()))
                         .extracting(User::getHost).containsExactly("%");
+                // The Terraform provider deletes root@% right after creating a MySQL instance and
+                // inserts it again to apply root_password; both must reach the server.
+                assertDone(client.users().delete(PROJECT_ID, instanceId).setName("root").setHost("%").execute(),
+                        "DELETE_USER");
+                assertThat(client.users().list(PROJECT_ID, instanceId).execute().getItems())
+                        .extracting(User::getName).doesNotContain("root");
+                assertDone(client.users().insert(PROJECT_ID, instanceId,
+                        new User().setName("root").setPassword("new-root")).execute(), "CREATE_USER");
             }
 
             DatabaseInstance running = client.instances().get(PROJECT_ID, instanceId).execute();

@@ -280,7 +280,7 @@ class CloudSqlServiceTest {
     }
 
     @Test
-    void mysqlSystemDatabasesAndRootCannotBeDeleted() {
+    void mysqlSystemDatabasesCannotBeDeletedButRootAtPercentCan() {
         withProject("project-a");
         service.createInstance("project-a", Map.of("name", "my-main", "databaseVersion", "MYSQL_8_4"));
 
@@ -289,10 +289,17 @@ class CloudSqlServiceTest {
                     () -> service.deleteDatabase("project-a", "my-main", system), system);
             assertEquals("FAILED_PRECONDITION", error.getGcpStatus());
         }
-        GcpException root = assertThrows(GcpException.class,
-                () -> service.deleteUser("project-a", "my-main", "root", null));
-        assertEquals("FAILED_PRECONDITION", root.getGcpStatus());
-        assertEquals("root", service.getUser("project-a", "my-main", "root", "%").get("name"));
+        // The Terraform provider deletes root@% right after creating every MySQL instance, and
+        // may insert it again with a password of its own; both must work as on Cloud SQL.
+        assertEquals("DELETE_USER", service.deleteUser("project-a", "my-main", "root", null).get("operationType"));
+        assertEquals("NOT_FOUND", assertThrows(GcpException.class,
+                () -> service.getUser("project-a", "my-main", "root", "%")).getGcpStatus());
+        assertEquals(0, ((List<?>) service.listUsers("project-a", "my-main").get("items")).size());
+
+        service.createUser("project-a", "my-main", Map.of("name", "root", "password", "new-root"));
+        Map<String, Object> recreated = service.getUser("project-a", "my-main", "root", "%");
+        assertEquals("%", recreated.get("host"));
+        assertFalse(recreated.containsKey("password"));
     }
 
     @Test
@@ -422,9 +429,14 @@ class CloudSqlServiceTest {
         dataPlaneService.deleteUser("project-a", "my-main", "root", "10.0.0.5");
         assertTrue(dataPlane.events.stream().anyMatch(e -> e.startsWith("delete-user:root@10.0.0.5:")));
 
-        GcpException error = assertThrows(GcpException.class,
-                () -> dataPlaneService.deleteUser("project-a", "my-main", "root", "%"));
-        assertEquals("FAILED_PRECONDITION", error.getGcpStatus());
+        // root@% is the provisioned account, not the plane's login: dropping and recreating it
+        // reaches the server like any other user, so a Terraform apply on a MySQL instance works.
+        dataPlaneService.deleteUser("project-a", "my-main", "root", "%");
+        assertTrue(dataPlane.events.stream().anyMatch(e -> e.startsWith("delete-user:root@%:")));
+        dataPlaneService.createUser("project-a", "my-main", Map.of("name", "root", "password", "new-root"));
+        assertTrue(dataPlane.events.contains("create-user:root@%:new-root"));
+        dataPlaneService.updateUser("project-a", "my-main", "root", "%", Map.of("password", "rotated"));
+        assertTrue(dataPlane.events.contains("create-user:root@%:rotated"));
     }
 
     @Test
@@ -444,7 +456,7 @@ class CloudSqlServiceTest {
     }
 
     @Test
-    void localRootIdentitiesAreReservedOnMysql() {
+    void rootAtLocalhostIsReservedOnMysql() {
         withProject("project-a");
         RecordingDataPlane dataPlane = new RecordingDataPlane();
         CloudSqlService dataPlaneService = new CloudSqlService(
@@ -452,9 +464,9 @@ class CloudSqlServiceTest {
                 new ObjectMapper(), "http://localhost:4588", dataPlane, true);
         dataPlaneService.createInstance("project-a", Map.of("name", "my-main", "databaseVersion", "MYSQL_8_0"));
 
-        // The image provisions root at these hosts and the plane logs in through them over
-        // 127.0.0.1, so re-passwording any of them would strand every later DDL call.
-        for (String host : List.of("localhost", "127.0.0.1", "::1", "LOCALHOST")) {
+        // The plane logs in over the Unix socket, which the server authenticates as
+        // root@localhost, so re-passwording that one identity would strand every later DDL call.
+        for (String host : List.of("localhost", "LOCALHOST")) {
             GcpException error = assertThrows(GcpException.class, () -> dataPlaneService.createUser(
                     "project-a", "my-main", Map.of("name", "root", "host", host, "password", "x")), host);
             assertEquals("INVALID_ARGUMENT", error.getGcpStatus());
@@ -463,6 +475,12 @@ class CloudSqlServiceTest {
         // root@% already exists from provisioning, so that spelling is a conflict rather than a reservation.
         assertEquals("ALREADY_EXISTS", assertThrows(GcpException.class, () -> dataPlaneService.createUser(
                 "project-a", "my-main", Map.of("name", "root", "password", "x"))).getGcpStatus());
+        // The image does not provision root at 127.0.0.1 or ::1 and the plane never connects as
+        // them, so they are ordinary accounts.
+        for (String host : List.of("127.0.0.1", "::1")) {
+            dataPlaneService.createUser("project-a", "my-main", Map.of("name", "root", "host", host, "password", "x"));
+            assertTrue(dataPlane.events.contains("create-user:root@" + host + ":x"), host);
+        }
     }
 
     @Test

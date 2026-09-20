@@ -82,10 +82,11 @@ engine's own identity model:
   `users.update` and `users.delete` take `?host=` to address a specific identity (omitted means `%`).
   PostgreSQL instances still reject a `host`.
 - `users.list` includes the `root@%` account the instance is provisioned with (`type: BUILT_IN`).
-  It cannot be deleted, and a password update on it is acknowledged without changing the server.
-  `root` at `localhost`, `127.0.0.1` or `::1` is reserved for the same reason (the image creates
-  it and the emulator connects through it) and cannot be created through the API; `root` at any
-  other host is an ordinary user.
+  As on Cloud SQL it is an ordinary user: it can be re-passworded, deleted and inserted again,
+  which is what the Terraform `google_sql_database_instance` resource does right after creating a
+  MySQL instance. The emulator itself connects over the container's Unix socket as
+  `root@localhost`, so that one identity cannot be created through the API; `root` at any other
+  host is an ordinary user.
 - Created users receive `ALL PRIVILEGES` on every existing and later user database; system schemas
   are not granted.
 - New databases report `utf8mb4` / `utf8mb4_0900_ai_ci` when the request sets neither `charset` nor

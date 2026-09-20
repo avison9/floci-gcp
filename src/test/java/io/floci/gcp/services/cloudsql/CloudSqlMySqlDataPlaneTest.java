@@ -171,14 +171,17 @@ class CloudSqlMySqlDataPlaneTest {
                 "GRANT ALL PRIVILEGES ON `appdb`.* TO 'app'@'10.0.0.5'",
                 "DROP USER IF EXISTS 'app'@'%'",
                 "DROP DATABASE IF EXISTS `appdb`"), sql);
-        // Every call goes through the mysql client as root with the password in the environment,
-        // so the client's insecure-password warning never lands in stderr.
-        assertTrue(commands.getAllValues().stream().allMatch(cmd -> cmd.get(0).equals("mysql") && cmd.contains("root")));
+        // Every call goes through the mysql client over the Unix socket (root@localhost, never
+        // root@% which the API may drop) with the password in the environment, so the client's
+        // insecure-password warning never lands in stderr.
+        assertTrue(commands.getAllValues().stream().allMatch(cmd -> cmd.get(0).equals("mysql") && cmd.contains("root")
+                && cmd.contains("--protocol=socket") && cmd.contains("--socket=/var/run/mysqld/mysqld.sock")
+                && !cmd.contains("127.0.0.1")));
         assertTrue(envs.getAllValues().stream().allMatch(env -> env.equals(List.of("MYSQL_PWD=root"))));
     }
 
     @Test
-    void systemSchemasAndTheRootAccountAreNeverTouched() {
+    void systemSchemasAndTheAdminLoginAreNeverTouched() {
         CloudSqlMySqlDataPlane plane = dataPlane();
 
         for (String system : List.of("mysql", "sys", "information_schema", "performance_schema")) {
@@ -186,22 +189,30 @@ class CloudSqlMySqlDataPlaneTest {
             plane.deleteDatabase(RUNNING, system);
             plane.grantDatabaseAccess(RUNNING, system, "app", "%");
         }
-        plane.createOrUpdateUser(RUNNING, "root", "%", "new-root-password");
-        plane.createOrUpdateUser(RUNNING, "root", null, "new-root-password");
-        // the local root identities the image also creates, which 127.0.0.1 connections resolve to
-        for (String local : List.of("localhost", "127.0.0.1", "::1")) {
-            plane.createOrUpdateUser(RUNNING, "root", local, "new-root-password");
-            plane.deleteUser(RUNNING, "root", local, List.of());
-        }
-        plane.grantDatabaseAccess(RUNNING, "appdb", "root", "%");
+        // root@localhost is what the socket login authenticates as; it is the one identity kept
+        // out of reach.
+        plane.createOrUpdateUser(RUNNING, "root", "localhost", "new-root-password");
+        plane.deleteUser(RUNNING, "root", "localhost", List.of());
+        plane.grantDatabaseAccess(RUNNING, "appdb", "root", "localhost");
 
         verify(lifecycleManager, never()).exec(any(), anyList(), anyList());
 
-        // root at another host is not the admin identity and is managed like any user.
+        // root@% (the provisioned account the Terraform provider drops and recreates) and root at
+        // any other host are managed like any user.
         when(lifecycleManager.exec(eq("container-1"), anyList(), anyList())).thenReturn(new ExecResult(0, "", ""));
+        plane.deleteUser(RUNNING, "root", "%", List.of());
+        plane.createOrUpdateUser(RUNNING, "root", null, "new-root-password");
+        plane.grantDatabaseAccess(RUNNING, "appdb", "root", "%");
         plane.createOrUpdateUser(RUNNING, "root", "10.0.0.5", "pw");
-        verify(lifecycleManager).exec(eq("container-1"), anyList(),
-                argThat(cmd -> cmd.get(cmd.size() - 1).startsWith("CREATE USER IF NOT EXISTS 'root'@'10.0.0.5'")));
+        ArgumentCaptor<List<String>> commands = ArgumentCaptor.captor();
+        verify(lifecycleManager, org.mockito.Mockito.times(4)).exec(eq("container-1"), anyList(), commands.capture());
+        assertEquals(List.of(
+                "DROP USER IF EXISTS 'root'@'%'",
+                "CREATE USER IF NOT EXISTS 'root'@'%' IDENTIFIED BY 'new-root-password'; "
+                        + "ALTER USER 'root'@'%' IDENTIFIED BY 'new-root-password'",
+                "GRANT ALL PRIVILEGES ON `appdb`.* TO 'root'@'%'",
+                "CREATE USER IF NOT EXISTS 'root'@'10.0.0.5' IDENTIFIED BY 'pw'; ALTER USER 'root'@'10.0.0.5' IDENTIFIED BY 'pw'"),
+                commands.getAllValues().stream().map(cmd -> cmd.get(cmd.size() - 1)).toList());
     }
 
     @Test

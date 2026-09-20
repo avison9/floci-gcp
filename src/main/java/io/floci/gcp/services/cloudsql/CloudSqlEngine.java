@@ -21,7 +21,7 @@ enum CloudSqlEngine {
     /**
      * MySQL: the four system schemas a fresh Cloud SQL MySQL instance lists, {@code utf8mb4}
      * defaults (8.0 and 8.4), host-qualified users defaulting to {@code %}, and the
-     * {@code root@%} account the instance is provisioned with.
+     * {@code root@%} account the instance is provisioned with, listed like any other user.
      */
     MYSQL("MySQL", "MYSQL_", "^MYSQL_8_(?:0(?:_\\d+)?|4)$", "MYSQL_8_0, MYSQL_8_0_NN or MYSQL_8_4",
             List.of("information_schema", "mysql", "performance_schema", "sys"),
@@ -121,12 +121,13 @@ enum CloudSqlEngine {
     }
 
     /**
-     * Whether {@code user@host} is one of the identities the data plane itself is provisioned
-     * with and logs in as. On MySQL that is {@code root} at {@code %} and at the local hosts the
-     * image also creates ({@code localhost}, {@code 127.0.0.1}, {@code ::1}), which the plane's
-     * own {@code 127.0.0.1} connections resolve to. A MySQL {@code root@10.0.0.5} is an ordinary,
-     * separately created account. These identities cannot be created, deleted or re-passworded
-     * through the API: doing so would strand every later DDL call.
+     * Whether {@code user@host} is the identity the data plane itself logs in as, which cannot be
+     * created, deleted or re-passworded through the API: doing so would strand every later DDL
+     * call. On MySQL that is {@code root@localhost} only, the account the {@code mysql} client
+     * authenticates as over the Unix socket. {@code root@%}, the account Cloud SQL provisions and
+     * lists, is an ordinary user: the Terraform provider deletes it right after creating every
+     * MySQL instance and expects to be able to recreate it. {@code root} at any other host is an
+     * ordinary, separately created account as well.
      */
     boolean isReservedIdentity(String user, String host) {
         if (builtInUser == null || !builtInUser.equals(user)) {
@@ -135,9 +136,8 @@ enum CloudSqlEngine {
         if (!hostQualifiedUsers()) {
             return true;
         }
-        String normalized = normalizeHost(host);
-        return defaultHost.equals(normalized) || LOCAL_HOSTS.contains(normalized.toLowerCase());
+        return ADMIN_HOST.equalsIgnoreCase(normalizeHost(host));
     }
 
-    private static final List<String> LOCAL_HOSTS = List.of("localhost", "127.0.0.1", "::1");
+    private static final String ADMIN_HOST = "localhost";
 }

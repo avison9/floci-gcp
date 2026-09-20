@@ -8,6 +8,7 @@ import static org.hamcrest.Matchers.containsInAnyOrder;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasItem;
 import static org.hamcrest.Matchers.hasItems;
+import static org.hamcrest.Matchers.hasKey;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.nullValue;
@@ -126,13 +127,46 @@ class CloudSqlMySqlRestIntegrationTest {
                 .statusCode(200)
                 .body("operationType", equalTo("DELETE_USER"));
 
+        // What the Terraform provider does right after creating a MySQL instance: delete root@%,
+        // then (for root_password) insert it again. Both are ordinary user operations on Cloud SQL.
         given()
                 .queryParam("name", "root")
                 .queryParam("host", "%")
                 .when().delete(base + "/instances/" + instance + "/users")
                 .then()
+                .statusCode(200)
+                .body("operationType", equalTo("DELETE_USER"));
+
+        given()
+                .when().get(base + "/instances/" + instance + "/users")
+                .then()
+                .statusCode(200)
+                .body("items.name", not(hasItem("root")));
+
+        given()
+                .contentType("application/json")
+                .body("{\"name\":\"root\",\"password\":\"new-root\"}")
+                .when().post(base + "/instances/" + instance + "/users")
+                .then()
+                .statusCode(200)
+                .body("operationType", equalTo("CREATE_USER"));
+
+        given()
+                .queryParam("host", "%")
+                .when().get(base + "/instances/" + instance + "/users/root")
+                .then()
+                .statusCode(200)
+                .body("host", equalTo("%"))
+                .body("$", not(hasKey("password")));
+
+        // root@localhost is the emulator's own login and stays out of reach.
+        given()
+                .contentType("application/json")
+                .body("{\"name\":\"root\",\"host\":\"localhost\",\"password\":\"x\"}")
+                .when().post(base + "/instances/" + instance + "/users")
+                .then()
                 .statusCode(400)
-                .body("error.status", equalTo("FAILED_PRECONDITION"));
+                .body("error.status", equalTo("INVALID_ARGUMENT"));
 
         given()
                 .when().get("/v1/flags")
