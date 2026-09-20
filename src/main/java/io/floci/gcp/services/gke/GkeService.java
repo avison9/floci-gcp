@@ -639,13 +639,27 @@ public class GkeService {
                 project, location, clusterId, nodePoolId, OperationType.DELETE_NODE_POOL);
     }
 
+    /** {@code ClusterManager.UpdateNodePool} ({@code PUT .../nodePools/{id}}).
+     *
+     * <p>{@code node_version} documents the same aliases as {@code desired_node_version}
+     * ({@code "latest"}, {@code "-"}, {@code "1.X"}, {@code "1.X.Y"}), so it goes through the
+     * same resolver: stored verbatim, a pool upgraded with {@code "latest"} or {@code "-"} read
+     * back that alias as its version. The resolver needs the cluster because {@code "-"} picks
+     * its master version, and the request is resolved before the pool is mutated so a rejected
+     * value leaves the pool exactly as it was. */
     public StoredOperation updateNodePool(String project, String location, String clusterId, String nodePoolId,
                                           Map<String, Object> body) {
+        StoredCluster cluster = requireCluster(project, location, clusterId);
         StoredNodePool pool = requireNodePool(project, location, clusterId, nodePoolId);
         if (body != null) {
-            String nodeVersion = (String) body.get("nodeVersion");
+            // A non-string value is a 400, not an unmapped ClassCastException (a 500); the field
+            // is optional here, so absence is the no-op it always was.
+            if (body.get("nodeVersion") != null && !(body.get("nodeVersion") instanceof String)) {
+                throw GcpException.invalidArgument("nodeVersion must be a string");
+            }
+            String nodeVersion = stringField(body, "nodeVersion", null);
             if (nodeVersion != null) {
-                pool.setVersion(nodeVersion);
+                pool.setVersion(resolveNodeVersion("nodeVersion", nodeVersion, cluster));
             }
             if (body.get("upgradeSettings") != null) {
                 pool.setUpgradeSettings(asMap(body.get("upgradeSettings")));
@@ -829,7 +843,7 @@ public class GkeService {
      * <p>Anything outside those five shapes is rejected. The prefix test alone would also accept
      * a bare major ({@code "1"} is a character prefix of {@code "1.30..."}), which the field does
      * not document and real GKE rejects. {@code field} is the request field the value came from
-     * (three callers share this), so the rejection names the field the client actually sent. */
+     * (four callers share this), so the rejection names the field the client actually sent. */
     private static String resolveMasterVersion(String field, String requested) {
         if ("latest".equals(requested) || "-".equals(requested)) {
             return DEFAULT_MASTER_VERSION;
