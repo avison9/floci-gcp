@@ -52,6 +52,14 @@ class GkeUpdateNodePoolRestIntegrationTest {
                 .body("version", equalTo(advertised))
                 .body("version", not(equalTo("latest")));
 
+        // #233: the cluster aggregate follows its pools, so it moves with the only pool.
+        given()
+                .when().get(BASE + "/clusters/" + cluster)
+                .then()
+                .statusCode(200)
+                .body("currentNodeVersion", equalTo(advertised))
+                .body("nodePools[0].version", equalTo(advertised));
+
         // `gcloud container clusters upgrade C --node-pool default-pool` with no --cluster-version:
         // "-" means the cluster's master version.
         given()
