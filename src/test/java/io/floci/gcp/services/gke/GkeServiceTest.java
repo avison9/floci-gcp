@@ -873,6 +873,56 @@ class GkeServiceTest {
     }
 
     @Test
+    void updateClusterRejectsMalformedVersionsWithoutTouchingTheCluster() {
+        service.createCluster(PROJECT, LOCATION, Map.of("name", "version-shape",
+                "initialClusterVersion", "1.29.0-gke.1"));
+        StoredCluster before = service.getCluster(PROJECT, LOCATION, "version-shape");
+        StoredNodePool poolBefore = service.getNodePool(PROJECT, LOCATION, "version-shape", "default-pool");
+        String nodeVersionBefore = before.getCurrentNodeVersion();
+        String masterVersionBefore = before.getCurrentMasterVersion();
+        String clusterEtagBefore = before.getEtag();
+        String poolVersionBefore = poolBefore.getVersion();
+        String poolEtagBefore = poolBefore.getEtag();
+
+        for (String field : List.of("desiredNodeVersion", "desiredMasterVersion")) {
+            GcpException thrown = assertThrows(GcpException.class,
+                    () -> service.updateCluster(PROJECT, LOCATION, "version-shape", Map.of(field, 123)));
+            assertEquals(400, thrown.getHttpStatus());
+            assertEquals(field + " must be a string", thrown.getMessage());
+        }
+
+        GcpException combined = assertThrows(GcpException.class,
+                () -> service.updateCluster(PROJECT, LOCATION, "version-shape", Map.of(
+                        "desiredNodeVersion", "1.30.0-gke.1",
+                        "desiredMasterVersion", 123)));
+        assertEquals("desiredMasterVersion must be a string", combined.getMessage());
+
+        StoredCluster after = service.getCluster(PROJECT, LOCATION, "version-shape");
+        StoredNodePool poolAfter = service.getNodePool(PROJECT, LOCATION, "version-shape", "default-pool");
+        assertEquals(nodeVersionBefore, after.getCurrentNodeVersion());
+        assertEquals(masterVersionBefore, after.getCurrentMasterVersion());
+        assertEquals(clusterEtagBefore, after.getEtag());
+        assertEquals(poolVersionBefore, poolAfter.getVersion());
+        assertEquals(poolEtagBefore, poolAfter.getEtag());
+    }
+
+    @Test
+    void updateClusterTreatsBlankVersionsAsUnset() {
+        service.createCluster(PROJECT, LOCATION, Map.of("name", "blank-version",
+                "initialClusterVersion", "1.29.0-gke.1"));
+
+        for (String field : List.of("desiredNodeVersion", "desiredMasterVersion")) {
+            service.updateCluster(PROJECT, LOCATION, "blank-version", Map.of(field, ""));
+        }
+
+        StoredCluster cluster = service.getCluster(PROJECT, LOCATION, "blank-version");
+        assertEquals("1.29.0-gke.1", cluster.getCurrentMasterVersion());
+        assertEquals("1.29.0-gke.1", cluster.getCurrentNodeVersion());
+        assertEquals("1.29.0-gke.1",
+                service.getNodePool(PROJECT, LOCATION, "blank-version", "default-pool").getVersion());
+    }
+
+    @Test
     void updateNodePoolResolvesNodeVersionAliasesAgainstTheMaster() {
         // UpdateNodePoolRequest.node_version documents the same aliases as desired_node_version
         // (#229): stored verbatim, GetNodePool reported "latest" or "-" as the pool's version.
