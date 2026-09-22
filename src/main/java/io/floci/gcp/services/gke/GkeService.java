@@ -889,8 +889,10 @@ public class GkeService {
      * master version, so every alias that matches it resolves to it. An explicit
      * {@code 1.X.Y-gke.N} that is not the advertised one is kept verbatim, as {@code createCluster}
      * and {@code UpdateCluster} already do, so clients pinning a specific version keep working
-     * against the emulator; a {@code 1.X} / {@code 1.X.Y} alias that matches nothing is kept the
-     * same way rather than failing on a catalogue this emulator does not have.
+     * against the emulator. A {@code 1.X} / {@code 1.X.Y} alias that matches no valid version is
+     * rejected (#231): the alias means "the highest valid version under this prefix", and when
+     * there is none there is nothing to pick, so storing it would make the emulator report a
+     * version its own {@code getServerConfig()} does not consider valid.
      *
      * <p>Anything outside those five shapes is rejected. The prefix test alone would also accept
      * a bare major ({@code "1"} is a character prefix of {@code "1.30..."}), which the field does
@@ -901,9 +903,12 @@ public class GkeService {
             return DEFAULT_MASTER_VERSION;
         }
         if (VERSION_PREFIX_ALIAS.matcher(requested).matches()) {
-            return DEFAULT_MASTER_VERSION.startsWith(requested + ".")
-                    || DEFAULT_MASTER_VERSION.startsWith(requested + "-")
-                    ? DEFAULT_MASTER_VERSION : requested;
+            if (DEFAULT_MASTER_VERSION.startsWith(requested + ".")
+                    || DEFAULT_MASTER_VERSION.startsWith(requested + "-")) {
+                return DEFAULT_MASTER_VERSION;
+            }
+            throw GcpException.invalidArgument("Invalid " + field + " \"" + requested
+                    + "\": no valid version matches this alias (valid: " + DEFAULT_MASTER_VERSION + ")");
         }
         if (EXPLICIT_VERSION.matcher(requested).matches()) {
             return requested;
