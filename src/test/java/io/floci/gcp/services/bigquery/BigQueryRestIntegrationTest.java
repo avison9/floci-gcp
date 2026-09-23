@@ -7,11 +7,13 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 
 import static io.restassured.RestAssured.given;
+import static org.hamcrest.Matchers.emptyOrNullString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasKey;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.notNullValue;
 import static org.hamcrest.Matchers.nullValue;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @QuarkusTest
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
@@ -467,6 +469,18 @@ class BigQueryRestIntegrationTest {
 
     @Test
     @Order(9)
+    void internalNdjsonRouteAnswersGetAndHead() {
+        String path = "/_floci-gcp/bigquery/projects/" + PROJECT + "/datasets/ds1/tables/t1/rows.ndjson";
+        String body = given().when().get(path).then().statusCode(200).extract().asString();
+        assertTrue(body.contains("\"name\":\"ana\""), body);
+
+        // DuckDB's httpfs probes with HEAD before reading. Deriving HEAD from the streaming GET
+        // left that probe hanging until httpfs timed out, so the route answers HEAD itself.
+        given().when().head(path).then().statusCode(200).body(emptyOrNullString());
+    }
+
+    @Test
+    @Order(10)
     void deleteSemantics() {
         given()
                 .when().delete(BASE + "/datasets/ds1")
@@ -534,5 +548,43 @@ class BigQueryRestIntegrationTest {
                 .when().patch(BASE + "/datasets/meta/tables/events")
                 .then().statusCode(400)
                 .body("error.errors[0].reason", equalTo("invalid"));
+    }
+
+    @Test
+    @Order(11)
+    void malformedQueryRequestFieldsReturnAGcpErrorNotA500() {
+        // Erasure makes the queryParameters cast succeed, so a bad element used to surface as a
+        // ClassCastException. Nothing maps that, so the client got a 500 with no error body.
+        given().contentType("application/json")
+                .body("""
+                        {"query": "SELECT @p", "useLegacySql": false, "queryParameters": ["oops"]}
+                        """)
+                .when().post(BASE + "/queries")
+                .then().statusCode(400)
+                .body("error.errors[0].reason", equalTo("invalidQuery"));
+
+        given().contentType("application/json")
+                .body("""
+                        {"query": "SELECT 1", "useLegacySql": false, "queryParameters": {"name": "p"}}
+                        """)
+                .when().post(BASE + "/queries")
+                .then().statusCode(400)
+                .body("error.errors[0].reason", equalTo("invalidQuery"));
+
+        given().contentType("application/json")
+                .body("""
+                        {"query": 5, "useLegacySql": false}
+                        """)
+                .when().post(BASE + "/queries")
+                .then().statusCode(400)
+                .body("error.errors[0].reason", equalTo("invalidQuery"));
+
+        given().contentType("application/json")
+                .body("""
+                        {"query": "SELECT 1", "useLegacySql": false, "parameterMode": 7}
+                        """)
+                .when().post(BASE + "/queries")
+                .then().statusCode(400)
+                .body("error.errors[0].reason", equalTo("invalidQuery"));
     }
 }
