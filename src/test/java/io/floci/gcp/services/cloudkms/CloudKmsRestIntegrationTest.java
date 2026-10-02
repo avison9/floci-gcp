@@ -143,6 +143,34 @@ class CloudKmsRestIntegrationTest {
     }
 
     @Test
+    void decryptVerifiesCiphertextAndAadChecksums() {
+        String key = createKey("decrypt-crc", "ENCRYPT_DECRYPT", null);
+        byte[] aad = "context".getBytes(StandardCharsets.UTF_8);
+        String ciphertext = json()
+                .body("{\"plaintext\": \"aGVsbG8=\", \"additionalAuthenticatedData\": \"" + b64(aad) + "\"}")
+                .when().post(key + ":encrypt")
+                .then().statusCode(200)
+                .extract().path("ciphertext");
+        String ciphertextCrc = crc32c(Base64.getDecoder().decode(ciphertext));
+        String request = "{\"ciphertext\": \"" + ciphertext + "\", \"additionalAuthenticatedData\": \"" + b64(aad)
+                + "\", \"ciphertextCrc32c\": \"%s\", \"additionalAuthenticatedDataCrc32c\": \"%s\"}";
+
+        json().body(request.formatted(ciphertextCrc, crc32c(aad)))
+                .when().post(key + ":decrypt")
+                .then().statusCode(200)
+                .body("plaintext", equalTo("aGVsbG8="));
+        json().body(request.formatted("1", crc32c(aad)))
+                .when().post(key + ":decrypt")
+                .then().statusCode(400)
+                .body("error.status", equalTo("INVALID_ARGUMENT"))
+                .body("plaintext", nullValue());
+        json().body(request.formatted(ciphertextCrc, "1"))
+                .when().post(key + ":decrypt")
+                .then().statusCode(400)
+                .body("error.status", equalTo("INVALID_ARGUMENT"));
+    }
+
+    @Test
     void asymmetricSignVerifiesTheDigestChecksum() throws Exception {
         String key = createKey("sign", "ASYMMETRIC_SIGN", "EC_SIGN_P256_SHA256");
         byte[] digest = MessageDigest.getInstance("SHA-256").digest("payload".getBytes(StandardCharsets.UTF_8));
