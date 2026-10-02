@@ -1,8 +1,11 @@
 package io.floci.gcp.services.cloudkms;
 
+import com.google.cloud.kms.v1.AsymmetricSignRequest;
 import com.google.cloud.kms.v1.CreateCryptoKeyRequest;
 import com.google.cloud.kms.v1.CreateKeyRingRequest;
 import com.google.cloud.kms.v1.CryptoKey;
+import com.google.cloud.kms.v1.CryptoKeyVersion;
+import com.google.cloud.kms.v1.CryptoKeyVersionTemplate;
 import com.google.cloud.kms.v1.DecryptRequest;
 import com.google.cloud.kms.v1.EncryptRequest;
 import com.google.cloud.kms.v1.KeyManagementServiceGrpc;
@@ -25,6 +28,7 @@ import java.util.zip.CRC32C;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Cloud KMS over gRPC on the shared port. */
 @QuarkusTest
@@ -77,6 +81,25 @@ class CloudKmsGrpcIntegrationTest {
                 .getStatus().getCode());
         assertEquals(Status.Code.INVALID_ARGUMENT, assertThrows(StatusRuntimeException.class,
                 () -> kms.decrypt(decrypt.toBuilder().setAdditionalAuthenticatedDataCrc32C(Int64Value.of(1)).build()))
+                .getStatus().getCode());
+    }
+
+    @Test
+    void asymmetricSignVerifiesTheDataChecksum() {
+        kms.createKeyRing(CreateKeyRingRequest.newBuilder().setParent(LOCATION).setKeyRingId("sign-ring").build());
+        String key = kms.createCryptoKey(CreateCryptoKeyRequest.newBuilder()
+                .setParent(LOCATION + "/keyRings/sign-ring").setCryptoKeyId("sign-data")
+                .setCryptoKey(CryptoKey.newBuilder().setPurpose(CryptoKey.CryptoKeyPurpose.ASYMMETRIC_SIGN)
+                        .setVersionTemplate(CryptoKeyVersionTemplate.newBuilder()
+                                .setAlgorithm(CryptoKeyVersion.CryptoKeyVersionAlgorithm.EC_SIGN_P256_SHA256)))
+                .build()).getName();
+        ByteString data = ByteString.copyFrom("payload", StandardCharsets.UTF_8);
+        AsymmetricSignRequest sign = AsymmetricSignRequest.newBuilder().setName(key + "/cryptoKeyVersions/1")
+                .setData(data).setDataCrc32C(Int64Value.of(crc32c(data))).build();
+
+        assertTrue(kms.asymmetricSign(sign).getVerifiedDataCrc32C());
+        assertEquals(Status.Code.INVALID_ARGUMENT, assertThrows(StatusRuntimeException.class,
+                () -> kms.asymmetricSign(sign.toBuilder().setDataCrc32C(Int64Value.of(1)).build()))
                 .getStatus().getCode());
     }
 }

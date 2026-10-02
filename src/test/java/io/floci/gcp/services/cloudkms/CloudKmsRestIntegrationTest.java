@@ -11,6 +11,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.KeyFactory;
 import java.security.MessageDigest;
 import java.security.PublicKey;
+import java.security.Signature;
 import java.security.spec.MGF1ParameterSpec;
 import java.security.spec.X509EncodedKeySpec;
 import java.util.Base64;
@@ -21,6 +22,7 @@ import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.notNullValue;
 import static org.hamcrest.Matchers.nullValue;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Request checksums on the KMS REST transport. Each optional {@code *Crc32c} field is verified
@@ -185,6 +187,35 @@ class CloudKmsRestIntegrationTest {
         json()
                 .body("{\"digest\": {\"sha256\": \"" + b64(digest) + "\"}, \"digestCrc32c\": \"1\"}")
                 .when().post(url)
+                .then().statusCode(400)
+                .body("error.status", equalTo("INVALID_ARGUMENT"));
+    }
+
+    @Test
+    void asymmetricSignSignsTheSha256OfData() throws Exception {
+        String key = createKey("sign-data", "ASYMMETRIC_SIGN", "EC_SIGN_P256_SHA256");
+        String version = key + "/cryptoKeyVersions/1";
+        byte[] data = "payload".getBytes(StandardCharsets.UTF_8);
+
+        String signature = json()
+                .body("{\"data\": \"" + b64(data) + "\", \"dataCrc32c\": \"" + crc32c(data) + "\"}")
+                .when().post(version + ":asymmetricSign")
+                .then().statusCode(200)
+                .body("verifiedDataCrc32c", equalTo(true))
+                .extract().path("signature");
+        String pem = given().when().get(version + "/publicKey").then().statusCode(200).extract().path("pem");
+        Signature verifier = Signature.getInstance("SHA256withECDSA");
+        verifier.initVerify(KeyFactory.getInstance("EC").generatePublic(new X509EncodedKeySpec(
+                Base64.getMimeDecoder().decode(pem.replaceAll("-----[A-Z ]+-----", "")))));
+        verifier.update(data);
+        assertTrue(verifier.verify(Base64.getDecoder().decode(signature)), "the signature covers the data");
+
+        json().body("{\"data\": \"" + b64(data) + "\", \"dataCrc32c\": \"1\"}")
+                .when().post(version + ":asymmetricSign")
+                .then().statusCode(400)
+                .body("error.status", equalTo("INVALID_ARGUMENT"));
+        json().body("{}")
+                .when().post(version + ":asymmetricSign")
                 .then().statusCode(400)
                 .body("error.status", equalTo("INVALID_ARGUMENT"));
     }

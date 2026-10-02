@@ -25,6 +25,8 @@ import org.jboss.logging.Logger;
 
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -342,14 +344,17 @@ public class CloudKmsHttpController {
                     digest = Base64.getDecoder().decode(s);
                 }
             }
+            byte[] data = decodeField(body, "data");
             boolean verifiedDigest = verifyCrc32c(body, "digestCrc32c", digest);
+            boolean verifiedData = verifyCrc32c(body, "dataCrc32c", data);
             byte[] signature = service.asymmetricSign(
-                    versionName(project, location, keyRing, cryptoKey, version), digest);
+                    versionName(project, location, keyRing, cryptoKey, version), resolveDigest(digest, data));
             Map<String, Object> response = new LinkedHashMap<>();
             response.put("name", versionName(project, location, keyRing, cryptoKey, version));
             response.put("signature", Base64.getEncoder().encodeToString(signature));
             response.put("signatureCrc32c", String.valueOf(crc32c(signature)));
             putIfVerified(response, "verifiedDigestCrc32c", verifiedDigest);
+            putIfVerified(response, "verifiedDataCrc32c", verifiedData);
             response.put("protectionLevel", "SOFTWARE");
             return Response.ok(response).build();
         } catch (GcpException e) {
@@ -510,6 +515,21 @@ public class CloudKmsHttpController {
         } catch (JsonProcessingException e) {
             throw GcpException.invalidArgument("Invalid JSON payload received: " + e.getOriginalMessage());
         }
+    }
+
+    /** The digest to sign: the one supplied, else the SHA-256 of the data, as the gRPC controller does. */
+    private static byte[] resolveDigest(byte[] digest, byte[] data) {
+        if (digest.length > 0) {
+            return digest;
+        }
+        if (data.length > 0) {
+            try {
+                return MessageDigest.getInstance("SHA-256").digest(data);
+            } catch (NoSuchAlgorithmException e) {
+                throw GcpException.internal("Digest computation failed: " + e.getMessage());
+            }
+        }
+        throw GcpException.invalidArgument("A SHA-256 digest or data is required for AsymmetricSign");
     }
 
     /** proto3 JSON leaves a false bool out, so a verified flag only appears when it is true. */
