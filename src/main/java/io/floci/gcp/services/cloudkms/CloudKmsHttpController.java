@@ -307,10 +307,13 @@ public class CloudKmsHttpController {
     @POST
     @Path("/{location}/keyRings/{keyRing}/cryptoKeys/{cryptoKey}:decrypt")
     public Response decrypt(@PathParam("project") String project, @PathParam("location") String location,
-            @PathParam("keyRing") String keyRing, @PathParam("cryptoKey") String cryptoKey, Map<String, Object> body) {
+            @PathParam("keyRing") String keyRing, @PathParam("cryptoKey") String cryptoKey, String rawBody) {
         try {
+            Map<String, Object> body = parseBody(rawBody);
             byte[] ciphertext = decodeField(body, "ciphertext");
             byte[] aad = decodeField(body, "additionalAuthenticatedData");
+            verifyCrc32c(body, "ciphertextCrc32c", ciphertext);
+            verifyCrc32c(body, "additionalAuthenticatedDataCrc32c", aad);
             CloudKmsService.DecryptResult result = service.decrypt(
                     cryptoKeyName(project, location, keyRing, cryptoKey), ciphertext, aad);
             Map<String, Object> response = new LinkedHashMap<>();
