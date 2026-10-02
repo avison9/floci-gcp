@@ -132,6 +132,14 @@ class CloudKmsRestIntegrationTest {
                     .then().statusCode(400)
                     .body("error.status", equalTo("INVALID_ARGUMENT"));
         }
+        // An empty plaintext has CRC32C 0, so a literal that rounds to 0 must still be rejected.
+        for (String crc : List.of("1e-324", "\"1e-324\"", "0.5")) {
+            json()
+                    .body("{\"plaintext\": \"\", \"plaintextCrc32c\": " + crc + "}")
+                    .when().post(key + ":encrypt")
+                    .then().statusCode(400)
+                    .body("error.status", equalTo("INVALID_ARGUMENT"));
+        }
     }
 
     @Test

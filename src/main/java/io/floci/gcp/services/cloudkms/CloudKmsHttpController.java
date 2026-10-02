@@ -1,5 +1,9 @@
 package io.floci.gcp.services.cloudkms;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.gcp.core.common.GcpException;
 import io.floci.gcp.services.cloudkms.model.StoredCryptoKey;
 import io.floci.gcp.services.cloudkms.model.StoredCryptoKeyVersion;
@@ -43,6 +47,8 @@ import java.util.zip.CRC32C;
 public class CloudKmsHttpController {
 
     private static final Logger LOG = Logger.getLogger(CloudKmsHttpController.class);
+    private static final ObjectMapper EXACT_NUMBERS = new ObjectMapper()
+            .enable(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS);
 
     @Inject
     CloudKmsService service;
@@ -276,8 +282,9 @@ public class CloudKmsHttpController {
     @POST
     @Path("/{location}/keyRings/{keyRing}/cryptoKeys/{cryptoKey}:encrypt")
     public Response encrypt(@PathParam("project") String project, @PathParam("location") String location,
-            @PathParam("keyRing") String keyRing, @PathParam("cryptoKey") String cryptoKey, Map<String, Object> body) {
+            @PathParam("keyRing") String keyRing, @PathParam("cryptoKey") String cryptoKey, String rawBody) {
         try {
+            Map<String, Object> body = parseBody(rawBody);
             byte[] plaintext = decodeField(body, "plaintext");
             byte[] aad = decodeField(body, "additionalAuthenticatedData");
             boolean verifiedPlaintext = verifyCrc32c(body, "plaintextCrc32c", plaintext);
@@ -322,8 +329,9 @@ public class CloudKmsHttpController {
     @SuppressWarnings("unchecked")
     public Response asymmetricSign(@PathParam("project") String project, @PathParam("location") String location,
             @PathParam("keyRing") String keyRing, @PathParam("cryptoKey") String cryptoKey,
-            @PathParam("version") String version, Map<String, Object> body) {
+            @PathParam("version") String version, String rawBody) {
         try {
+            Map<String, Object> body = parseBody(rawBody);
             byte[] digest = new byte[0];
             if (body != null && body.get("digest") instanceof Map<?, ?> d) {
                 Object sha256 = ((Map<String, Object>) d).get("sha256");
@@ -350,8 +358,9 @@ public class CloudKmsHttpController {
     @Path("/{location}/keyRings/{keyRing}/cryptoKeys/{cryptoKey}/cryptoKeyVersions/{version}:asymmetricDecrypt")
     public Response asymmetricDecrypt(@PathParam("project") String project, @PathParam("location") String location,
             @PathParam("keyRing") String keyRing, @PathParam("cryptoKey") String cryptoKey,
-            @PathParam("version") String version, Map<String, Object> body) {
+            @PathParam("version") String version, String rawBody) {
         try {
+            Map<String, Object> body = parseBody(rawBody);
             byte[] ciphertext = decodeField(body, "ciphertext");
             boolean verifiedCiphertext = verifyCrc32c(body, "ciphertextCrc32c", ciphertext);
             byte[] plaintext = service.asymmetricDecrypt(
@@ -482,6 +491,22 @@ public class CloudKmsHttpController {
             throw GcpException.invalidArgument("Checksum verification failed");
         }
         return true;
+    }
+
+    /**
+     * Parses a request whose int64 checksums must be read exactly. The shared mapper turns a JSON
+     * number with a fraction or exponent into a double, which can round a non-integral literal such
+     * as {@code 1e-324} to {@code 0}; reading floats as BigDecimal keeps the literal.
+     */
+    private static Map<String, Object> parseBody(String rawBody) {
+        if (rawBody == null || rawBody.isBlank()) {
+            return null;
+        }
+        try {
+            return EXACT_NUMBERS.readValue(rawBody, new TypeReference<Map<String, Object>>() {});
+        } catch (JsonProcessingException e) {
+            throw GcpException.invalidArgument("Invalid JSON payload received: " + e.getOriginalMessage());
+        }
     }
 
     /** proto3 JSON leaves a false bool out, so a verified flag only appears when it is true. */
