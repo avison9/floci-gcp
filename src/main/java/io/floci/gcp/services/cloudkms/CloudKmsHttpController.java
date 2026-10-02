@@ -279,12 +279,16 @@ public class CloudKmsHttpController {
         try {
             byte[] plaintext = decodeField(body, "plaintext");
             byte[] aad = decodeField(body, "additionalAuthenticatedData");
+            boolean verifiedPlaintext = verifyCrc32c(body, "plaintextCrc32c", plaintext);
+            boolean verifiedAad = verifyCrc32c(body, "additionalAuthenticatedDataCrc32c", aad);
             CloudKmsService.EncryptResult result = service.encrypt(
                     cryptoKeyName(project, location, keyRing, cryptoKey), plaintext, aad);
             Map<String, Object> response = new LinkedHashMap<>();
             response.put("name", result.versionName());
             response.put("ciphertext", Base64.getEncoder().encodeToString(result.ciphertext()));
             response.put("ciphertextCrc32c", String.valueOf(crc32c(result.ciphertext())));
+            putIfVerified(response, "verifiedPlaintextCrc32c", verifiedPlaintext);
+            putIfVerified(response, "verifiedAdditionalAuthenticatedDataCrc32c", verifiedAad);
             response.put("protectionLevel", "SOFTWARE");
             return Response.ok(response).build();
         } catch (GcpException e) {
@@ -326,12 +330,14 @@ public class CloudKmsHttpController {
                     digest = Base64.getDecoder().decode(s);
                 }
             }
+            boolean verifiedDigest = verifyCrc32c(body, "digestCrc32c", digest);
             byte[] signature = service.asymmetricSign(
                     versionName(project, location, keyRing, cryptoKey, version), digest);
             Map<String, Object> response = new LinkedHashMap<>();
             response.put("name", versionName(project, location, keyRing, cryptoKey, version));
             response.put("signature", Base64.getEncoder().encodeToString(signature));
             response.put("signatureCrc32c", String.valueOf(crc32c(signature)));
+            putIfVerified(response, "verifiedDigestCrc32c", verifiedDigest);
             response.put("protectionLevel", "SOFTWARE");
             return Response.ok(response).build();
         } catch (GcpException e) {
@@ -346,11 +352,13 @@ public class CloudKmsHttpController {
             @PathParam("version") String version, Map<String, Object> body) {
         try {
             byte[] ciphertext = decodeField(body, "ciphertext");
+            boolean verifiedCiphertext = verifyCrc32c(body, "ciphertextCrc32c", ciphertext);
             byte[] plaintext = service.asymmetricDecrypt(
                     versionName(project, location, keyRing, cryptoKey, version), ciphertext);
             Map<String, Object> response = new LinkedHashMap<>();
             response.put("plaintext", Base64.getEncoder().encodeToString(plaintext));
             response.put("plaintextCrc32c", String.valueOf(crc32c(plaintext)));
+            putIfVerified(response, "verifiedCiphertextCrc32c", verifiedCiphertext);
             response.put("protectionLevel", "SOFTWARE");
             return Response.ok(response).build();
         } catch (GcpException e) {
@@ -448,6 +456,40 @@ public class CloudKmsHttpController {
         CRC32C crc = new CRC32C();
         crc.update(data);
         return crc.getValue();
+    }
+
+    /**
+     * Checks an optional request checksum the way the gRPC controller does: absent means not
+     * verified, a mismatch is INVALID_ARGUMENT. The field is an int64, which proto3 JSON carries as
+     * a decimal string or a number.
+     */
+    private static boolean verifyCrc32c(Map<String, Object> body, String field, byte[] data) {
+        Object value = body != null ? body.get(field) : null;
+        if (value == null) {
+            return false;
+        }
+        long expected;
+        try {
+            expected = switch (value) {
+                case String s -> Long.parseLong(s);
+                case Integer i -> i;
+                case Long l -> l;
+                default -> throw new NumberFormatException();
+            };
+        } catch (NumberFormatException e) {
+            throw GcpException.invalidArgument("Invalid value at '" + field + "' (TYPE_INT64): " + value);
+        }
+        if (crc32c(data) != expected) {
+            throw GcpException.invalidArgument("Checksum verification failed");
+        }
+        return true;
+    }
+
+    /** proto3 JSON leaves a false bool out, so a verified flag only appears when it is true. */
+    private static void putIfVerified(Map<String, Object> response, String field, boolean verified) {
+        if (verified) {
+            response.put(field, true);
+        }
     }
 
     private static Response error(GcpException e) {
