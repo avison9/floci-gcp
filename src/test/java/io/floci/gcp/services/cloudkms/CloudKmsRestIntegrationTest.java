@@ -14,6 +14,7 @@ import java.security.PublicKey;
 import java.security.spec.MGF1ParameterSpec;
 import java.security.spec.X509EncodedKeySpec;
 import java.util.Base64;
+import java.util.List;
 import java.util.zip.CRC32C;
 
 import static io.restassured.RestAssured.given;
@@ -81,13 +82,15 @@ class CloudKmsRestIntegrationTest {
     }
 
     @Test
-    void encryptAcceptsTheChecksumAsAJsonNumber() {
+    void encryptAcceptsEveryProto3JsonFormOfTheChecksum() {
         String key = createKey("encrypt-number", "ENCRYPT_DECRYPT", null);
-        json()
-                .body("{\"plaintext\": \"aGVsbG8=\", \"plaintextCrc32c\": 2591144780}")
-                .when().post(key + ":encrypt")
-                .then().statusCode(200)
-                .body("verifiedPlaintextCrc32c", equalTo(true));
+        for (String crc : List.of("2591144780", "2.59114478e9", "\"2.59114478e9\"", "2591144780.0")) {
+            json()
+                    .body("{\"plaintext\": \"aGVsbG8=\", \"plaintextCrc32c\": " + crc + "}")
+                    .when().post(key + ":encrypt")
+                    .then().statusCode(200)
+                    .body("verifiedPlaintextCrc32c", equalTo(true));
+        }
     }
 
     @Test
@@ -122,11 +125,13 @@ class CloudKmsRestIntegrationTest {
     @Test
     void encryptRejectsAChecksumThatIsNotAnInt64() {
         String key = createKey("encrypt-malformed", "ENCRYPT_DECRYPT", null);
-        json()
-                .body("{\"plaintext\": \"aGVsbG8=\", \"plaintextCrc32c\": \"abc\"}")
-                .when().post(key + ":encrypt")
-                .then().statusCode(400)
-                .body("error.status", equalTo("INVALID_ARGUMENT"));
+        for (String crc : List.of("\"abc\"", "\"\"", "2591144780.5", "{\"value\": \"2591144780\"}")) {
+            json()
+                    .body("{\"plaintext\": \"aGVsbG8=\", \"plaintextCrc32c\": " + crc + "}")
+                    .when().post(key + ":encrypt")
+                    .then().statusCode(400)
+                    .body("error.status", equalTo("INVALID_ARGUMENT"));
+        }
     }
 
     @Test

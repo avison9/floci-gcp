@@ -19,6 +19,7 @@ import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
 
+import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.LinkedHashMap;
@@ -461,7 +462,7 @@ public class CloudKmsHttpController {
     /**
      * Checks an optional request checksum the way the gRPC controller does: absent means not
      * verified, a mismatch is INVALID_ARGUMENT. The field is an int64, which proto3 JSON carries as
-     * a decimal string or a number.
+     * a string or a number, in either form possibly with an exponent; it must be integral.
      */
     private static boolean verifyCrc32c(Map<String, Object> body, String field, byte[] data) {
         Object value = body != null ? body.get(field) : null;
@@ -470,13 +471,11 @@ public class CloudKmsHttpController {
         }
         long expected;
         try {
-            expected = switch (value) {
-                case String s -> Long.parseLong(s);
-                case Integer i -> i;
-                case Long l -> l;
-                default -> throw new NumberFormatException();
-            };
-        } catch (NumberFormatException e) {
+            if (!(value instanceof String) && !(value instanceof Number)) {
+                throw new NumberFormatException();
+            }
+            expected = new BigDecimal(value.toString()).longValueExact();
+        } catch (NumberFormatException | ArithmeticException e) {
             throw GcpException.invalidArgument("Invalid value at '" + field + "' (TYPE_INT64): " + value);
         }
         if (crc32c(data) != expected) {
