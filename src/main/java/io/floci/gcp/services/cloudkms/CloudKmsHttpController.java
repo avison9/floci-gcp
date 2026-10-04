@@ -339,7 +339,7 @@ public class CloudKmsHttpController {
             if (body != null && body.get("digest") instanceof Map<?, ?> d) {
                 Object sha256 = ((Map<String, Object>) d).get("sha256");
                 if (sha256 instanceof String s) {
-                    digest = Base64.getDecoder().decode(s);
+                    digest = decodeBytes(s, "digest.sha256");
                 }
             }
             boolean verifiedDigest = verifyCrc32c(body, "digestCrc32c", digest);
@@ -462,7 +462,19 @@ public class CloudKmsHttpController {
         if (body == null || !(body.get(field) instanceof String s) || s.isEmpty()) {
             return new byte[0];
         }
-        return Base64.getDecoder().decode(s);
+        return decodeBytes(s, field);
+    }
+
+    /**
+     * proto3 JSON accepts a bytes field in standard or URL-safe base64, with or without padding;
+     * gcloud sends URL-safe. The basic decoder already treats padding as optional.
+     */
+    private static byte[] decodeBytes(String value, String field) {
+        try {
+            return Base64.getDecoder().decode(value.replace('-', '+').replace('_', '/'));
+        } catch (IllegalArgumentException e) {
+            throw GcpException.invalidArgument("Invalid value at '" + field + "' (TYPE_BYTES): " + e.getMessage());
+        }
     }
 
     private static long crc32c(byte[] data) {

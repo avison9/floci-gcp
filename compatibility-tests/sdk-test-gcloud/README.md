@@ -22,7 +22,7 @@ environment only (no `gcloud config` mutation):
 |---|---|
 | Cloud Storage | `storage buckets create/list`, `storage cp/mv/cat/ls/rm` |
 | Secret Manager | `secrets create/list/versions add/versions access` |
-| Cloud KMS | `kms keyrings create/list`, `kms keys create/list/describe` |
+| Cloud KMS | `kms keyrings create/list`, `kms keys create/list/describe`, `kms encrypt/decrypt` |
 | IAM | `iam service-accounts create/list` |
 | Cloud Scheduler | `scheduler jobs create/list/describe/pause/resume/run` |
 
@@ -34,9 +34,6 @@ surfaces a few emulator gaps. These operations are intentionally not asserted he
 
 - **Pub/Sub** — gRPC-only in the emulator; `gcloud pubsub` (REST) cannot reach it,
   so there is no Pub/Sub coverage in this suite.
-- **Cloud KMS encrypt/decrypt** — gcloud verifies request/response CRC32C; the
-  emulator does not yet return matching CRC32C fields, so gcloud reports
-  "corrupted in-transit". (`KmsTest` covers the encrypt/decrypt data path.)
 - **Secret Manager `versions add`** — gcloud's payload CRC32C check makes the command
   exit non-zero; the version is still created correctly (the test asserts the
   round-tripped payload via `versions access`).

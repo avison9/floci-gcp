@@ -21,6 +21,7 @@ import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.notNullValue;
 import static org.hamcrest.Matchers.nullValue;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Request checksums on the KMS REST transport. Each optional {@code *Crc32c} field is verified
@@ -165,6 +166,34 @@ class CloudKmsRestIntegrationTest {
                 .body("error.status", equalTo("INVALID_ARGUMENT"))
                 .body("plaintext", nullValue());
         json().body(request.formatted(ciphertextCrc, "1"))
+                .when().post(key + ":decrypt")
+                .then().statusCode(400)
+                .body("error.status", equalTo("INVALID_ARGUMENT"));
+    }
+
+    @Test
+    void bytesFieldsAcceptUrlSafeUnpaddedBase64() {
+        String key = createKey("url-safe", "ENCRYPT_DECRYPT", null);
+        // 0xfb 0xff encodes as "+/8=" in standard base64 and "-_8" in URL-safe unpadded form.
+        byte[] plaintext = {(byte) 0xfb, (byte) 0xff};
+        // The ciphertext carries a random IV, so about one in five has no '+' or '/' to convert;
+        // encrypt until it does, so the decrypt below always sees a URL-safe character.
+        String urlSafe = "";
+        for (int attempt = 0; attempt < 50 && urlSafe.indexOf('-') < 0 && urlSafe.indexOf('_') < 0; attempt++) {
+            String ciphertext = json()
+                    .body("{\"plaintext\": \"-_8\"}")
+                    .when().post(key + ":encrypt")
+                    .then().statusCode(200)
+                    .extract().path("ciphertext");
+            urlSafe = ciphertext.replace('+', '-').replace('/', '_').replace("=", "");
+        }
+        assertTrue(urlSafe.indexOf('-') >= 0 || urlSafe.indexOf('_') >= 0, "no ciphertext with a URL-safe character");
+
+        json().body("{\"ciphertext\": \"" + urlSafe + "\"}")
+                .when().post(key + ":decrypt")
+                .then().statusCode(200)
+                .body("plaintext", equalTo(b64(plaintext)));
+        json().body("{\"ciphertext\": \"not*base64\"}")
                 .when().post(key + ":decrypt")
                 .then().statusCode(400)
                 .body("error.status", equalTo("INVALID_ARGUMENT"));
