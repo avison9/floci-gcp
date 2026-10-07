@@ -318,6 +318,74 @@ class PubSubRestIntegrationTest {
     }
 
     @Test
+    void publishAcceptsUrlSafeUnpaddedBase64Data() {
+        String project = "pubsub-rest-url-safe-it";
+        String base = "/v1/projects/" + project;
+
+        given().when().put(base + "/topics/events").then().statusCode(200);
+        given()
+                .contentType("application/json")
+                .body("{\"topic\": \"projects/%s/topics/events\"}".formatted(project))
+                .when().put(base + "/subscriptions/all")
+                .then()
+                .statusCode(200);
+
+        // 0xfb 0xff encodes as "+/8=" in standard base64 and "-_8" in URL-safe unpadded form.
+        given()
+                .urlEncodingEnabled(false)
+                .contentType("application/json")
+                .body("{\"messages\": [{\"data\": \"-_8\"}]}")
+                .when().post(base + "/topics/events:publish")
+                .then()
+                .statusCode(200)
+                .body("messageIds.size()", equalTo(1));
+
+        given()
+                .urlEncodingEnabled(false)
+                .contentType("application/json")
+                .body("{\"maxMessages\": 10}")
+                .when().post(base + "/subscriptions/all:pull")
+                .then()
+                .statusCode(200)
+                .body("receivedMessages.size()", equalTo(1))
+                .body("receivedMessages[0].message.data", equalTo("+/8="));
+    }
+
+    @Test
+    void publishRejectsUndecodableDataWithInvalidArgumentAndPublishesNothing() {
+        String project = "pubsub-rest-bad-base64-it";
+        String base = "/v1/projects/" + project;
+
+        given().when().put(base + "/topics/events").then().statusCode(200);
+        given()
+                .contentType("application/json")
+                .body("{\"topic\": \"projects/%s/topics/events\"}".formatted(project))
+                .when().put(base + "/subscriptions/all")
+                .then()
+                .statusCode(200);
+
+        // The valid first message must not be published when the second cannot be decoded.
+        given()
+                .urlEncodingEnabled(false)
+                .contentType("application/json")
+                .body("{\"messages\": [{\"data\": \"+/8=\"}, {\"data\": \"not*base64\"}]}")
+                .when().post(base + "/topics/events:publish")
+                .then()
+                .statusCode(400)
+                .body("error.code", equalTo(400))
+                .body("error.status", equalTo("INVALID_ARGUMENT"));
+
+        given()
+                .urlEncodingEnabled(false)
+                .contentType("application/json")
+                .body("{\"maxMessages\": 10}")
+                .when().post(base + "/subscriptions/all:pull")
+                .then()
+                .statusCode(200)
+                .body("receivedMessages", empty());
+    }
+
+    @Test
     void unparseableFilterIsRejectedWithInvalidArgument() {
         String project = "pubsub-rest-filter-invalid-it";
         String base = "/v1/projects/" + project;
