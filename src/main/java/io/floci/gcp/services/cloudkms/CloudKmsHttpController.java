@@ -338,17 +338,20 @@ public class CloudKmsHttpController {
         try {
             Map<String, Object> body = parseBody(rawBody);
             byte[] digest = new byte[0];
+            boolean digestSupplied = false;
             if (body != null && body.get("digest") instanceof Map<?, ?> d) {
                 Object sha256 = ((Map<String, Object>) d).get("sha256");
                 if (sha256 instanceof String s) {
                     digest = decodeBytes(s, "digest.sha256");
                 }
+                digestSupplied = List.of("sha256", "sha384", "sha512").stream()
+                        .anyMatch(k -> d.get(k) instanceof String s && !s.isEmpty());
             }
             byte[] data = decodeField(body, "data");
             boolean verifiedDigest = verifyCrc32c(body, "digestCrc32c", digest);
             boolean verifiedData = verifyCrc32c(body, "dataCrc32c", data);
             byte[] signature = service.asymmetricSign(
-                    versionName(project, location, keyRing, cryptoKey, version), resolveDigest(digest, data));
+                    versionName(project, location, keyRing, cryptoKey, version), resolveDigest(digest, digestSupplied, data));
             Map<String, Object> response = new LinkedHashMap<>();
             response.put("name", versionName(project, location, keyRing, cryptoKey, version));
             response.put("signature", Base64.getEncoder().encodeToString(signature));
@@ -531,13 +534,13 @@ public class CloudKmsHttpController {
 
     /**
      * The digest to sign: the one supplied, else the SHA-256 of the data, as the gRPC controller does.
-     * The proto lets a request carry one or the other, never both.
+     * The proto lets a request carry one or the other, never both, whichever digest variant it is.
      */
-    private static byte[] resolveDigest(byte[] digest, byte[] data) {
+    private static byte[] resolveDigest(byte[] digest, boolean digestSupplied, byte[] data) {
+        if (digestSupplied && data.length > 0) {
+            throw GcpException.invalidArgument("Only one of digest or data may be supplied for AsymmetricSign");
+        }
         if (digest.length > 0) {
-            if (data.length > 0) {
-                throw GcpException.invalidArgument("Only one of digest or data may be supplied for AsymmetricSign");
-            }
             return digest;
         }
         if (data.length > 0) {

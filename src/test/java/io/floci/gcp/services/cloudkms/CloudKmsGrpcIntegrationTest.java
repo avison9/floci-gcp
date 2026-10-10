@@ -122,4 +122,22 @@ class CloudKmsGrpcIntegrationTest {
         assertEquals(Status.Code.INVALID_ARGUMENT, assertThrows(StatusRuntimeException.class,
                 () -> kms.asymmetricSign(sign)).getStatus().getCode());
     }
+
+    @Test
+    void asymmetricSignRejectsSha384DigestAndDataTogether() throws Exception {
+        kms.createKeyRing(CreateKeyRingRequest.newBuilder().setParent(LOCATION).setKeyRingId("sign-both-384-ring").build());
+        String key = kms.createCryptoKey(CreateCryptoKeyRequest.newBuilder()
+                .setParent(LOCATION + "/keyRings/sign-both-384-ring").setCryptoKeyId("sign-both-384")
+                .setCryptoKey(CryptoKey.newBuilder().setPurpose(CryptoKey.CryptoKeyPurpose.ASYMMETRIC_SIGN)
+                        .setVersionTemplate(CryptoKeyVersionTemplate.newBuilder()
+                                .setAlgorithm(CryptoKeyVersion.CryptoKeyVersionAlgorithm.EC_SIGN_P256_SHA256)))
+                .build()).getName();
+        ByteString data = ByteString.copyFrom("payload", StandardCharsets.UTF_8);
+        ByteString sha384 = ByteString.copyFrom(MessageDigest.getInstance("SHA-384").digest(data.toByteArray()));
+        AsymmetricSignRequest sign = AsymmetricSignRequest.newBuilder().setName(key + "/cryptoKeyVersions/1")
+                .setDigest(Digest.newBuilder().setSha384(sha384)).setData(data).build();
+
+        assertEquals(Status.Code.INVALID_ARGUMENT, assertThrows(StatusRuntimeException.class,
+                () -> kms.asymmetricSign(sign)).getStatus().getCode());
+    }
 }

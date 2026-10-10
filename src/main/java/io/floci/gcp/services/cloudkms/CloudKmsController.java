@@ -13,6 +13,7 @@ import com.google.cloud.kms.v1.CryptoKeyVersionTemplate;
 import com.google.cloud.kms.v1.DecryptRequest;
 import com.google.cloud.kms.v1.DecryptResponse;
 import com.google.cloud.kms.v1.DestroyCryptoKeyVersionRequest;
+import com.google.cloud.kms.v1.Digest;
 import com.google.cloud.kms.v1.EncryptRequest;
 import com.google.cloud.kms.v1.EncryptResponse;
 import com.google.cloud.kms.v1.GenerateRandomBytesRequest;
@@ -467,11 +468,11 @@ public class CloudKmsController extends KeyManagementServiceGrpc.KeyManagementSe
     }
 
     private static byte[] resolveDigest(AsymmetricSignRequest request) {
+        if (request.getDigest().getDigestCase() != Digest.DigestCase.DIGEST_NOT_SET && !request.getData().isEmpty()) {
+            throw GcpException.invalidArgument("Only one of digest or data may be supplied for AsymmetricSign");
+        }
         ByteString sha256 = request.getDigest().getSha256();
         if (!sha256.isEmpty()) {
-            if (!request.getData().isEmpty()) {
-                throw GcpException.invalidArgument("Only one of digest or data may be supplied for AsymmetricSign");
-            }
             return sha256.toByteArray();
         }
         if (!request.getData().isEmpty()) {
