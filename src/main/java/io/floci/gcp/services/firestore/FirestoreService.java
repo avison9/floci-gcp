@@ -6,9 +6,11 @@ import com.google.firestore.v1.Document;
 import com.google.firestore.v1.DocumentTransform;
 import com.google.firestore.v1.DocumentMask;
 import com.google.firestore.v1.Precondition;
+import com.google.firestore.v1.StructuredAggregationQuery;
 import com.google.firestore.v1.StructuredQuery;
 import com.google.firestore.v1.Value;
 import com.google.firestore.v1.Write;
+import com.google.protobuf.NullValue;
 import com.google.type.LatLng;
 import io.floci.gcp.config.EmulatorConfig;
 import io.floci.gcp.core.common.GcpException;
@@ -483,8 +485,82 @@ public class FirestoreService {
         return new ArrayList<>(ids);
     }
 
-    public long countDocuments(String parent, StructuredQuery query) {
-        return runQuery(parent, query).size();
+    /**
+     * Evaluates each aggregation over the documents the nested query returns, following the rules
+     * on {@code StructuredAggregationQuery.Aggregation} in google/firestore/v1/query.proto.
+     */
+    public Map<String, Value> runAggregationQuery(String parent, StructuredAggregationQuery query) {
+        List<StoredDocument> docs = runQuery(parent,
+                query.hasStructuredQuery() ? query.getStructuredQuery() : StructuredQuery.getDefaultInstance());
+        Map<String, Value> results = new LinkedHashMap<>();
+        int unnamed = 0;
+        for (StructuredAggregationQuery.Aggregation aggregation : query.getAggregationsList()) {
+            String alias = aggregation.getAlias().isEmpty() ? "field_" + ++unnamed : aggregation.getAlias();
+            results.put(alias, switch (aggregation.getOperatorCase()) {
+                case COUNT -> count(docs.size(), aggregation.getCount());
+                case SUM -> sum(numericValues(docs, aggregation.getSum().getField().getFieldPath()));
+                case AVG -> avg(numericValues(docs, aggregation.getAvg().getField().getFieldPath()));
+                case OPERATOR_NOT_SET -> throw GcpException.invalidArgument("Aggregation operator is required");
+            });
+        }
+        return results;
+    }
+
+    private static Value count(long count, StructuredAggregationQuery.Aggregation.Count spec) {
+        if (spec.hasUpTo()) {
+            long upTo = spec.getUpTo().getValue();
+            if (upTo <= 0) {
+                throw GcpException.invalidArgument("count up_to must be greater than zero");
+            }
+            count = Math.min(count, upTo);
+        }
+        return Value.newBuilder().setIntegerValue(count).build();
+    }
+
+    /** Only integer and double values are aggregated; every other type, including null, is skipped. */
+    private List<StoredValue> numericValues(List<StoredDocument> docs, String path) {
+        return docs.stream()
+                .map(doc -> resolveFieldPath(doc, path))
+                .filter(v -> v != null && ("integer".equals(v.getType()) && v.getIntegerValue() != null
+                        || "double".equals(v.getType()) && v.getDoubleValue() != null))
+                .toList();
+    }
+
+    /** An integer while every value is an integer and the total fits in 64 bits, otherwise a double. */
+    private static Value sum(List<StoredValue> values) {
+        long longSum = 0;
+        double doubleSum = 0;
+        boolean isDouble = false;
+        for (StoredValue v : values) {
+            if ("integer".equals(v.getType()) && !isDouble) {
+                try {
+                    longSum = Math.addExact(longSum, v.getIntegerValue());
+                } catch (ArithmeticException overflow) {
+                    isDouble = true;
+                    doubleSum = (double) longSum + v.getIntegerValue();
+                }
+            } else {
+                if (!isDouble) {
+                    isDouble = true;
+                    doubleSum = longSum;
+                }
+                doubleSum += "integer".equals(v.getType()) ? v.getIntegerValue() : v.getDoubleValue();
+            }
+        }
+        return isDouble ? Value.newBuilder().setDoubleValue(doubleSum).build()
+                : Value.newBuilder().setIntegerValue(longSum).build();
+    }
+
+    /** Always a double, and null when there is nothing to average. */
+    private static Value avg(List<StoredValue> values) {
+        if (values.isEmpty()) {
+            return Value.newBuilder().setNullValue(NullValue.NULL_VALUE).build();
+        }
+        double total = 0;
+        for (StoredValue v : values) {
+            total += "integer".equals(v.getType()) ? v.getIntegerValue() : v.getDoubleValue();
+        }
+        return Value.newBuilder().setDoubleValue(total / values.size()).build();
     }
 
     // ── Transactions ───────────────────────────────────────────────────────────
