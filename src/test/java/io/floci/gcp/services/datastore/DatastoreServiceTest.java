@@ -152,6 +152,16 @@ class DatastoreServiceTest {
     }
 
     @Test
+    void aDamagedStoredKeyReadsBackAsNullWithoutFailingTheRead() {
+        StoredProperty damaged = new StoredProperty();
+        damaged.setType("key");
+        damaged.setKeyValue("not base64!");
+
+        assertEquals(Value.ValueTypeCase.NULL_VALUE, damaged.toProto().getValueTypeCase());
+        assertFalse(damaged.matchesEqual(Value.newBuilder().setKeyValue(namedKey("Ref", "alpha")).build()));
+    }
+
+    @Test
     void keyStoredInTheEarlierPathFormStillMatchesAnEqualityFilter() {
         // Entities persisted before key values were stored losslessly hold only the flattened path.
         StoredProperty legacy = new StoredProperty();

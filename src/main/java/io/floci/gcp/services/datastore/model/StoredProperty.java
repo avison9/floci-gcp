@@ -18,10 +18,13 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 import io.quarkus.runtime.annotations.RegisterForReflection;
+import org.jboss.logging.Logger;
 
 @RegisterForReflection
 
 public class StoredProperty {
+
+    private static final Logger LOG = Logger.getLogger(StoredProperty.class);
 
     private String type;
     private Boolean booleanValue;
@@ -251,6 +254,9 @@ public class StoredProperty {
         try {
             return Key.parseFrom(Base64.getDecoder().decode(encoded));
         } catch (InvalidProtocolBufferException | IllegalArgumentException e) {
+            // Only encodeKey writes this field, so a value that does not decode means the stored data
+            // was damaged or edited by hand. The property reads back as null rather than failing the read.
+            LOG.warnf("Stored Datastore key value is not a valid Key and reads back as null: %s", e.getMessage());
             return null;
         }
     }
