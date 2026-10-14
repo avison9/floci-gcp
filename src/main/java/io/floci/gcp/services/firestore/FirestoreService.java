@@ -28,6 +28,7 @@ import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
@@ -526,29 +527,27 @@ public class FirestoreService {
                 .toList();
     }
 
-    /** An integer while every value is an integer and the total fits in 64 bits, otherwise a double. */
+    /**
+     * An integer when every value is an integer and the final total fits in 64 bits, otherwise a
+     * double. The integers are added exactly, so an intermediate overflow that later cancels out
+     * still yields an integer.
+     */
     private static Value sum(List<StoredValue> values) {
-        long longSum = 0;
+        BigInteger integerSum = BigInteger.ZERO;
         double doubleSum = 0;
-        boolean isDouble = false;
+        boolean anyDouble = false;
         for (StoredValue v : values) {
-            if ("integer".equals(v.getType()) && !isDouble) {
-                try {
-                    longSum = Math.addExact(longSum, v.getIntegerValue());
-                } catch (ArithmeticException overflow) {
-                    isDouble = true;
-                    doubleSum = (double) longSum + v.getIntegerValue();
-                }
+            if ("integer".equals(v.getType())) {
+                integerSum = integerSum.add(BigInteger.valueOf(v.getIntegerValue()));
             } else {
-                if (!isDouble) {
-                    isDouble = true;
-                    doubleSum = longSum;
-                }
-                doubleSum += "integer".equals(v.getType()) ? v.getIntegerValue() : v.getDoubleValue();
+                anyDouble = true;
+                doubleSum += v.getDoubleValue();
             }
         }
-        return isDouble ? Value.newBuilder().setDoubleValue(doubleSum).build()
-                : Value.newBuilder().setIntegerValue(longSum).build();
+        if (!anyDouble && integerSum.bitLength() < Long.SIZE) {
+            return Value.newBuilder().setIntegerValue(integerSum.longValue()).build();
+        }
+        return Value.newBuilder().setDoubleValue(integerSum.doubleValue() + doubleSum).build();
     }
 
     /** Always a double, and null when there is nothing to average. */

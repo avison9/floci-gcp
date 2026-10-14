@@ -16,6 +16,7 @@ import com.google.protobuf.Int64Value;
 import com.google.protobuf.NullValue;
 import io.floci.gcp.core.storage.InMemoryStorage;
 import io.floci.gcp.services.firestore.model.StoredDocument;
+import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -220,6 +221,23 @@ class FirestoreControllerTest {
     }
 
     @Test
+    void sumStaysAnIntegerWhenAnIntermediateOverflowCancelsOut() {
+        seedDocument(PARENT + "/swing/a", "n", Value.newBuilder().setIntegerValue(Long.MAX_VALUE).build());
+        seedDocument(PARENT + "/swing/b", "n", Value.newBuilder().setIntegerValue(1).build());
+        seedDocument(PARENT + "/swing/c", "n", Value.newBuilder().setIntegerValue(-Long.MAX_VALUE).build());
+
+        // Descending visits MAX, 1, -MAX, so the running total overflows before it comes back in range.
+        StructuredQuery query = StructuredQuery.newBuilder()
+                .addFrom(StructuredQuery.CollectionSelector.newBuilder().setCollectionId("swing"))
+                .addOrderBy(StructuredQuery.Order.newBuilder()
+                        .setField(StructuredQuery.FieldReference.newBuilder().setFieldPath("n"))
+                        .setDirection(StructuredQuery.Direction.DESCENDING))
+                .build();
+
+        assertEquals(Value.newBuilder().setIntegerValue(1).build(), aggregate(query, sum("total", "n")).get("total"));
+    }
+
+    @Test
     void sumOfNothingIsZeroAndAvgOfNothingIsNull() {
         seedPrice("a", Value.newBuilder().setStringValue("n/a").build());
 
@@ -255,6 +273,25 @@ class FirestoreControllerTest {
     }
 
     @Test
+    void countUpToMustBeGreaterThanZero() {
+        seedPrice("a", Value.newBuilder().setIntegerValue(1).build());
+
+        for (long upTo : new long[] {0, -1}) {
+            assertInvalidArgument(StructuredAggregationQuery.Aggregation.newBuilder()
+                    .setAlias("n")
+                    .setCount(StructuredAggregationQuery.Aggregation.Count.newBuilder().setUpTo(Int64Value.of(upTo)))
+                    .build());
+        }
+    }
+
+    @Test
+    void anAggregationWithoutAnOperatorIsRejected() {
+        seedPrice("a", Value.newBuilder().setIntegerValue(1).build());
+
+        assertInvalidArgument(StructuredAggregationQuery.Aggregation.newBuilder().setAlias("n").build());
+    }
+
+    @Test
     void unnamedAggregationsGetTheirOwnDefaultAliases() {
         seedPrice("a", Value.newBuilder().setIntegerValue(10).build());
         seedPrice("b", Value.newBuilder().setIntegerValue(20).build());
@@ -280,17 +317,36 @@ class FirestoreControllerTest {
     }
 
     private Map<String, Value> aggregate(String collectionId, StructuredAggregationQuery.Aggregation... aggregations) {
+        return aggregate(StructuredQuery.newBuilder()
+                .addFrom(StructuredQuery.CollectionSelector.newBuilder().setCollectionId(collectionId))
+                .build(), aggregations);
+    }
+
+    private Map<String, Value> aggregate(StructuredQuery query, StructuredAggregationQuery.Aggregation... aggregations) {
         CapturingObserver<RunAggregationQueryResponse> observer = new CapturingObserver<>();
         controller.runAggregationQuery(RunAggregationQueryRequest.newBuilder()
                 .setParent(PARENT)
                 .setStructuredAggregationQuery(StructuredAggregationQuery.newBuilder()
-                        .setStructuredQuery(StructuredQuery.newBuilder()
-                                .addFrom(StructuredQuery.CollectionSelector.newBuilder().setCollectionId(collectionId)))
+                        .setStructuredQuery(query)
                         .addAllAggregations(List.of(aggregations)))
                 .build(), observer);
         assertNull(observer.error);
         assertTrue(observer.completed);
         return observer.messages.get(0).getResult().getAggregateFieldsMap();
+    }
+
+    private void assertInvalidArgument(StructuredAggregationQuery.Aggregation aggregation) {
+        CapturingObserver<RunAggregationQueryResponse> observer = new CapturingObserver<>();
+        controller.runAggregationQuery(RunAggregationQueryRequest.newBuilder()
+                .setParent(PARENT)
+                .setStructuredAggregationQuery(StructuredAggregationQuery.newBuilder()
+                        .setStructuredQuery(StructuredQuery.newBuilder()
+                                .addFrom(StructuredQuery.CollectionSelector.newBuilder().setCollectionId("items")))
+                        .addAggregations(aggregation))
+                .build(), observer);
+        assertEquals(Status.Code.INVALID_ARGUMENT, Status.fromThrowable(observer.error).getCode());
+        assertTrue(observer.messages.isEmpty());
+        assertFalse(observer.completed);
     }
 
     private static StructuredAggregationQuery.Aggregation count(String alias) {
