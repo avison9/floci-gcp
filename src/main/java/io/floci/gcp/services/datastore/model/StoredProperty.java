@@ -10,6 +10,8 @@ import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.NullValue;
 import com.google.protobuf.Timestamp;
 import com.google.type.LatLng;
+import io.quarkus.runtime.annotations.RegisterForReflection;
+import org.jboss.logging.Logger;
 
 import java.time.DateTimeException;
 import java.time.Instant;
@@ -17,8 +19,6 @@ import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
-import io.quarkus.runtime.annotations.RegisterForReflection;
-import org.jboss.logging.Logger;
 
 @RegisterForReflection
 
