@@ -163,6 +163,16 @@ Supported GQL syntax:
 - `LIMIT n` / `OFFSET n`
 - Named bindings (`@name`) and positional bindings (`@1`)
 
+## Deviations from real Datastore
+
+- With persistence enabled, a key property written by floci-gcp 0.11.0 or earlier
+  was stored only as a flattened path, which cannot be rebuilt into a key. It reads
+  back as `NULL` until the entity is written again, although equality filters still
+  match it. An embedded entity written then reads back without its own key, since
+  that key was not stored.
+- `Value.meaning` and `Value.exclude_from_indexes` are not stored, so they never
+  read back.
+
 ## Supported Operations
 
 - `Lookup` (gRPC and HTTP/protobuf)
