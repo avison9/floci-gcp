@@ -144,7 +144,8 @@ func TestFirestore(t *testing.T) {
 func TestFirestoreAggregation(t *testing.T) {
 	ctx := context.Background()
 	client := testutil.FirestoreClient(ctx)
-	defer client.Close()
+	// Registered first so it runs last: cleanups below still need the client.
+	t.Cleanup(func() { client.Close() })
 
 	col := client.Collection(uniqueName("go-agg"))
 	_, err := col.Doc("a").Set(ctx, map[string]interface{}{"price": 10})
