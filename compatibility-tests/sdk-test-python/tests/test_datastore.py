@@ -112,3 +112,22 @@ def test_unindexed_property_stays_unindexed_after_read_modify_write(datastore_cl
         assert "bio" in updated.exclude_from_indexes
     finally:
         datastore_client.delete(key)
+
+
+def test_sum_and_avg_aggregation(datastore_client, unique_name):
+    kind = f"Price-{unique_name}"
+    keys = [datastore_client.key(kind, name) for name in ("a", "b")]
+    for key, price in zip(keys, (10, 20)):
+        entity = datastore.Entity(key=key)
+        entity["price"] = price
+        datastore_client.put(entity)
+
+    try:
+        query = datastore_client.aggregation_query(datastore_client.query(kind=kind))
+        query.count(alias="n")
+        query.sum("price", alias="total")
+        query.avg("price", alias="mean")
+        results = {r.alias: r.value for r in list(query.fetch())[0]}
+        assert results == {"n": 2, "total": 30, "mean": 15.0}
+    finally:
+        datastore_client.delete_multi(keys)

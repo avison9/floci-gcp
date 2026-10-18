@@ -1,5 +1,7 @@
 package io.floci.gcp.services.datastore;
 
+import com.google.datastore.v1.AggregationResult;
+import com.google.datastore.v1.AggregationResultBatch;
 import com.google.datastore.v1.AllocateIdsRequest;
 import com.google.datastore.v1.AllocateIdsResponse;
 import com.google.datastore.v1.BeginTransactionRequest;
@@ -12,6 +14,7 @@ import com.google.datastore.v1.Key;
 import com.google.datastore.v1.LookupRequest;
 import com.google.datastore.v1.LookupResponse;
 import com.google.datastore.v1.Mutation;
+import com.google.datastore.v1.Query;
 import com.google.datastore.v1.QueryResultBatch;
 import com.google.datastore.v1.ReserveIdsRequest;
 import com.google.datastore.v1.ReserveIdsResponse;
@@ -22,7 +25,9 @@ import com.google.datastore.v1.RunAggregationQueryResponse;
 import com.google.datastore.v1.RunQueryRequest;
 import com.google.datastore.v1.RunQueryResponse;
 import com.google.protobuf.ByteString;
+import io.floci.gcp.core.common.GcpException;
 import io.floci.gcp.core.common.GcpGrpcController;
+import io.floci.gcp.core.common.GqlParser;
 import io.floci.gcp.services.datastore.model.StoredEntity;
 import io.grpc.BindableService;
 import io.grpc.MethodDescriptor;
@@ -158,8 +163,11 @@ public class DatastoreController implements BindableService {
         LOG.debugf("runQuery project=%s", request.getProjectId());
         try {
             Instant readTime = Instant.now();
+            Query query = request.hasGqlQuery()
+                    ? GqlParser.toStructuredQuery(request.getGqlQuery())
+                    : request.getQuery();
             List<StoredEntity> results = service.runQuery(
-                    request.getProjectId(), request.getPartitionId(), request.getQuery());
+                    request.getProjectId(), request.getPartitionId(), query);
 
             QueryResultBatch.Builder batch = QueryResultBatch.newBuilder()
                     .setEntityResultType(EntityResult.ResultType.FULL)
@@ -248,7 +256,26 @@ public class DatastoreController implements BindableService {
     private void runAggregationQuery(RunAggregationQueryRequest request,
             StreamObserver<RunAggregationQueryResponse> responseObserver) {
         LOG.debugf("runAggregationQuery project=%s", request.getProjectId());
-        responseObserver.onNext(RunAggregationQueryResponse.getDefaultInstance());
-        responseObserver.onCompleted();
+        try {
+            if (request.hasGqlQuery()) {
+                throw GcpException.unimplemented("GQL aggregation queries are not supported");
+            }
+            Instant readTime = Instant.now();
+            AggregationResult result = AggregationResult.newBuilder()
+                    .putAllAggregateProperties(service.runAggregationQuery(
+                            request.getProjectId(), request.getPartitionId(), request.getAggregationQuery()))
+                    .build();
+
+            AggregationResultBatch batch = AggregationResultBatch.newBuilder()
+                    .setMoreResults(QueryResultBatch.MoreResultsType.NO_MORE_RESULTS)
+                    .setReadTime(DatastoreService.toTimestamp(readTime.toString()))
+                    .addAggregationResults(result)
+                    .build();
+            responseObserver.onNext(RunAggregationQueryResponse.newBuilder().setBatch(batch).build());
+            responseObserver.onCompleted();
+        } catch (Exception e) {
+            LOG.warnf("runAggregationQuery failed: %s", e.getMessage());
+            GcpGrpcController.grpcError(responseObserver, e);
+        }
     }
 }

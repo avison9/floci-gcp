@@ -1,6 +1,7 @@
 package io.floci.gcp.services.datastore;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.datastore.v1.AggregationQuery;
 import com.google.datastore.v1.ArrayValue;
 import com.google.datastore.v1.Entity;
 import com.google.datastore.v1.Filter;
@@ -13,6 +14,7 @@ import com.google.datastore.v1.PropertyReference;
 import com.google.datastore.v1.Query;
 import com.google.datastore.v1.Value;
 import com.google.protobuf.ByteString;
+import com.google.protobuf.Int64Value;
 import com.google.protobuf.NullValue;
 import com.google.protobuf.Timestamp;
 import io.floci.gcp.core.common.GcpException;
@@ -24,6 +26,7 @@ import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -430,6 +433,143 @@ class DatastoreServiceTest {
         assertEquals(List.of("nil"), namesOf(runPropertyQuery("Nulls", "v", PropertyFilter.Operator.EQUAL, nil)));
     }
 
+    @Test
+    void sumAndAvgAggregateThePropertyInsteadOfCountingEntities() {
+        seedPrices("Item", 10, 20);
+
+        Map<String, Value> result = aggregate("Item", count("n"), sum("price", "total"), avg("price", "mean"));
+
+        assertEquals(Value.newBuilder().setIntegerValue(2).build(), result.get("n"));
+        assertEquals(Value.newBuilder().setIntegerValue(30).build(), result.get("total"));
+        assertEquals(Value.newBuilder().setDoubleValue(15.0).build(), result.get("mean"));
+    }
+
+    @Test
+    void nonNumericAndMissingValuesAreSkipped() {
+        seedPrices("Item", 10, 20);
+        upsertProperty("Item", "text", "price", Value.newBuilder().setStringValue("free").build());
+        upsertProperty("Item", "null", "price", Value.newBuilder().setNullValue(NullValue.NULL_VALUE).build());
+        upsertProperty("Item", "none", "other", Value.newBuilder().setIntegerValue(99).build());
+
+        Map<String, Value> result = aggregate("Item", count("n"), sum("price", "total"), avg("price", "mean"));
+
+        assertEquals(5, result.get("n").getIntegerValue());
+        assertEquals(30, result.get("total").getIntegerValue());
+        assertEquals(15.0, result.get("mean").getDoubleValue());
+    }
+
+    @Test
+    void sumIsADoubleWhenAnyValueIsADoubleOrTheIntegersOverflow() {
+        upsertProperty("Mixed", "a", "price", Value.newBuilder().setIntegerValue(10).build());
+        upsertProperty("Mixed", "b", "price", Value.newBuilder().setDoubleValue(2.5).build());
+        upsertProperty("Big", "a", "n", Value.newBuilder().setIntegerValue(Long.MAX_VALUE).build());
+        upsertProperty("Big", "b", "n", Value.newBuilder().setIntegerValue(1).build());
+
+        assertEquals(Value.newBuilder().setDoubleValue(12.5).build(),
+                aggregate("Mixed", sum("price", "total")).get("total"));
+        assertEquals(Value.newBuilder().setDoubleValue((double) Long.MAX_VALUE + 1).build(),
+                aggregate("Big", sum("n", "total")).get("total"));
+    }
+
+    @Test
+    void sumStaysAnIntegerWhenAnIntermediateOverflowCancelsOut() {
+        upsertProperty("Swing", "a", "n", Value.newBuilder().setIntegerValue(Long.MAX_VALUE).build());
+        upsertProperty("Swing", "b", "n", Value.newBuilder().setIntegerValue(1).build());
+        upsertProperty("Swing", "c", "n", Value.newBuilder().setIntegerValue(-Long.MAX_VALUE).build());
+        // Integers are added exactly, so the result is 1 whichever order the entities are summed in.
+        Map<String, Value> result = aggregate("Swing", sum("n", "total"));
+
+        assertEquals(Value.newBuilder().setIntegerValue(1).build(), result.get("total"));
+    }
+
+    @Test
+    void sumOfNothingIsZeroAndAvgOfNothingIsNull() {
+        Map<String, Value> result = aggregate("Empty", sum("price", "total"), avg("price", "mean"));
+
+        assertEquals(Value.newBuilder().setIntegerValue(0).build(), result.get("total"));
+        assertEquals(Value.newBuilder().setNullValue(NullValue.NULL_VALUE).build(), result.get("mean"));
+    }
+
+    @Test
+    void nanInTheAggregatedValuesMakesSumAndAvgNan() {
+        upsertProperty("Nan", "a", "price", Value.newBuilder().setIntegerValue(1).build());
+        upsertProperty("Nan", "b", "price", Value.newBuilder().setDoubleValue(Double.NaN).build());
+
+        Map<String, Value> result = aggregate("Nan", sum("price", "total"), avg("price", "mean"));
+
+        assertTrue(Double.isNaN(result.get("total").getDoubleValue()));
+        assertTrue(Double.isNaN(result.get("mean").getDoubleValue()));
+    }
+
+    @Test
+    void sumAndAvgReadADotDelimitedPathThroughAnEmbeddedEntity() {
+        for (int i = 1; i <= 2; i++) {
+            upsertProperty("Order", "o" + i, "item", Value.newBuilder()
+                    .setEntityValue(Entity.newBuilder()
+                            .putProperties("price", Value.newBuilder().setIntegerValue(i * 10L).build()))
+                    .build());
+        }
+
+        Map<String, Value> result = aggregate("Order", sum("item.price", "total"), avg("item.price", "mean"));
+
+        assertEquals(30, result.get("total").getIntegerValue());
+        assertEquals(15.0, result.get("mean").getDoubleValue());
+    }
+
+    @Test
+    void countUpToCapsTheCountAndZeroCountsNothing() {
+        seedPrices("Item", 10, 20, 30);
+
+        Map<String, Value> result = aggregate("Item", countUpTo("two", 2), countUpTo("zero", 0), countUpTo("ten", 10));
+
+        assertEquals(2, result.get("two").getIntegerValue());
+        assertEquals(0, result.get("zero").getIntegerValue());
+        assertEquals(3, result.get("ten").getIntegerValue());
+    }
+
+    @Test
+    void aNegativeCountUpToIsRejected() {
+        GcpException e = assertThrows(GcpException.class, () -> aggregate("Item", countUpTo("n", -1)));
+        assertEquals(io.grpc.Status.Code.INVALID_ARGUMENT, e.getGrpcCode());
+    }
+
+    @Test
+    void anAggregationWithoutAnOperatorIsRejected() {
+        GcpException e = assertThrows(GcpException.class,
+                () -> aggregate("Item", AggregationQuery.Aggregation.newBuilder().setAlias("n").build()));
+        assertEquals(io.grpc.Status.Code.INVALID_ARGUMENT, e.getGrpcCode());
+    }
+
+    @Test
+    void unnamedAggregationsGetTheirOwnDefaultAliases() {
+        seedPrices("Item", 10, 20);
+
+        Map<String, Value> result = aggregate("Item",
+                countUpTo("count_up_to_1", 1), sum("price", ""), count("named"), avg("price", ""));
+
+        assertEquals(List.of("count_up_to_1", "property_1", "named", "property_2"), List.copyOf(result.keySet()));
+        assertEquals(30, result.get("property_1").getIntegerValue());
+        assertEquals(15.0, result.get("property_2").getDoubleValue());
+    }
+
+    @Test
+    void theNestedQueryFilterAndLimitApplyBeforeAggregating() {
+        seedPrices("Item", 10, 20, 30);
+        Query cheapest = Query.newBuilder()
+                .addKind(KindExpression.newBuilder().setName("Item"))
+                .setFilter(Filter.newBuilder().setPropertyFilter(PropertyFilter.newBuilder()
+                        .setProperty(PropertyReference.newBuilder().setName("price"))
+                        .setOp(PropertyFilter.Operator.NOT_EQUAL)
+                        .setValue(Value.newBuilder().setIntegerValue(30))))
+                .setLimit(com.google.protobuf.Int32Value.of(1))
+                .build();
+
+        Map<String, Value> result = service.runAggregationQuery(PROJECT, null, AggregationQuery.newBuilder()
+                .setNestedQuery(cheapest).addAggregations(count("n")).build());
+
+        assertEquals(1, result.get("n").getIntegerValue());
+    }
+
     private void upsertProperty(String kind, String name, String property, Value value) {
         Entity entity = Entity.newBuilder()
                 .setKey(namedKey(kind, name))
@@ -459,6 +599,44 @@ class DatastoreServiceTest {
             array.addValues(Value.newBuilder().setStringValue(element).build());
         }
         return Value.newBuilder().setArrayValue(array.build()).build();
+    }
+
+    private void seedPrices(String kind, long... prices) {
+        for (int i = 0; i < prices.length; i++) {
+            upsertProperty(kind, "e" + i, "price", Value.newBuilder().setIntegerValue(prices[i]).build());
+        }
+    }
+
+    private Map<String, Value> aggregate(String kind, AggregationQuery.Aggregation... aggregations) {
+        return service.runAggregationQuery(PROJECT, null, AggregationQuery.newBuilder()
+                .setNestedQuery(Query.newBuilder().addKind(KindExpression.newBuilder().setName(kind)))
+                .addAllAggregations(List.of(aggregations))
+                .build());
+    }
+
+    private static AggregationQuery.Aggregation count(String alias) {
+        return AggregationQuery.Aggregation.newBuilder()
+                .setCount(AggregationQuery.Aggregation.Count.getDefaultInstance()).setAlias(alias).build();
+    }
+
+    private static AggregationQuery.Aggregation countUpTo(String alias, long upTo) {
+        return AggregationQuery.Aggregation.newBuilder()
+                .setCount(AggregationQuery.Aggregation.Count.newBuilder().setUpTo(Int64Value.of(upTo)))
+                .setAlias(alias).build();
+    }
+
+    private static AggregationQuery.Aggregation sum(String property, String alias) {
+        return AggregationQuery.Aggregation.newBuilder()
+                .setSum(AggregationQuery.Aggregation.Sum.newBuilder()
+                        .setProperty(PropertyReference.newBuilder().setName(property)))
+                .setAlias(alias).build();
+    }
+
+    private static AggregationQuery.Aggregation avg(String property, String alias) {
+        return AggregationQuery.Aggregation.newBuilder()
+                .setAvg(AggregationQuery.Aggregation.Avg.newBuilder()
+                        .setProperty(PropertyReference.newBuilder().setName(property)))
+                .setAlias(alias).build();
     }
 
     private Entity readBack(String kind, String name) {
