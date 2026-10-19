@@ -8,13 +8,17 @@ import io.floci.gcp.core.storage.StorageException;
 import io.floci.gcp.services.iam.model.StoredPolicy;
 import io.floci.gcp.services.iam.model.StoredServiceAccount;
 import io.floci.gcp.services.iam.model.StoredServiceAccountKey;
+import io.floci.gcp.services.iam.model.StoredSigningKey;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.Base64;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -36,6 +40,67 @@ class IamServiceTest {
                 new InMemoryStorage<>(),
                 new InMemoryStorage<>(),
                 new InMemoryStorage<>());
+    }
+
+    @Test
+    void signBlobReturnsAnRsaSha256SignatureNamedSignature() throws Exception {
+        InMemoryStorage<String, StoredSigningKey> signingKeys = new InMemoryStorage<>();
+        IamService iam = SigningKeyFixtures.iamService(signingKeys);
+        iam.createServiceAccount("p1", "signer", "", "");
+        byte[] data = "hello".getBytes(StandardCharsets.UTF_8);
+
+        Map<String, String> response = iam.signBlob("p1", "signer@p1.iam.gserviceaccount.com",
+                Base64.getEncoder().encodeToString(data));
+
+        assertEquals(Set.of("keyId", "signature"), response.keySet());
+        StoredSigningKey key = signingKeys.scan(k -> true).get(0);
+        assertEquals(key.getKeyId(), response.get("keyId"));
+        assertTrue(SigningKeyFixtures.verifies(SigningKeyFixtures.publicKey(key), data,
+                Base64.getDecoder().decode(response.get("signature"))));
+    }
+
+    @Test
+    void eachAccountKeepsOneSigningKeyAcrossCalls() {
+        service.createServiceAccount("p1", "a", "", "");
+        service.createServiceAccount("p1", "b", "", "");
+
+        String first = service.signingKeyId("p1", "a@p1.iam.gserviceaccount.com");
+
+        assertEquals(first, service.sign("p1", "a@p1.iam.gserviceaccount.com", new byte[] {1}).keyId());
+        assertEquals(first, service.signingKeyId("-", "a@p1.iam.gserviceaccount.com"));
+        assertNotEquals(first, service.signingKeyId("p1", "b@p1.iam.gserviceaccount.com"));
+        assertTrue(first.matches("[0-9a-f]{40}"));
+    }
+
+    @Test
+    void theSigningKeyIsNotListedAmongUserManagedKeys() {
+        service.createServiceAccount("p1", "signer", "", "");
+        service.signingKeyId("p1", "signer@p1.iam.gserviceaccount.com");
+
+        assertTrue(service.listKeys("p1", "signer@p1.iam.gserviceaccount.com").isEmpty());
+    }
+
+    @Test
+    void aRecreatedAccountSignsWithANewKey() {
+        service.createServiceAccount("p1", "signer", "", "");
+        String before = service.signingKeyId("p1", "signer@p1.iam.gserviceaccount.com");
+
+        service.deleteServiceAccount("p1", "signer@p1.iam.gserviceaccount.com");
+        service.createServiceAccount("p1", "signer", "", "");
+
+        assertNotEquals(before, service.signingKeyId("p1", "signer@p1.iam.gserviceaccount.com"));
+    }
+
+    @Test
+    void signingForAMissingAccountIsNotFoundAndBadBase64IsInvalid() {
+        GcpException missing = assertThrows(GcpException.class,
+                () -> service.signBlob("p1", "ghost@p1.iam.gserviceaccount.com", "aGk="));
+        assertEquals(io.grpc.Status.Code.NOT_FOUND, missing.getGrpcCode());
+
+        service.createServiceAccount("p1", "signer", "", "");
+        GcpException invalid = assertThrows(GcpException.class,
+                () -> service.signBlob("p1", "signer@p1.iam.gserviceaccount.com", "not base64!"));
+        assertEquals(io.grpc.Status.Code.INVALID_ARGUMENT, invalid.getGrpcCode());
     }
 
     @Test

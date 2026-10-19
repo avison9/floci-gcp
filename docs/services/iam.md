@@ -246,7 +246,9 @@ URL signedUrl = storage.signUrl(
     Storage.SignUrlOption.withV4Signature());
 ```
 
-`SignBlob` accepts the bytes to sign and returns a stub signature, which is sufficient for local development.
+`SignBlob` (`{"bytesToSign": "<base64>"}`) returns `{"keyId", "signature"}`: an RSASSA-PKCS1-v1_5 SHA-256 signature made with the service account's Google-managed RSA-2048 key. Each account gets one such key the first time it signs, kept until the account is deleted, and the same key signs for the [IAM Credentials](iam-credentials.md) `signBlob` and `signJwt` methods.
+
+The signing key is not returned by `ListServiceAccountKeys` (real IAM lists it as a `SYSTEM_MANAGED` key), so its public half cannot be read back and signatures cannot be verified against it locally. Nothing in floci-gcp verifies them: GCS checks a signed URL's expiry, not its signature.
 
 ## Supported Operations
 
