@@ -128,25 +128,29 @@ public class IamCredentialsService {
         }
         validateExpiry(claims.get("exp"));
 
-        String keyId = iamService.signingKeyId(WILDCARD_PROJECT, serviceAccount);
+        // The header is built inside sign so its kid names the key that signs it.
+        String[] signingInput = new String[1];
+        IamService.SignedBytes signed = iamService.sign(WILDCARD_PROJECT, serviceAccount, keyId -> {
+            signingInput[0] = jwtSigningInput(keyId, payload);
+            return signingInput[0].getBytes(StandardCharsets.US_ASCII);
+        });
+
+        Map<String, String> response = new LinkedHashMap<>();
+        response.put("keyId", signed.keyId());
+        response.put("signedJwt", signingInput[0] + "." + base64Url(signed.signature()));
+        return response;
+    }
+
+    private static String jwtSigningInput(String keyId, String payload) {
         Map<String, String> header = new LinkedHashMap<>();
         header.put("alg", "RS256");
         header.put("typ", "JWT");
         header.put("kid", keyId);
-        String signingInput;
         try {
-            signingInput = base64Url(MAPPER.writeValueAsBytes(header)) + "."
-                    + base64Url(payload.getBytes(StandardCharsets.UTF_8));
+            return base64Url(MAPPER.writeValueAsBytes(header)) + "." + base64Url(payload.getBytes(StandardCharsets.UTF_8));
         } catch (Exception e) {
             throw GcpException.internal("JWT header serialization failed: " + e.getMessage());
         }
-        IamService.SignedBytes signed = iamService.sign(WILDCARD_PROJECT, serviceAccount,
-                signingInput.getBytes(StandardCharsets.US_ASCII));
-
-        Map<String, String> response = new LinkedHashMap<>();
-        response.put("keyId", signed.keyId());
-        response.put("signedJwt", signingInput + "." + base64Url(signed.signature()));
-        return response;
     }
 
     private void validateExpiry(JsonNode exp) {

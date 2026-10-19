@@ -18,6 +18,7 @@ import java.nio.file.Path;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
@@ -89,6 +90,60 @@ class IamServiceTest {
         service.createServiceAccount("p1", "signer", "", "");
 
         assertNotEquals(before, service.signingKeyId("p1", "signer@p1.iam.gserviceaccount.com"));
+    }
+
+    @Test
+    void deletingAnAccountWaitsForAFirstSigningCallSoItsKeyIsNotWrittenBack() throws Exception {
+        CountDownLatch signerInStore = new CountDownLatch(1);
+        CountDownLatch releaseSigner = new CountDownLatch(1);
+        InMemoryStorage<String, StoredSigningKey> signingKeys = new InMemoryStorage<>() {
+            @Override
+            public Optional<StoredSigningKey> get(String key) {
+                signerInStore.countDown();
+                await(releaseSigner);
+                return super.get(key);
+            }
+        };
+        IamService iam = SigningKeyFixtures.iamService(signingKeys);
+        iam.createServiceAccount("p1", "signer", "", "");
+        String email = "signer@p1.iam.gserviceaccount.com";
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<IamService.SignedBytes> signing = executor.submit(() -> iam.sign("p1", email, new byte[] {1}));
+            await(signerInStore);
+            Future<?> deleting = executor.submit(() -> iam.deleteServiceAccount("p1", email));
+            assertThrows(TimeoutException.class, () -> deleting.get(200, TimeUnit.MILLISECONDS),
+                    "deletion must wait while the signing call holds the key lock");
+
+            releaseSigner.countDown();
+            signing.get(5, TimeUnit.SECONDS);
+            deleting.get(5, TimeUnit.SECONDS);
+        } finally {
+            releaseSigner.countDown();
+            executor.shutdownNow();
+        }
+
+        assertTrue(signingKeys.keys().isEmpty());
+    }
+
+    @Test
+    void theSigningInputGetsTheIdOfTheKeyThatSignsIt() throws Exception {
+        InMemoryStorage<String, StoredSigningKey> signingKeys = new InMemoryStorage<>();
+        IamService iam = SigningKeyFixtures.iamService(signingKeys);
+        iam.createServiceAccount("p1", "signer", "", "");
+        String email = "signer@p1.iam.gserviceaccount.com";
+        String[] named = new String[1];
+
+        IamService.SignedBytes signed = iam.sign("p1", email, keyId -> {
+            named[0] = keyId;
+            // The account is replaced after the key is chosen: the chosen key still signs.
+            iam.deleteServiceAccount("p1", email);
+            iam.createServiceAccount("p1", "signer", "", "");
+            return keyId.getBytes(StandardCharsets.UTF_8);
+        });
+
+        assertEquals(named[0], signed.keyId());
+        assertNotEquals(named[0], iam.signingKeyId("p1", email));
     }
 
     @Test

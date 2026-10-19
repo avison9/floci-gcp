@@ -216,9 +216,12 @@ public class IamService {
     public void deleteServiceAccount(String project, String emailOrId) {
         ServiceAccountRef ref = resolve(project, emailOrId);
         String key = saKey(ref.project(), ref.email());
-        saStore.get(key).orElseThrow(() -> GcpException.notFound("Service account not found: " + ref.email()));
-        saStore.delete(key);
-        signingKeyStore.delete(signingKeyStorageKey(ref.project(), ref.email()));
+        // Under the signing-key lock, so a first signing call cannot write the key back after it is removed.
+        synchronized (signingKeyLock) {
+            saStore.get(key).orElseThrow(() -> GcpException.notFound("Service account not found: " + ref.email()));
+            saStore.delete(key);
+            signingKeyStore.delete(signingKeyStorageKey(ref.project(), ref.email()));
+        }
         LOG.debugf("deleteServiceAccount project=%s email=%s", ref.project(), ref.email());
     }
 
@@ -560,7 +563,16 @@ public class IamService {
      * key, which is created on first use and kept until the account is deleted.
      */
     public SignedBytes sign(String project, String emailOrId, byte[] data) {
-        StoredSigningKey key = signingKey(existingAccount(project, emailOrId));
+        return sign(project, emailOrId, keyId -> data);
+    }
+
+    /**
+     * Like {@link #sign(String, String, byte[])}, for input that names the signing key (a JWT header's
+     * {@code kid}): {@code input} gets the id of the key that then signs what it returns.
+     */
+    public SignedBytes sign(String project, String emailOrId, Function<String, byte[]> input) {
+        StoredSigningKey key = signingKey(resolve(project, emailOrId));
+        byte[] data = input.apply(key.getKeyId());
         try {
             PrivateKey privateKey = KeyFactory.getInstance("RSA")
                     .generatePrivate(new PKCS8EncodedKeySpec(Base64.getDecoder().decode(key.getPrivateKey())));
@@ -575,19 +587,15 @@ public class IamService {
 
     /** The id of the key {@link #sign} uses, creating the key if the account has not signed yet. */
     public String signingKeyId(String project, String emailOrId) {
-        return signingKey(existingAccount(project, emailOrId)).getKeyId();
+        return signingKey(resolve(project, emailOrId)).getKeyId();
     }
 
-    private ServiceAccountRef existingAccount(String project, String emailOrId) {
-        ServiceAccountRef ref = resolve(project, emailOrId);
-        saStore.get(saKey(ref.project(), ref.email()))
-                .orElseThrow(() -> GcpException.notFound("Service account not found: " + ref.email()));
-        return ref;
-    }
-
+    /** The account's signing key, created if missing; the account is checked under the lock deletion takes. */
     private StoredSigningKey signingKey(ServiceAccountRef ref) {
         String storageKey = signingKeyStorageKey(ref.project(), ref.email());
         synchronized (signingKeyLock) {
+            saStore.get(saKey(ref.project(), ref.email()))
+                    .orElseThrow(() -> GcpException.notFound("Service account not found: " + ref.email()));
             Optional<StoredSigningKey> existing = signingKeyStore.get(storageKey);
             if (existing.isPresent()) {
                 return existing.get();
