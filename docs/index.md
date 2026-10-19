@@ -20,7 +20,7 @@ floci-gcp is a fast, free, and open-source local GCP emulator built for develope
 | **Datastore** | gRPC + HTTP/protobuf | Entity operations and structured queries over both transports; GQL queries and COUNT aggregation over HTTP/protobuf; transaction RPCs with limited semantics |
 | **Secret Manager** | gRPC + REST | Secrets, versions, access, disable/enable/destroy, IAM bindings |
 | **Cloud Logging** | gRPC + REST | Structured log ingestion (`WriteLogEntries`), read-back (`ListLogEntries`) with filter subset, `ListLogs`, `DeleteLog` |
-| **Cloud KMS** | gRPC + REST | Key rings, crypto keys, versions, symmetric encrypt/decrypt, asymmetric sign/decrypt, `GenerateRandomBytes` |
+| **Cloud KMS** | gRPC + REST | Key rings, crypto keys, versions, symmetric encrypt/decrypt, asymmetric sign/decrypt, HMAC MAC sign/verify, `GenerateRandomBytes` |
 | **IAM** | REST | Service accounts, RSA-2048 keys, policy bindings, SignBlob (V4 signed URLs) |
 | **Security Token Service (STS)** | REST | OAuth 2.0 token exchange for GCS Credential Access Boundaries |
 | **Managed Kafka** | REST | Clusters, topics, consumer groups (Redpanda-backed or mock mode) |
