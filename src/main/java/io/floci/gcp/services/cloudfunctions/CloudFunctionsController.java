@@ -1,6 +1,8 @@
 package io.floci.gcp.services.cloudfunctions;
 
 import com.google.cloud.functions.v2.GenerateUploadUrlRequest;
+import com.google.iam.v1.SetIamPolicyRequest;
+import com.google.iam.v1.TestIamPermissionsRequest;
 import io.floci.gcp.config.EmulatorConfig;
 import io.floci.gcp.core.common.ProtoJson;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -9,6 +11,7 @@ import jakarta.ws.rs.Consumes;
 import jakarta.ws.rs.DELETE;
 import jakarta.ws.rs.DefaultValue;
 import jakarta.ws.rs.GET;
+import jakarta.ws.rs.PATCH;
 import jakarta.ws.rs.POST;
 import jakarta.ws.rs.Path;
 import jakarta.ws.rs.PathParam;
@@ -59,6 +62,45 @@ public class CloudFunctionsController {
                                 @PathParam("location") String location,
                                 @PathParam("functionId") String functionId) {
         return json(ProtoJson.print(service.getFunction(functionName(project, location, functionId))));
+    }
+
+    @PATCH
+    @Path("/functions/{functionId}")
+    public Response updateFunction(@PathParam("project") String project,
+                                   @PathParam("location") String location,
+                                   @PathParam("functionId") String functionId,
+                                   @QueryParam("updateMask") String updateMask,
+                                   String body) {
+        return json(ProtoJson.print(service.updateFunction(functionName(project, location, functionId), body, updateMask)));
+    }
+
+    @GET
+    @Path("/functions/{functionId}:getIamPolicy")
+    public Response getIamPolicy(@PathParam("project") String project,
+                                 @PathParam("location") String location,
+                                 @PathParam("functionId") String functionId) {
+        return json(ProtoJson.print(service.getIamPolicy(functionName(project, location, functionId))));
+    }
+
+    @POST
+    @Path("/functions/{functionId}:setIamPolicy")
+    public Response setIamPolicy(@PathParam("project") String project,
+                                 @PathParam("location") String location,
+                                 @PathParam("functionId") String functionId,
+                                 String body) {
+        SetIamPolicyRequest request = ProtoJson.merge(body, SetIamPolicyRequest.newBuilder()).build();
+        return json(ProtoJson.print(service.setIamPolicy(functionName(project, location, functionId), request.getPolicy())));
+    }
+
+    @POST
+    @Path("/functions/{functionId}:testIamPermissions")
+    public Response testIamPermissions(@PathParam("project") String project,
+                                       @PathParam("location") String location,
+                                       @PathParam("functionId") String functionId,
+                                       String body) {
+        TestIamPermissionsRequest request = ProtoJson.merge(body, TestIamPermissionsRequest.newBuilder()).build();
+        return json(ProtoJson.print(service.testIamPermissions(functionName(project, location, functionId),
+                request.getPermissionsList())));
     }
 
     @DELETE

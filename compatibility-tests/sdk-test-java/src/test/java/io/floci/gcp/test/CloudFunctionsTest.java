@@ -9,6 +9,14 @@ import com.google.cloud.functions.v2.GenerateUploadUrlRequest;
 import com.google.cloud.functions.v2.GenerateUploadUrlResponse;
 import com.google.cloud.functions.v2.GetFunctionRequest;
 import com.google.cloud.functions.v2.ListFunctionsRequest;
+import com.google.cloud.functions.v2.UpdateFunctionRequest;
+import com.google.iam.v1.Binding;
+import com.google.iam.v1.GetIamPolicyRequest;
+import com.google.iam.v1.Policy;
+import com.google.iam.v1.SetIamPolicyRequest;
+import com.google.iam.v1.TestIamPermissionsRequest;
+import com.google.iam.v1.TestIamPermissionsResponse;
+import com.google.protobuf.FieldMask;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.MethodOrderer;
@@ -130,6 +138,60 @@ class CloudFunctionsTest {
 
     @Test
     @Order(5)
+    void updateFunctionWithMaskAndLro() throws Exception {
+        Function updated = client.updateFunctionAsync(UpdateFunctionRequest.newBuilder()
+                        .setFunction(Function.newBuilder()
+                                .setName(FUNCTION_NAME)
+                                .setDescription("updated")
+                                .setBuildConfig(BuildConfig.newBuilder().setRuntime("java25").build())
+                                .build())
+                        .setUpdateMask(FieldMask.newBuilder()
+                                .addPaths("description")
+                                .addPaths("build_config.runtime")
+                                .build())
+                        .build())
+                .get(10, TimeUnit.SECONDS);
+
+        assertThat(updated.getDescription()).isEqualTo("updated");
+        assertThat(updated.getBuildConfig().getRuntime()).isEqualTo("java25");
+        assertThat(updated.getBuildConfig().getEntryPoint()).isEqualTo("ExampleFunction");
+        assertThat(updated.getState()).isEqualTo(Function.State.ACTIVE);
+    }
+
+    @Test
+    @Order(6)
+    void iamPolicyRoundTrip() {
+        Policy empty = client.getIamPolicy(GetIamPolicyRequest.newBuilder()
+                .setResource(FUNCTION_NAME)
+                .build());
+        assertThat(empty.getBindingsList()).isEmpty();
+
+        Policy set = client.setIamPolicy(SetIamPolicyRequest.newBuilder()
+                .setResource(FUNCTION_NAME)
+                .setPolicy(Policy.newBuilder()
+                        .addBindings(Binding.newBuilder()
+                                .setRole("roles/cloudfunctions.invoker")
+                                .addMembers("allUsers")
+                                .build())
+                        .build())
+                .build());
+        assertThat(set.getBindingsList()).hasSize(1);
+
+        Policy read = client.getIamPolicy(GetIamPolicyRequest.newBuilder()
+                .setResource(FUNCTION_NAME)
+                .build());
+        assertThat(read.getEtag()).isEqualTo(set.getEtag());
+        assertThat(read.getBindings(0).getMembersList()).containsExactly("allUsers");
+
+        TestIamPermissionsResponse permissions = client.testIamPermissions(TestIamPermissionsRequest.newBuilder()
+                .setResource(FUNCTION_NAME)
+                .addPermissions("cloudfunctions.functions.invoke")
+                .build());
+        assertThat(permissions.getPermissionsList()).containsExactly("cloudfunctions.functions.invoke");
+    }
+
+    @Test
+    @Order(7)
     void deleteFunctionWithLro() throws Exception {
         client.deleteFunctionAsync(DeleteFunctionRequest.newBuilder()
                         .setName(FUNCTION_NAME)

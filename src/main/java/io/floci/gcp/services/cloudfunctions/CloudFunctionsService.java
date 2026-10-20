@@ -9,10 +9,14 @@ import com.google.cloud.functions.v2.OperationMetadata;
 import com.google.cloud.functions.v2.OperationType;
 import com.google.cloud.functions.v2.ServiceConfig;
 import com.google.cloud.functions.v2.StorageSource;
+import com.google.iam.v1.Policy;
+import com.google.iam.v1.TestIamPermissionsResponse;
 import com.google.longrunning.Operation;
 import com.google.protobuf.Empty;
+import com.google.protobuf.FieldMask;
 import com.google.protobuf.Message;
 import com.google.protobuf.Timestamp;
+import com.google.protobuf.util.FieldMaskUtil;
 import io.floci.gcp.config.EmulatorConfig;
 import io.floci.gcp.core.common.GcpException;
 import io.floci.gcp.core.common.GcpResourceNames;
@@ -25,6 +29,8 @@ import io.floci.gcp.core.common.ServiceRegistry;
 import io.floci.gcp.core.storage.StorageBackend;
 import io.floci.gcp.core.storage.StorageFactory;
 import io.floci.gcp.services.gcs.GcsService;
+import io.floci.gcp.services.iam.IamPolicyCodec;
+import io.floci.gcp.services.iam.IamService;
 import io.floci.gcp.services.operations.LongRunningOperationsService;
 import io.quarkus.runtime.StartupEvent;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -49,6 +55,9 @@ public class CloudFunctionsService {
     private final ServiceRegistry serviceRegistry;
     private final EmulatorConfig config;
     private final LocationCatalog locations;
+    private final IamService iamService;
+    // Guards each read-modify-write of a function record against a concurrent create, update or delete.
+    private final Object mutationLock = new Object();
 
     @Inject
     public CloudFunctionsService(StorageFactory storageFactory,
@@ -56,7 +65,8 @@ public class CloudFunctionsService {
                                  GcsService gcsService,
                                  ServiceRegistry serviceRegistry,
                                  EmulatorConfig config,
-                                 LocationCatalog locations) {
+                                 LocationCatalog locations,
+                                 IamService iamService) {
         this.functionStore = storageFactory.create("cloudfunctions-functions", "cloudfunctions-functions.json",
                 new TypeReference<Map<String, String>>() {});
         this.operations = operations;
@@ -64,29 +74,28 @@ public class CloudFunctionsService {
         this.serviceRegistry = serviceRegistry;
         this.config = config;
         this.locations = locations;
-    }
-
-    CloudFunctionsService(StorageBackend<String, String> functionStore,
-                          LongRunningOperationsService operations,
-                          GcsService gcsService) {
-        this.functionStore = functionStore;
-        this.operations = operations;
-        this.gcsService = gcsService;
-        this.serviceRegistry = null;
-        this.config = null;
-        this.locations = LocationCatalog.lenient();
+        this.iamService = iamService;
     }
 
     CloudFunctionsService(StorageBackend<String, String> functionStore,
                           LongRunningOperationsService operations,
                           GcsService gcsService,
-                          ServiceRegistry serviceRegistry) {
+                          IamService iamService) {
+        this(functionStore, operations, gcsService, null, iamService);
+    }
+
+    CloudFunctionsService(StorageBackend<String, String> functionStore,
+                          LongRunningOperationsService operations,
+                          GcsService gcsService,
+                          ServiceRegistry serviceRegistry,
+                          IamService iamService) {
         this.functionStore = functionStore;
         this.operations = operations;
         this.gcsService = gcsService;
         this.serviceRegistry = serviceRegistry;
         this.config = null;
         this.locations = LocationCatalog.lenient();
+        this.iamService = iamService;
     }
 
     void onStart(@Observes StartupEvent ev) {
@@ -97,6 +106,7 @@ public class CloudFunctionsService {
                 .resourceClasses(CloudFunctionsController.class)
                 .api("cloudfunctions.googleapis.com", "Cloud Functions API")
                 .build());
+        iamService.registerPolicyResourceResolver("projects/*/locations/*/functions/*", this::getFunction);
     }
 
     public Operation createFunction(String project, String location, String functionId, String body, boolean validateOnly) {
@@ -108,14 +118,15 @@ public class CloudFunctionsService {
             throw GcpException.invalidArgument("functionId query parameter is required");
         }
         String name = parent + "/functions/" + id;
-        if (functionStore.get(name).isPresent()) {
-            throw GcpException.alreadyExists("Cloud Function already exists: " + name);
-        }
-
         Timestamp now = timestampNow();
         Function function = populateFunction(project, location, id, requested, name, now);
-        if (!validateOnly) {
-            functionStore.put(name, ProtoJson.print(function));
+        synchronized (mutationLock) {
+            if (functionStore.get(name).isPresent()) {
+                throw GcpException.alreadyExists("Cloud Function already exists: " + name);
+            }
+            if (!validateOnly) {
+                functionStore.put(name, ProtoJson.print(function));
+            }
         }
         LOG.infof("create Cloud Function name=%s validateOnly=%s", name, validateOnly);
         return done(parent, function, operationMetadata(name, "create", OperationType.CREATE_FUNCTION, now), validateOnly);
@@ -144,10 +155,46 @@ public class CloudFunctionsService {
         return response.build();
     }
 
+    public Operation updateFunction(String name, String body, String updateMask) {
+        Function requested = ProtoJson.merge(body, Function.newBuilder()).build();
+        FieldMask mask = parseUpdateMask(updateMask);
+        Timestamp now = timestampNow();
+        Function updated;
+        synchronized (mutationLock) {
+            updated = applyUpdate(getFunction(name), requested, mask, now);
+            functionStore.put(name, ProtoJson.print(updated));
+        }
+        LOG.infof("update Cloud Function name=%s updateMask=%s", name, updateMask);
+        return done(parentFromName(name), updated,
+                operationMetadata(name, "update", OperationType.UPDATE_FUNCTION, now), false);
+    }
+
+    public Policy getIamPolicy(String resource) {
+        getFunction(resource);
+        return IamPolicyCodec.toProtoPolicy(iamService.getPolicy(resource));
+    }
+
+    public Policy setIamPolicy(String resource, Policy policy) {
+        getFunction(resource);
+        return IamPolicyCodec.toProtoPolicy(iamService.setPolicy(resource, IamPolicyCodec.toStoredPolicy(policy)));
+    }
+
+    public TestIamPermissionsResponse testIamPermissions(String resource, List<String> permissions) {
+        TestIamPermissionsResponse.Builder response = TestIamPermissionsResponse.newBuilder();
+        if (functionStore.get(resource).isPresent()) {
+            response.addAllPermissions(iamService.testPermissions(resource, permissions));
+        }
+        return response.build();
+    }
+
     public Operation deleteFunction(String name, boolean validateOnly) {
-        getFunction(name);
-        if (!validateOnly) {
-            functionStore.delete(name);
+        if (validateOnly) {
+            getFunction(name);
+        } else {
+            synchronized (mutationLock) {
+                getFunction(name);
+                iamService.deleteResourceAndPolicy(name, () -> functionStore.delete(name));
+            }
         }
         Timestamp now = timestampNow();
         LOG.infof("delete Cloud Function name=%s validateOnly=%s", name, validateOnly);
@@ -208,6 +255,79 @@ public class CloudFunctionsService {
             builder.setEnvironment(Environment.GEN_2);
         }
         return builder.build();
+    }
+
+    /**
+     * Applies an update: with no mask every settable field is replaced, otherwise only the masked
+     * paths are. Output-only fields always keep their stored values, and a change to the build or
+     * service config rolls the function onto a new revision, as a redeploy does.
+     */
+    private static Function applyUpdate(Function existing, Function requested, FieldMask mask, Timestamp now) {
+        Function.Builder builder;
+        if (mask.getPathsCount() == 0) {
+            builder = requested.toBuilder();
+        } else {
+            builder = existing.toBuilder();
+            FieldMaskUtil.merge(mask, requested, builder, new FieldMaskUtil.MergeOptions()
+                    .setReplaceMessageFields(true)
+                    .setReplaceRepeatedFields(true)
+                    .setReplacePrimitiveFields(true));
+        }
+        if (builder.getEnvironment() != Environment.ENVIRONMENT_UNSPECIFIED
+                && builder.getEnvironment() != existing.getEnvironment()) {
+            throw GcpException.invalidArgument("A function's environment cannot be changed.");
+        }
+
+        boolean redeploy = mask.getPathsCount() == 0 || mask.getPathsList().stream()
+                .anyMatch(path -> path.startsWith("build_config") || path.startsWith("service_config"));
+        String revision = redeploy
+                ? nextRevision(existing.getServiceConfig().getRevision())
+                : existing.getServiceConfig().getRevision();
+        builder.getServiceConfigBuilder()
+                .setService(existing.getServiceConfig().getService())
+                .setUri(existing.getServiceConfig().getUri())
+                .setRevision(revision);
+        if (!existing.getBuildConfig().getBuild().isEmpty()) {
+            builder.getBuildConfigBuilder().setBuild(existing.getBuildConfig().getBuild());
+        } else if (builder.hasBuildConfig()) {
+            builder.getBuildConfigBuilder().clearBuild();
+        }
+        return builder
+                .setName(existing.getName())
+                .setEnvironment(existing.getEnvironment())
+                .setState(existing.getState())
+                .clearStateMessages()
+                .addAllStateMessages(existing.getStateMessagesList())
+                .setCreateTime(existing.getCreateTime())
+                .setUpdateTime(now)
+                .setUrl(existing.getUrl())
+                .setSatisfiesPzs(existing.getSatisfiesPzs())
+                .build();
+    }
+
+    private static FieldMask parseUpdateMask(String updateMask) {
+        if (updateMask == null || updateMask.isBlank()) {
+            return FieldMask.getDefaultInstance();
+        }
+        FieldMask mask = FieldMaskUtil.fromJsonString(updateMask.replace(" ", ""));
+        if (!FieldMaskUtil.isValid(Function.class, mask)) {
+            throw GcpException.invalidArgument("Invalid update_mask: " + updateMask);
+        }
+        return mask;
+    }
+
+    // Revisions are named <function>-NNNNN; an update that redeploys takes the next number.
+    private static String nextRevision(String revision) {
+        int dash = revision.lastIndexOf('-');
+        if (dash < 0) {
+            return revision;
+        }
+        try {
+            int next = Integer.parseInt(revision.substring(dash + 1)) + 1;
+            return revision.substring(0, dash + 1) + String.format("%05d", next);
+        } catch (NumberFormatException e) {
+            return revision;
+        }
     }
 
     private static OperationMetadata operationMetadata(String target, String verb,

@@ -177,4 +177,133 @@ class CloudFunctionsRestIntegrationTest {
                         "projects/" + project + "/locations/europe-west1/functions/fn",
                         "projects/" + project + "/locations/us-central1/functions/fn"));
     }
+
+    @Test
+    void patchUpdatesMaskedFieldsThroughACompletedOperation() {
+        String base = "/v2/projects/functions-it-patch/locations/us-central1/functions";
+        given()
+                .contentType("application/json")
+                .queryParam("functionId", "fn")
+                .body("{\"description\":\"before\",\"buildConfig\":{\"runtime\":\"java21\",\"entryPoint\":\"Example\"}}")
+                .when().post(base)
+                .then()
+                .statusCode(200);
+
+        String operationName = given()
+                .contentType("application/json")
+                .queryParam("updateMask", "description,buildConfig.runtime")
+                .body("{\"description\":\"after\",\"buildConfig\":{\"runtime\":\"java25\"}}")
+                .when().patch(base + "/fn")
+                .then()
+                .statusCode(200)
+                .body("done", equalTo(true))
+                .body("metadata.operationType", equalTo("UPDATE_FUNCTION"))
+                .body("response.description", equalTo("after"))
+                .extract().path("name");
+
+        given()
+                .when().get(base + "/fn")
+                .then()
+                .statusCode(200)
+                .body("description", equalTo("after"))
+                .body("buildConfig.runtime", equalTo("java25"))
+                .body("buildConfig.entryPoint", equalTo("Example"))
+                .body("state", equalTo("ACTIVE"))
+                .body("serviceConfig.revision", endsWith("/revisions/fn-00002"));
+
+        given()
+                .when().get("/v2/" + operationName)
+                .then()
+                .statusCode(200)
+                .body("metadata.verb", equalTo("update"));
+
+        given()
+                .contentType("application/json")
+                .queryParam("updateMask", "description")
+                .body("{}")
+                .when().patch(base + "/missing")
+                .then()
+                .statusCode(404)
+                .body("error.status", equalTo("NOT_FOUND"));
+    }
+
+    @Test
+    void iamPolicyRoundTripsAndDiesWithTheFunction() {
+        String base = "/v2/projects/functions-it-iam/locations/us-central1/functions";
+        String create = "{\"buildConfig\":{\"runtime\":\"java21\"}}";
+        given().contentType("application/json").queryParam("functionId", "fn").body(create)
+                .when().post(base).then().statusCode(200);
+
+        String emptyEtag = given()
+                .urlEncodingEnabled(false)
+                .when().get(base + "/fn:getIamPolicy")
+                .then()
+                .statusCode(200)
+                .body("bindings", nullValue())
+                .extract().path("etag");
+
+        String etag = given()
+                .urlEncodingEnabled(false)
+                .contentType("application/json")
+                .body("{\"policy\":{\"bindings\":[{\"role\":\"roles/cloudfunctions.invoker\",\"members\":[\"allUsers\"]}]}}")
+                .when().post(base + "/fn:setIamPolicy")
+                .then()
+                .statusCode(200)
+                .body("bindings[0].role", equalTo("roles/cloudfunctions.invoker"))
+                .body("bindings[0].members", contains("allUsers"))
+                .extract().path("etag");
+
+        given()
+                .urlEncodingEnabled(false)
+                .when().get(base + "/fn:getIamPolicy")
+                .then()
+                .statusCode(200)
+                .body("etag", equalTo(etag))
+                .body("bindings[0].members", contains("allUsers"));
+
+        given()
+                .urlEncodingEnabled(false)
+                .contentType("application/json")
+                .body("{\"policy\":{\"etag\":\"" + emptyEtag + "\",\"bindings\":[]}}")
+                .when().post(base + "/fn:setIamPolicy")
+                .then()
+                .statusCode(409)
+                .body("error.status", equalTo("ABORTED"));
+
+        given()
+                .urlEncodingEnabled(false)
+                .contentType("application/json")
+                .body("{\"permissions\":[\"cloudfunctions.functions.invoke\"]}")
+                .when().post(base + "/fn:testIamPermissions")
+                .then()
+                .statusCode(200)
+                .body("permissions", contains("cloudfunctions.functions.invoke"));
+
+        given().when().delete(base + "/fn").then().statusCode(200);
+
+        given()
+                .urlEncodingEnabled(false)
+                .when().get(base + "/fn:getIamPolicy")
+                .then()
+                .statusCode(404)
+                .body("error.status", equalTo("NOT_FOUND"));
+        given()
+                .urlEncodingEnabled(false)
+                .contentType("application/json")
+                .body("{\"permissions\":[\"cloudfunctions.functions.invoke\"]}")
+                .when().post(base + "/fn:testIamPermissions")
+                .then()
+                .statusCode(200)
+                .body("permissions", nullValue());
+
+        given().contentType("application/json").queryParam("functionId", "fn").body(create)
+                .when().post(base).then().statusCode(200);
+        given()
+                .urlEncodingEnabled(false)
+                .when().get(base + "/fn:getIamPolicy")
+                .then()
+                .statusCode(200)
+                .body("etag", equalTo(emptyEtag))
+                .body("bindings", nullValue());
+    }
 }

@@ -4,6 +4,9 @@ import com.google.cloud.functions.v2.Environment;
 import com.google.cloud.functions.v2.Function;
 import com.google.cloud.functions.v2.GenerateUploadUrlResponse;
 import com.google.cloud.functions.v2.ListFunctionsResponse;
+import com.google.cloud.functions.v2.OperationMetadata;
+import com.google.cloud.functions.v2.OperationType;
+import com.google.iam.v1.Policy;
 import com.google.longrunning.Operation;
 import com.google.protobuf.Any;
 import com.google.protobuf.Message;
@@ -11,6 +14,7 @@ import io.floci.gcp.core.common.GcpException;
 import io.floci.gcp.core.common.ServiceRegistry;
 import io.floci.gcp.core.storage.InMemoryStorage;
 import io.floci.gcp.services.gcs.GcsService;
+import io.floci.gcp.services.iam.IamService;
 import io.floci.gcp.services.operations.LongRunningOperationsService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -29,6 +33,7 @@ class CloudFunctionsServiceTest {
 
     private CloudFunctionsService service;
     private GcsService gcsService;
+    private IamService iamService;
 
     @BeforeEach
     void setUp() {
@@ -48,7 +53,12 @@ class CloudFunctionsServiceTest {
                         .setMetadata(Any.pack(invocation.getArgument(2, Message.class)))
                         .build());
         gcsService = mock(GcsService.class);
-        service = new CloudFunctionsService(new InMemoryStorage<>(), operations, gcsService);
+        iamService = mock(IamService.class);
+        doAnswer(invocation -> {
+            invocation.getArgument(1, Runnable.class).run();
+            return null;
+        }).when(iamService).deleteResourceAndPolicy(anyString(), any(Runnable.class));
+        service = new CloudFunctionsService(new InMemoryStorage<>(), operations, gcsService, iamService);
     }
 
     @Test
@@ -138,6 +148,109 @@ class CloudFunctionsServiceTest {
     }
 
     @Test
+    void updateWithMaskChangesOnlyMaskedFieldsAndKeepsOutputOnlyOnes() throws Exception {
+        service.createFunction("p1", "us-central1", "fn",
+                "{\"description\":\"before\",\"labels\":{\"team\":\"a\"},\"buildConfig\":{\"runtime\":\"java21\"}}", false);
+        String name = "projects/p1/locations/us-central1/functions/fn";
+        Function created = service.getFunction(name);
+
+        Operation operation = service.updateFunction(name,
+                "{\"description\":\"after\",\"labels\":{\"team\":\"b\"},\"state\":\"FAILED\",\"url\":\"https://elsewhere\"}",
+                "description,state,url");
+
+        Function updated = service.getFunction(name);
+        assertEquals("after", updated.getDescription());
+        assertEquals(Map.of("team", "a"), updated.getLabelsMap());
+        assertEquals(Function.State.ACTIVE, updated.getState());
+        assertEquals(created.getUrl(), updated.getUrl());
+        assertEquals(created.getCreateTime(), updated.getCreateTime());
+        assertEquals("java21", updated.getBuildConfig().getRuntime());
+        assertEquals(created.getServiceConfig().getRevision(), updated.getServiceConfig().getRevision());
+        assertEquals(OperationType.UPDATE_FUNCTION,
+                operation.getMetadata().unpack(OperationMetadata.class).getOperationType());
+        assertEquals(updated, operation.getResponse().unpack(Function.class));
+    }
+
+    @Test
+    void updateWithNestedMaskKeepsSiblingFieldsAndRollsTheRevision() {
+        service.createFunction("p1", "us-central1", "fn",
+                "{\"buildConfig\":{\"runtime\":\"java21\",\"entryPoint\":\"Example\"}}", false);
+        String name = "projects/p1/locations/us-central1/functions/fn";
+
+        service.updateFunction(name, "{\"buildConfig\":{\"runtime\":\"java25\"}}", "buildConfig.runtime");
+
+        Function updated = service.getFunction(name);
+        assertEquals("java25", updated.getBuildConfig().getRuntime());
+        assertEquals("Example", updated.getBuildConfig().getEntryPoint());
+        assertEquals(name + "/revisions/fn-00002", updated.getServiceConfig().getRevision());
+        assertEquals("projects/p1/locations/us-central1/services/fn", updated.getServiceConfig().getService());
+    }
+
+    @Test
+    void updateWithoutMaskReplacesEverySettableField() {
+        service.createFunction("p1", "us-central1", "fn",
+                "{\"description\":\"before\",\"labels\":{\"team\":\"a\"}}", false);
+        String name = "projects/p1/locations/us-central1/functions/fn";
+
+        service.updateFunction(name, "{\"buildConfig\":{\"runtime\":\"python312\"}}", null);
+
+        Function updated = service.getFunction(name);
+        assertEquals("", updated.getDescription());
+        assertTrue(updated.getLabelsMap().isEmpty());
+        assertEquals("python312", updated.getBuildConfig().getRuntime());
+        assertEquals(Environment.GEN_2, updated.getEnvironment());
+        assertEquals(name + "/revisions/fn-00002", updated.getServiceConfig().getRevision());
+        assertEquals("https://us-central1-p1.cloudfunctions.net/fn", updated.getServiceConfig().getUri());
+    }
+
+    @Test
+    void aMaskedFieldMissingFromTheBodyIsCleared() {
+        service.createFunction("p1", "us-central1", "fn", "{\"labels\":{\"team\":\"a\"}}", false);
+        String name = "projects/p1/locations/us-central1/functions/fn";
+
+        service.updateFunction(name, "{}", "labels");
+
+        assertTrue(service.getFunction(name).getLabelsMap().isEmpty());
+    }
+
+    @Test
+    void updateRejectsAnUnknownMaskPathAMissingFunctionAndAnEnvironmentChange() {
+        service.createFunction("p1", "us-central1", "fn", "{}", false);
+        String name = "projects/p1/locations/us-central1/functions/fn";
+
+        GcpException badMask = assertThrows(GcpException.class,
+                () -> service.updateFunction(name, "{}", "noSuchField"));
+        assertEquals("INVALID_ARGUMENT", badMask.getGcpStatus());
+
+        GcpException missing = assertThrows(GcpException.class,
+                () -> service.updateFunction("projects/p1/locations/us-central1/functions/missing", "{}", "description"));
+        assertEquals("NOT_FOUND", missing.getGcpStatus());
+
+        GcpException environment = assertThrows(GcpException.class,
+                () -> service.updateFunction(name, "{\"environment\":\"GEN_1\"}", "environment"));
+        assertEquals("INVALID_ARGUMENT", environment.getGcpStatus());
+        assertEquals(Environment.GEN_2, service.getFunction(name).getEnvironment());
+    }
+
+    @Test
+    void iamCallsRequireTheFunctionAndDeleteDropsItsPolicy() {
+        String missing = "projects/p1/locations/us-central1/functions/missing";
+        assertEquals("NOT_FOUND", assertThrows(GcpException.class,
+                () -> service.getIamPolicy(missing)).getGcpStatus());
+        assertEquals("NOT_FOUND", assertThrows(GcpException.class,
+                () -> service.setIamPolicy(missing, Policy.getDefaultInstance())).getGcpStatus());
+        assertEquals(0, service.testIamPermissions(missing,
+                List.of("cloudfunctions.functions.invoke")).getPermissionsCount());
+        verifyNoInteractions(iamService);
+
+        service.createFunction("p1", "us-central1", "fn", "{}", false);
+        String name = "projects/p1/locations/us-central1/functions/fn";
+        service.deleteFunction(name, false);
+
+        verify(iamService).deleteResourceAndPolicy(eq(name), any(Runnable.class));
+    }
+
+    @Test
     void generateUploadUrlCreatesSourceBucketAndReturnsStorageSource() {
         GenerateUploadUrlResponse response = service.generateUploadUrl(
                 "project-1", "us-central1", "http://localhost:4588");
@@ -164,7 +277,7 @@ class CloudFunctionsServiceTest {
         ServiceRegistry registry = mock(ServiceRegistry.class);
         when(registry.isEnabled("gcs")).thenReturn(false);
         CloudFunctionsService gated = new CloudFunctionsService(new InMemoryStorage<>(),
-                mock(LongRunningOperationsService.class), gcsService, registry);
+                mock(LongRunningOperationsService.class), gcsService, registry, iamService);
 
         GcpException ex = assertThrows(GcpException.class,
                 () -> gated.generateUploadUrl("p1", "us-central1", "http://localhost:4588"));
