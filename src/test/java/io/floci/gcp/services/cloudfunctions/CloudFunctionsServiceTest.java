@@ -187,6 +187,64 @@ class CloudFunctionsServiceTest {
     }
 
     @Test
+    void aMaskNamingOnlyOutputOnlyPathsKeepsTheRevision() {
+        service.createFunction("p1", "us-central1", "fn", "{\"buildConfig\":{\"runtime\":\"java21\"}}", false);
+        String name = "projects/p1/locations/us-central1/functions/fn";
+        Function created = service.getFunction(name);
+
+        service.updateFunction(name,
+                "{\"serviceConfig\":{\"uri\":\"https://elsewhere\"},"
+                        + "\"buildConfig\":{\"sourceProvenance\":{\"resolvedStorageSource\":{\"bucket\":\"b\"}}}}",
+                "serviceConfig.uri,buildConfig.sourceProvenance.resolvedStorageSource");
+
+        Function updated = service.getFunction(name);
+        assertEquals(created.getServiceConfig(), updated.getServiceConfig());
+        assertEquals(created.getBuildConfig(), updated.getBuildConfig());
+    }
+
+    @Test
+    void updateKeepsEveryOutputOnlyFieldOfTheBuildConfigAndEventTrigger() {
+        service.createFunction("p1", "us-central1", "fn",
+                "{\"eventTrigger\":{\"eventType\":\"google.cloud.pubsub.topic.v1.messagePublished\"}}", false);
+        String name = "projects/p1/locations/us-central1/functions/fn";
+
+        service.updateFunction(name,
+                "{\"buildConfig\":{\"runtime\":\"java25\",\"build\":\"b\","
+                        + "\"sourceProvenance\":{\"resolvedStorageSource\":{\"bucket\":\"b\"}},"
+                        + "\"onDeployUpdatePolicy\":{\"runtimeVersion\":\"v\"}},"
+                        + "\"eventTrigger\":{\"trigger\":\"projects/p1/locations/us-central1/triggers/t\","
+                        + "\"eventType\":\"google.cloud.storage.object.v1.finalized\"}}",
+                "buildConfig,eventTrigger");
+
+        Function updated = service.getFunction(name);
+        assertEquals("java25", updated.getBuildConfig().getRuntime());
+        assertEquals("", updated.getBuildConfig().getBuild());
+        assertFalse(updated.getBuildConfig().hasSourceProvenance());
+        assertTrue(updated.getBuildConfig().hasOnDeployUpdatePolicy());
+        assertEquals("", updated.getBuildConfig().getOnDeployUpdatePolicy().getRuntimeVersion());
+        assertEquals("google.cloud.storage.object.v1.finalized", updated.getEventTrigger().getEventType());
+        assertEquals("", updated.getEventTrigger().getTrigger());
+    }
+
+    @Test
+    void createIgnoresOutputOnlyFieldsInTheBody() {
+        service.createFunction("p1", "us-central1", "fn",
+                "{\"state\":\"FAILED\",\"satisfiesPzs\":true,\"stateMessages\":[{\"message\":\"m\"}],"
+                        + "\"buildConfig\":{\"runtime\":\"java21\",\"build\":\"b\","
+                        + "\"sourceProvenance\":{\"resolvedStorageSource\":{\"bucket\":\"b\"}}},"
+                        + "\"eventTrigger\":{\"trigger\":\"projects/p1/locations/us-central1/triggers/t\"}}", false);
+
+        Function created = service.getFunction("projects/p1/locations/us-central1/functions/fn");
+        assertEquals(Function.State.ACTIVE, created.getState());
+        assertFalse(created.getSatisfiesPzs());
+        assertEquals(0, created.getStateMessagesCount());
+        assertEquals("java21", created.getBuildConfig().getRuntime());
+        assertEquals("", created.getBuildConfig().getBuild());
+        assertFalse(created.getBuildConfig().hasSourceProvenance());
+        assertEquals("", created.getEventTrigger().getTrigger());
+    }
+
+    @Test
     void updateWithoutMaskReplacesEverySettableField() {
         service.createFunction("p1", "us-central1", "fn",
                 "{\"description\":\"before\",\"labels\":{\"team\":\"a\"}}", false);

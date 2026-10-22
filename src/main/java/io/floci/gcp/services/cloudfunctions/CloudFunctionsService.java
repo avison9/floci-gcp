@@ -1,6 +1,8 @@
 package io.floci.gcp.services.cloudfunctions;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.google.api.FieldBehavior;
+import com.google.api.FieldBehaviorProto;
 import com.google.cloud.functions.v2.Environment;
 import com.google.cloud.functions.v2.Function;
 import com.google.cloud.functions.v2.GenerateUploadUrlResponse;
@@ -12,6 +14,7 @@ import com.google.cloud.functions.v2.StorageSource;
 import com.google.iam.v1.Policy;
 import com.google.iam.v1.TestIamPermissionsResponse;
 import com.google.longrunning.Operation;
+import com.google.protobuf.Descriptors;
 import com.google.protobuf.Empty;
 import com.google.protobuf.FieldMask;
 import com.google.protobuf.Message;
@@ -244,8 +247,9 @@ public class CloudFunctionsService {
                 .setRevision(revision)
                 .setAllTrafficOnLatestRevision(true);
 
-        Function.Builder builder = requested.toBuilder()
-                .setName(name)
+        Function.Builder builder = requested.toBuilder();
+        pinOutputOnly(builder, Function.getDefaultInstance());
+        builder.setName(name)
                 .setState(Function.State.ACTIVE)
                 .setCreateTime(now)
                 .setUpdateTime(now)
@@ -259,8 +263,8 @@ public class CloudFunctionsService {
 
     /**
      * Applies an update: with no mask every settable field is replaced, otherwise only the masked
-     * paths are. Output-only fields always keep their stored values, and a change to the build or
-     * service config rolls the function onto a new revision, as a redeploy does.
+     * paths are. Output-only fields always keep their stored values, and a change to a settable
+     * field of the build or service config rolls the function onto a new revision, as a redeploy does.
      */
     private static Function applyUpdate(Function existing, Function requested, FieldMask mask, Timestamp now) {
         Function.Builder builder;
@@ -279,30 +283,63 @@ public class CloudFunctionsService {
         }
 
         boolean redeploy = mask.getPathsCount() == 0 || mask.getPathsList().stream()
-                .anyMatch(path -> path.startsWith("build_config") || path.startsWith("service_config"));
-        String revision = redeploy
-                ? nextRevision(existing.getServiceConfig().getRevision())
-                : existing.getServiceConfig().getRevision();
+                .anyMatch(path -> (path.startsWith("build_config") || path.startsWith("service_config"))
+                        && !outputOnlyPath(path));
+        pinOutputOnly(builder, existing);
+        String revision = existing.getServiceConfig().getRevision();
         builder.getServiceConfigBuilder()
                 .setService(existing.getServiceConfig().getService())
                 .setUri(existing.getServiceConfig().getUri())
-                .setRevision(revision);
-        if (!existing.getBuildConfig().getBuild().isEmpty()) {
-            builder.getBuildConfigBuilder().setBuild(existing.getBuildConfig().getBuild());
-        } else if (builder.hasBuildConfig()) {
-            builder.getBuildConfigBuilder().clearBuild();
-        }
+                .setRevision(redeploy ? nextRevision(revision) : revision);
         return builder
                 .setName(existing.getName())
                 .setEnvironment(existing.getEnvironment())
-                .setState(existing.getState())
-                .clearStateMessages()
-                .addAllStateMessages(existing.getStateMessagesList())
-                .setCreateTime(existing.getCreateTime())
                 .setUpdateTime(now)
-                .setUrl(existing.getUrl())
-                .setSatisfiesPzs(existing.getSatisfiesPzs())
                 .build();
+    }
+
+    /**
+     * Gives every OUTPUT_ONLY field of {@code target}, in it and in the singular messages it holds,
+     * the value it has in {@code stored}, so a request cannot set them. Read from the proto's
+     * field_behavior annotations, so fields added to the API later are covered too.
+     */
+    private static void pinOutputOnly(Message.Builder target, Message stored) {
+        for (Descriptors.FieldDescriptor field : target.getDescriptorForType().getFields()) {
+            if (outputOnly(field)) {
+                if (field.isRepeated() ? stored.getRepeatedFieldCount(field) > 0 : stored.hasField(field)) {
+                    target.setField(field, stored.getField(field));
+                } else {
+                    target.clearField(field);
+                }
+            } else if (field.getJavaType() == Descriptors.FieldDescriptor.JavaType.MESSAGE
+                    && !field.isRepeated() && target.hasField(field)) {
+                pinOutputOnly(target.getFieldBuilder(field), (Message) stored.getField(field));
+            }
+        }
+    }
+
+    // True when the mask path is, or lies under, an OUTPUT_ONLY field (paths are validated before this).
+    private static boolean outputOnlyPath(String path) {
+        Descriptors.Descriptor type = Function.getDescriptor();
+        for (String segment : path.split("\\.")) {
+            Descriptors.FieldDescriptor field = type.findFieldByName(segment);
+            if (field == null) {
+                return false;
+            }
+            if (outputOnly(field)) {
+                return true;
+            }
+            if (field.getJavaType() != Descriptors.FieldDescriptor.JavaType.MESSAGE) {
+                return false;
+            }
+            type = field.getMessageType();
+        }
+        return false;
+    }
+
+    private static boolean outputOnly(Descriptors.FieldDescriptor field) {
+        return field.getOptions().getExtension(FieldBehaviorProto.fieldBehavior)
+                .contains(FieldBehavior.OUTPUT_ONLY);
     }
 
     private static FieldMask parseUpdateMask(String updateMask) {
