@@ -550,10 +550,11 @@ public class IamService {
             throw GcpException.internal("Key generation failed: " + e.getMessage());
         }
 
-        String privateKeyPem = "-----BEGIN RSA PRIVATE KEY-----\n"
+        // getEncoded() is PKCS#8, so the PEM label is "PRIVATE KEY", as in Google's own key files.
+        String privateKeyPem = "-----BEGIN PRIVATE KEY-----\n"
                 + Base64.getMimeEncoder(64, new byte[]{'\n'})
                         .encodeToString(keyPair.getPrivate().getEncoded())
-                + "\n-----END RSA PRIVATE KEY-----\n";
+                + "\n-----END PRIVATE KEY-----\n";
         String publicKeyPem = "-----BEGIN PUBLIC KEY-----\n"
                 + Base64.getMimeEncoder(64, new byte[]{'\n'})
                         .encodeToString(keyPair.getPublic().getEncoded())

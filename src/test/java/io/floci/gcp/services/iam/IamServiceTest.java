@@ -15,6 +15,12 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.security.KeyFactory;
+import java.security.PrivateKey;
+import java.security.PublicKey;
+import java.security.Signature;
+import java.security.spec.PKCS8EncodedKeySpec;
+import java.security.spec.X509EncodedKeySpec;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
@@ -301,6 +307,37 @@ class IamServiceTest {
         List<StoredServiceAccountKey> keys = service.listKeys("p1", "sa1@p1.iam.gserviceaccount.com");
         assertEquals(1, keys.size());
         assertEquals(key.getKeyId(), keys.get(0).getKeyId());
+    }
+
+    @Test
+    void createKeyWritesAPkcs8PrivateKeyThatPairsWithThePublicKey() throws Exception {
+        service.createServiceAccount("p1", "sa1", "SA1", "");
+        StoredServiceAccountKey key = service.createKey("p1", "sa1@p1.iam.gserviceaccount.com");
+
+        Map<?, ?> keyFile = new com.fasterxml.jackson.databind.ObjectMapper().readValue(
+                Base64.getDecoder().decode(key.getPrivateKeyData()), Map.class);
+        String privatePem = (String) keyFile.get("private_key");
+        assertTrue(privatePem.startsWith("-----BEGIN PRIVATE KEY-----\n"), privatePem);
+        assertTrue(privatePem.endsWith("\n-----END PRIVATE KEY-----\n"), privatePem);
+
+        KeyFactory rsa = KeyFactory.getInstance("RSA");
+        PrivateKey privateKey = rsa.generatePrivate(new PKCS8EncodedKeySpec(pemBody(privatePem)));
+        String publicPem = new String(Base64.getDecoder().decode(key.getPublicKeyData()), StandardCharsets.UTF_8);
+        PublicKey publicKey = rsa.generatePublic(new X509EncodedKeySpec(pemBody(publicPem)));
+
+        byte[] data = "payload".getBytes(StandardCharsets.UTF_8);
+        Signature signer = Signature.getInstance("SHA256withRSA");
+        signer.initSign(privateKey);
+        signer.update(data);
+        byte[] signature = signer.sign();
+        Signature verifier = Signature.getInstance("SHA256withRSA");
+        verifier.initVerify(publicKey);
+        verifier.update(data);
+        assertTrue(verifier.verify(signature));
+    }
+
+    private static byte[] pemBody(String pem) {
+        return Base64.getMimeDecoder().decode(pem.replaceAll("-----[A-Z ]+-----", ""));
     }
 
     @Test

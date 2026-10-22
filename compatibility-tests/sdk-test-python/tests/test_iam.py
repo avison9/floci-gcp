@@ -106,3 +106,29 @@ def test_test_iam_permissions(endpoint, project_id, unique_name):
         assert set(resp["permissions"]) == set(permissions)
     finally:
         _delete(f"{base}/{email}")
+
+
+def test_created_key_file_loads_with_google_auth(endpoint, project_id, unique_name):
+    import base64
+
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding
+    from google.oauth2 import service_account
+
+    account_id = f"py-sa-{unique_name}"
+    email = f"{account_id}@{project_id}.iam.gserviceaccount.com"
+    base = f"{endpoint}/v1/projects/{project_id}/serviceAccounts"
+
+    _post(base, {"accountId": account_id, "serviceAccount": {}})
+
+    try:
+        key = _post(f"{base}/{email}/keys")
+        info = json.loads(base64.b64decode(key["privateKeyData"]))
+        credentials = service_account.Credentials.from_service_account_info(info)
+        assert credentials.service_account_email == email
+
+        signature = credentials.sign_bytes(b"payload")
+        public_key = serialization.load_pem_public_key(base64.b64decode(key["publicKeyData"]))
+        public_key.verify(signature, b"payload", padding.PKCS1v15(), hashes.SHA256())
+    finally:
+        _delete(f"{base}/{email}")
