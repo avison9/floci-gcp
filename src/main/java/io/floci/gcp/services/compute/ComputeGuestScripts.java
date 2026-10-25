@@ -32,6 +32,19 @@ public class ComputeGuestScripts {
     private static final Logger LOG = Logger.getLogger(ComputeGuestScripts.class);
     static final String DIRECTORY = "/var/lib/google";
     static final String RUNNER = "google_metadata_script_runner";
+    /** The unit the guest agent's account lines carry on the serial console. */
+    static final String AGENT = "google_guest_agent";
+    /** Users the agent created, so a user whose keys leave metadata loses them again (the agent's google_users). */
+    static final String GOOGLE_USERS = DIRECTORY + "/google_users";
+    static final String ACCOUNTS_SCRIPT = "floci-guest-accounts-";
+    /** The newest account update that started in the guest; an older one still running stops before writing keys. */
+    static final String ACCOUNTS_REQUEST = DIRECTORY + "/floci-accounts.request";
+    /** Held while one update changes accounts. */
+    static final String ACCOUNTS_LOCK = DIRECTORY + "/floci-accounts.lock";
+    /** Longest the account step waits, an sshd package install included. */
+    static final Duration ACCOUNTS_TIMEOUT = Duration.ofMinutes(5);
+    /** The guest agent's default extra groups for the users it creates ({@code cfg.go}: groups). */
+    static final List<String> USER_GROUPS = List.of("adm", "dip", "docker", "lxd", "plugdev", "video");
     /** The guest environment runs metadata scripts as root, whatever user the image declares. */
     static final String ROOT = "root";
     /** Longest line kept before it is written out unfinished, so output without newlines stays bounded. */
@@ -130,6 +143,161 @@ public class ComputeGuestScripts {
             }
         }
         port.write(line(instance, "Finished running " + phase.prefix + " scripts."));
+    }
+
+    /**
+     * Applies {@code ssh-keys} as the guest agent's accounts manager does: each user exists (created with an empty
+     * password, a home directory and the agent's groups, and in {@code google-sudoers}, which may sudo without a
+     * password), its {@code authorized_keys} holds its metadata keys after a {@code # Added by Google} line each and
+     * keeps the lines the user added, and a user created earlier whose keys left metadata loses them and its sudo
+     * group but keeps its account. Then sshd is started, a guest without one getting openssh-server from its
+     * package manager first. {@code users} null leaves accounts alone (OS Login). A step that fails says so on serial
+     * port 1, and so does a nonzero exit status.
+     */
+    void accounts(String instance, String containerId, Map<String, List<String>> users, long request,
+                  ComputeSerialPort port) {
+        String script = accountsScript(users, request);
+        String name = ACCOUNTS_SCRIPT + request + ".sh";
+        try {
+            lifecycleManager.execStreaming(containerId, ROOT, List.of(), List.of("mkdir", "-p", DIRECTORY),
+                    Duration.ofSeconds(30), OutputStream.nullOutputStream(), OutputStream.nullOutputStream());
+            RetryingTarCopier.copyBytes(lifecycleManager.getDockerClient(), containerId, DIRECTORY, name,
+                    script.getBytes(StandardCharsets.UTF_8), 0700);
+            LineWriter out = new LineWriter(port, instance, AGENT, "");
+            ContainerExec.Result result = lifecycleManager.execStreaming(containerId, ROOT, List.of(),
+                    List.of("/bin/sh", DIRECTORY + "/" + name), ACCOUNTS_TIMEOUT, out, out);
+            out.close();
+            if (result.timedOut()) {
+                port.write(line(instance, AGENT, "Account setup still running after " + ACCOUNTS_TIMEOUT + "."));
+            } else if (result.exitCode() != 0) {
+                port.write(line(instance, AGENT, "Account setup exit status " + result.exitCode()));
+            }
+        } catch (RuntimeException e) {
+            LOG.warnf("Compute instance %s could not apply its SSH keys: %s", instance, e.getMessage());
+            port.write(line(instance, AGENT, "Could not apply SSH keys: " + e.getMessage()));
+        }
+    }
+
+    /**
+     * The account update numbered {@code request}: later requests have higher numbers, across emulator restarts too.
+     * It records itself as the newest update as it starts, and changes accounts only while holding the guest-side
+     * lock and only while it still is the newest, so an update the emulator stopped waiting for never overlaps or
+     * outlasts a newer one. The lock is created with its owner's pid and start time in one step, so a lock left by a
+     * process that died, in this boot or an earlier one, is recognised and taken over.
+     */
+    static String accountsScript(Map<String, List<String>> users, long request) {
+        StringBuilder sh = new StringBuilder("""
+                status=0
+                request=REQUEST
+                mark=REQUEST_FILE
+                lock=LOCK_DIR
+                cleanup() { rm -f "$0" "$lock.$$"; [ -n "$me" ] && [ "$(cat "$lock" 2>/dev/null)" = "$me" ] && rm -f "$lock"; }
+                trap cleanup EXIT
+                newest="$(cat "$mark" 2>/dev/null || echo 0)"
+                [ "$newest" -gt "$request" ] 2>/dev/null && exit 0
+                echo "$request" > "$mark"
+                failed() { echo "$1"; status=1; }
+                has() { command -v "$1" >/dev/null 2>&1; }
+                sshd_bin() { for b in /usr/sbin/sshd /usr/local/sbin/sshd /sbin/sshd "$(command -v sshd 2>/dev/null)"; do [ -n "$b" ] && [ -x "$b" ] && { echo "$b"; return; }; done; }
+                if [ -z "$(sshd_bin)" ]; then
+                  echo "Installing openssh-server."
+                  if has apt-get; then DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server sudo >/dev/null 2>&1
+                  elif has apk; then apk add --no-cache openssh-server shadow sudo >/dev/null 2>&1
+                  elif has dnf; then dnf install -y -q openssh-server sudo shadow-utils >/dev/null 2>&1
+                  elif has microdnf; then microdnf install -y openssh-server sudo shadow-utils >/dev/null 2>&1
+                  elif has yum; then yum install -y -q openssh-server sudo shadow-utils >/dev/null 2>&1
+                  fi
+                  [ -n "$(sshd_bin)" ] || failed "Could not install openssh-server: no supported package manager or no network."
+                fi
+                owner() { s="$(sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | cut -d' ' -f20)"; [ -n "$s" ] && echo "$1 $s"; }
+                me="$(owner $$)"
+                take_lock() {
+                  echo "$me" > "$lock.$$"
+                  [ -d "$lock" ] && rm -rf "$lock"
+                  until ln "$lock.$$" "$lock" 2>/dev/null; do
+                    [ "$(cat "$mark" 2>/dev/null)" = "$request" ] || exit 0
+                    holder="$(cat "$lock" 2>/dev/null)"
+                    if [ -z "$holder" ] || [ "$(owner "${holder%% *}")" != "$holder" ]; then rm -rf "$lock"; continue; fi
+                    sleep 1
+                  done
+                  rm -f "$lock.$$"
+                }
+                take_lock
+                [ "$(cat "$mark" 2>/dev/null)" = "$request" ] || exit 0
+                """.replace("REQUEST_FILE", ACCOUNTS_REQUEST).replace("LOCK_DIR", ACCOUNTS_LOCK)
+                .replace("REQUEST", Long.toString(request)));
+        if (users != null) {
+            sh.append("""
+                    in_group() { id -nG "$1" 2>/dev/null | tr ' ' '\\n' | grep -qx "$2"; }
+                    join_group() { in_group "$1" "$2" || gpasswd -a "$1" "$2" >/dev/null 2>&1 || usermod -aG "$2" "$1" >/dev/null 2>&1 || addgroup "$1" "$2" >/dev/null 2>&1; }
+                    leave_group() { gpasswd -d "$1" "$2" >/dev/null 2>&1 || delgroup "$1" "$2" >/dev/null 2>&1; }
+                    home_of() { awk -F: -v u="$1" '$1 == u { print $6 }' /etc/passwd; }
+                    write_keys() {
+                      user="$1"; shift; home="$(home_of "$user")"; [ -n "$home" ] || return 0
+                      mkdir -p "$home/.ssh"; ak="$home/.ssh/authorized_keys"
+                      { [ -f "$ak" ] && awk 'skip { skip = 0; next } $0 == "# Added by Google" { skip = 1; next } $0 != "" { print }' "$ak"
+                        for key in "$@"; do printf '# Added by Google\\n%s\\n' "$key"; done; } > "$ak.google"
+                      chmod 600 "$ak.google" && mv "$ak.google" "$ak" && chmod 700 "$home/.ssh" \\
+                        && chown -R "$user" "$home/.ssh" || failed "Could not update the SSH keys of $user."
+                    }
+                    groupadd google-sudoers >/dev/null 2>&1 || addgroup google-sudoers >/dev/null 2>&1
+                    mkdir -p /etc/sudoers.d
+                    [ -e /etc/sudoers.d/google_sudoers ] || { echo '%google-sudoers ALL=(ALL:ALL) NOPASSWD:ALL' > /etc/sudoers.d/google_sudoers; chmod 0440 /etc/sudoers.d/google_sudoers; }
+                    touch GOOGLE_USERS
+                    ensure_user() {
+                      if ! id "$1" >/dev/null 2>&1; then
+                        echo "Creating user $1."
+                        if has useradd; then
+                          if [ -x /bin/bash ]; then useradd -m -s /bin/bash -p '*' "$1" >/dev/null; else useradd -m -p '*' "$1" >/dev/null; fi
+                        else adduser -D "$1" >/dev/null && sed -i "s/^$1:!/$1:*/" /etc/shadow; fi
+                        id "$1" >/dev/null 2>&1 || { failed "Could not create user $1."; return 1; }
+                        for group in GROUPS; do grep -q "^$group:" /etc/group && join_group "$1" "$group"; done
+                        join_group "$1" google-sudoers || failed "Could not add user $1 to google-sudoers."
+                        grep -qx "$1" GOOGLE_USERS || echo "$1" >> GOOGLE_USERS
+                      elif ! grep -qx "$1" GOOGLE_USERS; then
+                        echo "Adding existing user $1 to google-sudoers group."
+                        join_group "$1" google-sudoers || failed "Could not add user $1 to google-sudoers."
+                        echo "$1" >> GOOGLE_USERS
+                      fi
+                      return 0
+                    }
+                    """.replace("GOOGLE_USERS", GOOGLE_USERS).replace("GROUPS", String.join(" ", USER_GROUPS)));
+            for (Map.Entry<String, List<String>> user : users.entrySet()) {
+                String name = quote(user.getKey());
+                sh.append("ensure_user ").append(name).append(" && echo \"Updating keys for user \"").append(name)
+                        .append("\".\" && write_keys ").append(name);
+                for (String key : user.getValue()) { sh.append(' ').append(quote(key)); }
+                sh.append('\n');
+            }
+            sh.append("current=").append(quote(String.join("\n", users.keySet()))).append('\n');
+            sh.append("""
+                    while IFS= read -r old; do
+                      [ -n "$old" ] || continue
+                      printf '%s\\n' "$current" | grep -qx "$old" && continue
+                      echo "Removing user $old."
+                      write_keys "$old"; leave_group "$old" google-sudoers
+                    done < GOOGLE_USERS
+                    printf '%s\\n' "$current" | grep -v '^$' > GOOGLE_USERS.new; mv GOOGLE_USERS.new GOOGLE_USERS
+                    """.replace("GOOGLE_USERS", GOOGLE_USERS));
+        }
+        sh.append("""
+                sshd="$(sshd_bin)"
+                if [ -n "$sshd" ]; then
+                  running=
+                  for comm in /proc/[0-9]*/comm; do [ "$(cat "$comm" 2>/dev/null)" = sshd ] && running=1 && break; done
+                  if [ -z "$running" ]; then
+                    ssh-keygen -A >/dev/null 2>&1; mkdir -p /run/sshd
+                    if "$sshd"; then echo "Started sshd."; else failed "Could not start sshd."; fi
+                  fi
+                fi
+                exit $status
+                """);
+        return sh.toString();
+    }
+
+    /** One shell word: single quotes around the value, each embedded single quote closed, escaped and reopened. */
+    static String quote(String value) {
+        return "'" + value.replace("'", "'\\''") + "'";
     }
 
     /**

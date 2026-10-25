@@ -4,7 +4,9 @@ import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.model.Container;
 import com.github.dockerjava.api.model.ContainerNetwork;
+import com.github.dockerjava.api.model.ExposedPort;
 import com.github.dockerjava.api.model.MountType;
+import com.github.dockerjava.api.model.Ports;
 import com.google.common.util.concurrent.MoreExecutors;
 import io.floci.gcp.config.EmulatorConfig;
 import io.floci.gcp.core.common.docker.ContainerBuilder;
@@ -40,6 +42,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
@@ -835,6 +838,80 @@ class ComputeInstanceRuntimeTest {
         Map<String, String> metadata = new HashMap<>(METADATA);
         metadata.put("gce-container-declaration", DECLARATION);
         return new Intent(kind, "p", "us-central1-a", "vm", "debian:12", 2, 8192, metadata);
+    }
+
+    @Test
+    void aBootPublishesTheIntentPortsReportsThemAndAppliesTheSshKeys() {
+        runtime.sshKeys((project, zone, name) -> List.of("alice:ssh-ed25519 AAAAC3Nz alice"));
+        Intent launch = new Intent(Kind.LAUNCH, "p", "us-central1-a", "vm", "debian:12", 2, 8192, METADATA,
+                List.of(22, 80));
+        Ports bindings = new Ports();
+        bindings.bind(ExposedPort.tcp(22), Ports.Binding.bindPort(32768));
+        bindings.bind(ExposedPort.tcp(80), Ports.Binding.bindPort(32769));
+        when(docker.inspectContainerCmd("new-id").exec().getNetworkSettings().getPorts()).thenReturn(bindings);
+
+        runtime.submit("launch", List.of(launch));
+
+        verify(builder).withDynamicPort(22);
+        verify(builder).withDynamicPort(80);
+        verify(scripts).accounts(eq("vm"), eq("new-id"), eq(Map.of("alice", List.of("ssh-ed25519 AAAAC3Nz alice"))),
+                anyLong(), any());
+        assertTrue(runtime.serialOutput("p", "us-central1-a", "vm", 1, 0).contents()
+                .contains("floci-gcp[1]: Published ports: 22/tcp -> localhost:32768, 80/tcp -> localhost:32769"));
+    }
+
+    @Test
+    void aMetadataChangeReappliesTheCurrentKeysInTheRunningContainer() {
+        Container running = container("c-1", "running", Map.of());
+        when(lifecycleManager.findByName(CONTAINER)).thenReturn(Optional.of(running));
+        runtime.sshKeys((project, zone, name) -> List.of());
+
+        runtime.submit("metadata", List.of(new Intent(Kind.METADATA, "p", "us-central1-a", "vm", null, 0, 0, METADATA)));
+
+        verify(scripts).accounts(eq("vm"), eq("c-1"), eq(Map.of()), anyLong(), any());
+        verify(lifecycleManager, never()).createAndStart(any());
+    }
+
+    @Test
+    void anAccountUpdateQueuedBehindANewerOneIsSkippedAndTheNewerReadsTheLatestKeys() {
+        List<Runnable> queued = new ArrayList<>();
+        ExecutorService deferred = mock(ExecutorService.class);
+        doAnswer(invocation -> queued.add(invocation.getArgument(0))).when(deferred).execute(any());
+        ComputeInstanceRuntime runtime = new ComputeInstanceRuntime(config, containerBuilder, lifecycleManager,
+                imageCache, scripts, dockerHost, MoreExecutors.newDirectExecutorService(), deferred);
+        List<String> keys = new ArrayList<>(List.of("alice:ssh-ed25519 AAAAC3Nz alice"));
+        runtime.sshKeys((project, zone, name) -> List.copyOf(keys));
+        Container running = container("c-1", "running", Map.of());
+        when(lifecycleManager.findByName(CONTAINER)).thenReturn(Optional.of(running));
+        Intent change = new Intent(Kind.METADATA, "p", "us-central1-a", "vm", null, 0, 0, METADATA);
+
+        runtime.submit("first", List.of(change));
+        keys.clear();
+        runtime.submit("second", List.of(change));
+        queued.forEach(Runnable::run);
+
+        verify(scripts, times(1)).accounts(any(), any(), any(), anyLong(), any());
+        verify(scripts).accounts(eq("vm"), eq("c-1"), eq(Map.of()), anyLong(), any());
+    }
+
+    @Test
+    void aBootAfterAnEmulatorRestartAppliesTheCurrentKeys() {
+        Container stopped = container("vm-c", "exited", identity("vm", "4588"));
+        when(lifecycleManager.listContainersByLabels(anyString(), any())).thenReturn(List.of(stopped));
+        runtime.sshKeys((project, zone, name) -> List.of("bob:ssh-ed25519 AAAAC3Nz bob"));
+
+        runtime.reconcile((project, zone, name) -> "RUNNING");
+
+        verify(scripts).accounts(eq("vm"), eq("vm-c"), eq(Map.of("bob", List.of("ssh-ed25519 AAAAC3Nz bob"))), anyLong(), any());
+    }
+
+    @Test
+    void osLoginLeavesAccountsAlone() {
+        runtime.sshKeys((project, zone, name) -> null);
+
+        runtime.submit("launch", List.of(intent(Kind.LAUNCH)));
+
+        verify(scripts).accounts(eq("vm"), eq("new-id"), isNull(), anyLong(), any());
     }
 
     private static Map<String, String> identity(String name, String owner) {

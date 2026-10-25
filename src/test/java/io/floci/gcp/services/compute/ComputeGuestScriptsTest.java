@@ -6,17 +6,26 @@ import io.floci.gcp.core.common.docker.ContainerLifecycleManager;
 import io.floci.gcp.services.gcs.GcsService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledOnOs;
+import org.junit.jupiter.api.condition.OS;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
@@ -256,5 +265,118 @@ class ComputeGuestScriptsTest {
     private List<String> messages() {
         return port.read(0).contents().lines()
                 .map(line -> line.substring(line.indexOf("google_metadata_script_runner[1]: ") + 34)).toList();
+    }
+
+    @Test
+    void theAccountsScriptParsesAndHandsEachUserExactlyItsKeys() throws Exception {
+        Map<String, List<String>> users = new LinkedHashMap<>();
+        users.put("alice", List.of("ssh-ed25519 AAAAC3Nz alice@host", "ssh-rsa AAAAB3Nz it's mine"));
+        users.put("carol", List.of("ssh-ed25519 AAAAC3Nzc carol"));
+        String script = ComputeGuestScripts.accountsScript(users, 42);
+        Path file = Files.createTempFile("accounts", ".sh");
+        Files.writeString(file, script);
+        assertEquals(0, new ProcessBuilder("sh", "-n", file.toString()).start().waitFor(), "the script parses");
+
+        String userLines = script.lines().filter(line -> line.startsWith("ensure_user ")).collect(Collectors.joining("\n"));
+        Process run = new ProcessBuilder("sh", "-c", "ensure_user() { :; }; write_keys() { printf '[%s]' \"$@\"; echo; }\n"
+                + userLines).redirectErrorStream(true).start();
+        String out = new String(run.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        assertEquals(0, run.waitFor(), out);
+        assertEquals("""
+                Updating keys for user alice.
+                [alice][ssh-ed25519 AAAAC3Nz alice@host][ssh-rsa AAAAB3Nz it's mine]
+                Updating keys for user carol.
+                [carol][ssh-ed25519 AAAAC3Nzc carol]
+                """, out);
+        Files.delete(file);
+    }
+
+    @Test
+    void aFailedAccountStepIsReportedWithTheExitStatus() {
+        ContainerExec.Result failed = mock(ContainerExec.Result.class);
+        when(failed.exitCode()).thenReturn(1L);
+        when(lifecycleManager.execStreaming(eq("c-1"), eq("root"), anyList(), eq(List.of("/bin/sh",
+                "/var/lib/google/floci-guest-accounts-42.sh")), any(), any(), any())).thenReturn(failed);
+        ComputeSerialPort port = new ComputeSerialPort();
+
+        scripts.accounts("vm", "c-1", Map.of(), 42, port);
+
+        assertTrue(port.read(0).contents().contains("google_guest_agent[1]: Account setup exit status 1"));
+    }
+
+    @Test
+    void anOlderAccountUpdateStopsBeforeTouchingAccountsWhileANewerOneRecordedItself() throws Exception {
+        Path dir = Files.createTempDirectory("accounts");
+        String script = ComputeGuestScripts.accountsScript(Map.of("alice", List.of("ssh-ed25519 AAAAC3Nz alice")), 5)
+                .replace(ComputeGuestScripts.ACCOUNTS_REQUEST, dir.resolve("request").toString())
+                .replace(ComputeGuestScripts.ACCOUNTS_LOCK, dir.resolve("lock").toString());
+        Files.writeString(dir.resolve("request"), "7\n");
+        Path file = dir.resolve("run.sh");
+        Files.writeString(file, script);
+
+        Process run = new ProcessBuilder("sh", file.toString()).redirectErrorStream(true).start();
+        String out = new String(run.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+
+        assertEquals(0, run.waitFor(), out);
+        assertEquals("", out, "stopped before installing or creating anything");
+        assertEquals("7", Files.readString(dir.resolve("request")).strip(), "the newer request stays recorded");
+        assertFalse(Files.exists(file), "the script removes itself");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"empty", "dead", "directory"})
+    void anAbandonedAccountLockIsTakenOver(String left) throws Exception {
+        Path dir = Files.createTempDirectory("accounts");
+        Path lock = dir.resolve("lock");
+        switch (left) {
+            case "empty" -> Files.writeString(lock, "");
+            case "dead" -> {
+                Process exited = new ProcessBuilder("true").start();
+                exited.waitFor();
+                Files.writeString(lock, exited.pid() + " 1\n");
+            }
+            default -> Files.createDirectories(lock.resolve("pid"));
+        }
+
+        String out = runLock(dir, "7", "take_lock; cat \"$lock\"; [ \"$(cat \"$lock\")\" = \"$me\" ] && echo owned");
+
+        assertTrue(out.endsWith("owned\n"), out);
+        try (var files = Files.list(dir)) {
+            assertEquals(List.of(lock), files.toList(), "no temporary lock file is left behind");
+        }
+    }
+
+    @Test
+    @EnabledOnOs(OS.LINUX)
+    void aWaitingAccountUpdateGivesUpOnceANewerOneIsRecorded() throws Exception {
+        Path dir = Files.createTempDirectory("accounts");
+
+        String out = runLock(dir, "8", "echo \"$me\" > \"$lock\"; take_lock; echo took");
+
+        assertEquals("", out, "left the live holder's lock alone");
+    }
+
+    /** Runs the accounts script's lock functions for request 7 with the newest request {@code newest}. */
+    private static String runLock(Path dir, String newest, String body) throws Exception {
+        String script = ComputeGuestScripts.accountsScript(null, 7);
+        String functions = script.substring(script.indexOf("owner() {"), script.indexOf("\ntake_lock\n"));
+        Files.writeString(dir.resolve("request"), newest + "\n");
+        Path output = Files.createTempFile("lock", ".out");
+        Process run = new ProcessBuilder("sh", "-c", "request=7\nmark=" + dir.resolve("request") + "\nlock="
+                + dir.resolve("lock") + "\n" + functions + "\n" + body).redirectErrorStream(true)
+                .redirectOutput(output.toFile()).start();
+        boolean finished = run.waitFor(30, TimeUnit.SECONDS);
+        run.destroyForcibly();
+        String out = Files.readString(output);
+        assertTrue(finished, "the lock functions did not finish: " + out);
+        assertEquals(0, run.exitValue(), out);
+        Files.delete(dir.resolve("request"));
+        Files.delete(output);
+        return out;
+    }
+
+    @Test
+    void quoteMakesOneShellWordOfAnything() {
+        assertEquals("'it'\\''s'", ComputeGuestScripts.quote("it's"));
     }
 }

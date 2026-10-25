@@ -5,6 +5,7 @@ import io.floci.gcp.services.compute.ComputeInstanceRuntime.Kind;
 import io.floci.gcp.services.compute.ComputeInstanceRuntime.Phase;
 import io.quarkus.test.InjectMock;
 import io.quarkus.test.junit.QuarkusTest;
+import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -24,6 +25,7 @@ class ComputeContainerRuntimeIntegrationTest extends ComputeTestSupport {
     private static final String ZONE = "/zones/us-central1-a";
 
     @InjectMock ComputeInstanceRuntime runtime;
+    @Inject ComputeService compute;
 
     @BeforeEach
     void enableRuntime() {
@@ -59,8 +61,8 @@ class ComputeContainerRuntimeIntegrationTest extends ComputeTestSupport {
         ArgumentCaptor<List<Intent>> intents = ArgumentCaptor.forClass(List.class);
         verify(runtime).submit(eq(key), intents.capture());
         String project = root.substring(root.lastIndexOf('/') + 1);
-        assertEquals(List.of(new Intent(Kind.LAUNCH, project, "us-central1-a", "vm", "ubuntu:22.04", 2, 8192, Map.of())),
-                intents.getValue());
+        assertEquals(List.of(new Intent(Kind.LAUNCH, project, "us-central1-a", "vm", "ubuntu:22.04", 2, 8192, Map.of(),
+                List.of(22))), intents.getValue());
     }
 
     @Test void lifecycleMethodsRecordTheirContainerSteps() throws Exception {
@@ -135,6 +137,68 @@ class ComputeContainerRuntimeIntegrationTest extends ComputeTestSupport {
         verify(runtime).submit(anyString(), intents.capture());
         assertEquals(Map.of("startup-script", "echo instance", "shutdown-script", "echo project-shutdown"),
                 intents.getValue().getFirst().metadata());
+    }
+
+    @Test void firewallRulesOnTheInstanceNetworkPickThePublishedPorts() throws Exception {
+        String root = network();
+        done(root, post(root + "/global/firewalls", Map.of("name", "web", "network", "global/networks/net",
+                "targetTags", List.of("web"), "allowed", List.of(Map.of("IPProtocol", "tcp", "ports", List.of("80", "8080-8081")),
+                        Map.of("IPProtocol", "udp", "ports", List.of("53"))))));
+        done(root, post(root + "/global/firewalls", Map.of("name", "db", "network", "global/networks/net",
+                "targetTags", List.of("db"), "allowed", List.of(Map.of("IPProtocol", "tcp", "ports", List.of("5432"))))));
+        done(root, post(root + "/global/firewalls", Map.of("name", "off", "network", "global/networks/net",
+                "disabled", true, "allowed", List.of(Map.of("IPProtocol", "tcp", "ports", List.of("9000"))))));
+        Map<String, Object> vm = new HashMap<>(vm("vm", null));
+        vm.put("tags", Map.of("items", List.of("web")));
+
+        done(root, post(root + ZONE + "/instances", vm));
+
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<Intent>> intents = ArgumentCaptor.forClass(List.class);
+        verify(runtime).submit(anyString(), intents.capture());
+        assertEquals(List.of(22, 80, 8080, 8081), intents.getValue().getFirst().ports());
+    }
+
+    @Test void sshKeyChangesReachRunningInstances() throws Exception {
+        String root = network();
+        done(root, post(root + ZONE + "/instances", vm("vm", null)));
+        clearInvocations(runtime);
+        String fingerprint = given().get(root + ZONE + "/instances/vm").jsonPath().getString("metadata.fingerprint");
+        done(root, post(root + ZONE + "/instances/vm/setMetadata", Map.of("fingerprint", fingerprint, "items",
+                List.of(Map.of("key", "ssh-keys", "value", "alice:ssh-ed25519 AAAAC3Nza alice")))));
+        String projectFingerprint = given().get(root).jsonPath().getString("commonInstanceMetadata.fingerprint");
+        done(root, post(root + "/setCommonInstanceMetadata", Map.of("fingerprint", projectFingerprint, "items",
+                List.of(Map.of("key", "ssh-keys", "value", "bob:ssh-ed25519 AAAAC3Nzb bob")))));
+
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<Intent>> intents = ArgumentCaptor.forClass(List.class);
+        verify(runtime, times(2)).submit(anyString(), intents.capture());
+        Intent instanceChange = intents.getAllValues().get(0).getFirst();
+        Intent projectChange = intents.getAllValues().get(1).getFirst();
+        assertEquals(Kind.METADATA, instanceChange.kind());
+        assertEquals(Kind.METADATA, projectChange.kind());
+        assertEquals("us-central1-a", projectChange.zone());
+        String project = root.substring(root.lastIndexOf('/') + 1);
+        assertEquals(List.of("alice:ssh-ed25519 AAAAC3Nza alice", "bob:ssh-ed25519 AAAAC3Nzb bob"),
+                compute.instanceSshKeys(project, "us-central1-a", "vm"));
+        assertNull(compute.instanceSshKeys(project, "us-central1-a", "missing"));
+    }
+
+    @Test void projectKeyChangesAlsoReachInstancesStillStarting() throws Exception {
+        String root = network();
+        when(runtime.phase(anyString())).thenReturn(Phase.PROVISIONING);
+        post(root + ZONE + "/instances", vm("vm", null)).then().statusCode(200);
+        clearInvocations(runtime);
+        String projectFingerprint = given().get(root).jsonPath().getString("commonInstanceMetadata.fingerprint");
+
+        post(root + "/setCommonInstanceMetadata", Map.of("fingerprint", projectFingerprint, "items",
+                List.of(Map.of("key", "ssh-keys", "value", "bob:ssh-ed25519 AAAAC3Nzb bob")))).then().statusCode(200);
+
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<Intent>> intents = ArgumentCaptor.forClass(List.class);
+        verify(runtime).submit(anyString(), intents.capture());
+        assertEquals(Kind.METADATA, intents.getValue().getFirst().kind());
+        when(runtime.phase(anyString())).thenReturn(Phase.DONE);
     }
 
     @Test void serialPortOutputServesTheRuntimeBuffer() throws Exception {

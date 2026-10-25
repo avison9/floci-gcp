@@ -39,6 +39,8 @@ public class ComputeService {
     private final ServiceRegistry registry;
     private final Instance<ComputeResourceHandler> handlers;
     private final LocationCatalog locations;
+    /** Instance statuses whose guest is up or coming up, so a metadata change must reach it. */
+    static final Set<String> STARTED = Set.of("PROVISIONING", "STAGING", "RUNNING");
     private final ComputeInstanceRuntime runtime;
     private final ComputeImageCatalog images;
 
@@ -61,6 +63,7 @@ public class ComputeService {
         registry.register(ServiceDescriptor.builder("compute").enabled(config.services().compute().enabled())
                 .storageKey("compute").resourceClasses(ComputeController.class, ComputeMetadataController.class)
                 .api("compute.googleapis.com", "Compute Engine API").build());
+        runtime.sshKeys(this::instanceSshKeys);
         runtime.reconcile(this::instanceStatus, this::instanceGuestMetadata);
     }
     /** What the metadata server needs about one instance: copies, so callers cannot change stored state. */
@@ -86,6 +89,18 @@ public class ComputeService {
     synchronized String instanceStatus(String project, String zone, String name) {
         ObjectNode instance = state(project).resources.get("zones/" + zone + "/instances/" + name);
         return instance == null ? null : instance.path("status").asText();
+    }
+    /** The guest agent's ssh-keys lines for an instance now, or null with OS Login on or no such instance. */
+    synchronized List<String> instanceSshKeys(String project, String zone, String name) {
+        ComputeProject state = state(project);
+        ObjectNode instance = state.resources.get("zones/" + zone + "/instances/" + name);
+        if (instance == null) { return null; }
+        return ComputeSshKeys.lines(metadataValues(instance.path("metadata")), metadataValues(commonInstanceMetadata(state)));
+    }
+    private static Map<String, String> metadataValues(JsonNode metadata) {
+        Map<String, String> values = new LinkedHashMap<>();
+        for (JsonNode item : metadata.path("items")) { values.put(item.path("key").asText(), item.path("value").asText()); }
+        return values;
     }
     synchronized Map<String, String> instanceGuestMetadata(String project, String zone, String name) {
         ComputeProject state = state(project);
@@ -371,6 +386,14 @@ public class ComputeService {
         if (body.has("items")) { replacement.set("items", body.get("items")); }
         c.state.commonInstanceMetadata = replacement;
         if (c.state.creationTimestamp == null) { c.state.creationTimestamp = Instant.now().toString(); }
+        // Project ssh-keys reach every running guest, whose agent applies them as they change, and every guest still
+        // starting, whose boot may already have read the old keys.
+        for (Map.Entry<String, ObjectNode> entry : c.state.resources.entrySet()) {
+            if (entry.getKey().matches("zones/[^/]+/instances/[^/]+")
+                    && STARTED.contains(entry.getValue().path("status").asText())) {
+                c.runtime(ComputeInstanceRuntime.Kind.METADATA, entry.getValue());
+            }
+        }
         ObjectNode target = object().put("selfLink", "https://www.googleapis.com/compute/v1/projects/" + project)
                 .put("id", ProjectNumbers.of(project));
         return operation(c, target, "setCommonInstanceMetadata", requestId, requestKey);
@@ -629,7 +652,9 @@ public class ComputeService {
             if (!runtime.enabled()) { return; }
             String image = null;
             int cpus = 0, memoryMb = 0;
+            List<Integer> ports = List.of();
             if (kind == ComputeInstanceRuntime.Kind.LAUNCH || kind == ComputeInstanceRuntime.Kind.START) {
+                ports = ComputeFirewallPorts.forInstance(state, instance);
                 image = bootDockerImage(instance);
                 String machine = instance.path("machineType").asText();
                 machine = machine.substring(machine.lastIndexOf('/') + 1);
@@ -640,8 +665,10 @@ public class ComputeService {
                     cpus = 0;
                 }
             }
-            intents.add(new ComputeInstanceRuntime.Intent(kind, project, scope.substring(scope.indexOf('/') + 1),
-                    instance.path("name").asText(), image, cpus, memoryMb, guestMetadata(state, instance)));
+            String zone = instance.path("zone").asText(scope);
+            zone = zone.substring(zone.lastIndexOf('/') + 1);
+            intents.add(new ComputeInstanceRuntime.Intent(kind, project, zone, instance.path("name").asText(), image,
+                    cpus, memoryMb, guestMetadata(state, instance), ports));
         }
         private String bootDockerImage(ObjectNode instance) {
             for (JsonNode attachment : instance.path("disks")) {
