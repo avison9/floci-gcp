@@ -2199,6 +2199,13 @@ final class SqlDialectTranslator {
             if (items.isEmpty()) {
                 continue;
             }
+            if (structProjectionHasAliasClause(listEnd, parenthesisDepth(select))) {
+                nameAnonymousStructFields(items);
+                listEnd = selectStructListEnd(listStart);
+                wrapStructProjection(select, marker, struct, listEnd);
+                select = tokens.size();
+                continue;
+            }
             if (items.size() == 1 && isStarProjection(significant(items.getFirst()[0], items.getFirst()[1]))) {
                 int itemStart = items.getFirst()[0];
                 int itemEnd = items.getFirst()[1];
@@ -2259,6 +2266,33 @@ final class SqlDialectTranslator {
             tokens.subList(select, listEnd).clear();
             replaceSelectHead(select, modifier, replacement.toString());
             select = tokens.size();
+        }
+    }
+
+    /** Clauses that can resolve names assigned by the SELECT list must stay inside the struct wrapper. */
+    private boolean structProjectionHasAliasClause(int start, int depth) {
+        int end = structQueryEnd(start, depth);
+        for (int i = start; i < end; i++) {
+            Token token = tokens.get(i);
+            if (parenthesisDepth(i) == depth && (token.isKeyword("GROUP") || token.isKeyword("HAVING")
+                    || token.isKeyword("QUALIFY") || token.isKeyword("ORDER"))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void nameAnonymousStructFields(List<int[]> items) {
+        for (int n = items.size() - 1; n >= 0; n--) {
+            int[] item = items.get(n);
+            if (!needsGeneratedName(item[0], item[1])) {
+                continue;
+            }
+            int end = item[1];
+            while (tokens.get(end - 1).kind == Kind.SPACE) {
+                end--;
+            }
+            tokens.addAll(end, new Lexer(" AS `_field_" + (n + 1) + "`").tokenize());
         }
     }
 
