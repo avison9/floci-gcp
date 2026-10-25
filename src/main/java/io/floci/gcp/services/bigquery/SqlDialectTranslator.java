@@ -80,7 +80,7 @@ final class SqlDialectTranslator {
     private static final Set<String> SHIMMED_FUNCTIONS = Set.of(
             "CAST", "SAFE_CAST", "EXTRACT", "STRUCT", "SAFE_DIVIDE", "IEEE_DIVIDE", "DIV", "IF", "COUNTIF", "CONCAT",
             "LOGICAL_AND", "LOGICAL_OR", "ARRAY_LENGTH", "ARRAY_REVERSE", "ARRAY_AGG", "ARRAY_CONCAT_AGG", "CONTAINS_SUBSTR",
-            "APPROX_COUNT_DISTINCT", "TO_HEX", "MD5", "SHA1", "SHA256", "RAND",
+            "APPROX_COUNT_DISTINCT", "TO_HEX", "MD5", "SHA1", "SHA256", "RAND", "INITCAP",
             "GENERATE_ARRAY", "GENERATE_DATE_ARRAY", "SPLIT", "FORMAT", "APPROX_QUANTILES",
             "TO_JSON_STRING", "JSON_VALUE", "JSON_EXTRACT_SCALAR", "JSON_QUERY", "JSON_EXTRACT", "JSON_TYPE",
             "REGEXP_CONTAINS", "REGEXP_EXTRACT", "REGEXP_REPLACE", "CURRENT_TIMESTAMP", "CURRENT_DATE",
@@ -118,6 +118,7 @@ final class SqlDialectTranslator {
     private int generatedUnnestAlias;
     private int generatedDerivedTableAlias;
     private int generatedConcatAlias;
+    private int generatedInitcapName;
     private boolean needsUnicodeCaseFold;
 
     private List<Token> tokens;
@@ -4658,6 +4659,7 @@ final class SqlDialectTranslator {
             case "SPLIT" -> a.size() == 1 ? "string_split(" + a.getFirst() + ", ',')"
                     : "string_split(" + String.join(", ", a) + ")";
             case "FORMAT" -> "printf(" + String.join(", ", a) + ")";
+            case "INITCAP" -> initcap(a);
             case "TO_JSON_STRING" -> "CAST(to_json(" + at(a, 0) + ") AS VARCHAR)";
             case "JSON_VALUE", "JSON_EXTRACT_SCALAR" -> a.size() == 1
                     ? "json_extract_string(" + a.getFirst() + ", '$')"
@@ -4894,6 +4896,33 @@ final class SqlDialectTranslator {
                 + " typeof(_floci_parsed_timestamp) = 'TIMESTAMP WITH TIME ZONE'"
                 + " THEN CAST(_floci_parsed_timestamp AS TIMESTAMPTZ) ELSE timezone("
                 + zone + ", CAST(_floci_parsed_timestamp AS TIMESTAMP)) END), 1)";
+    }
+
+    /** BigQuery's default INITCAP delimiters: whitespace plus {@code [](){}/|\<>!?@"^#$&~_,.:;*%+-}. */
+    private static final String INITCAP_DELIMITERS = "(' ' || chr(9) || chr(10) || chr(11) || chr(12) || chr(13)"
+            + " || '[](){}/|\\<>!?@\"^#$&~_,.:;*%+-')";
+
+    /**
+     * {@code INITCAP(value[, delimiters])}: DuckDB has no equivalent, so walk the characters. A delimiter is
+     * kept as is, the character after one (or the first) is upper-cased and every other character lower-cased.
+     * A NULL value or delimiter set yields NULL; an empty delimiter set makes the whole value one word. Both
+     * arguments are evaluated once, outside the lambdas (a subquery may not appear inside one), and the lambda
+     * variables get generated names so they cannot hide a column of the query.
+     */
+    private String initcap(List<String> a) {
+        if (a.isEmpty() || a.size() > 2) {
+            throw invalidQuery("No matching signature for function INITCAP with " + a.size() + " arguments");
+        }
+        String d = a.size() == 2 ? "(" + a.get(1) + ")" : INITCAP_DELIMITERS;
+        String v = "_floci_initcap_" + generatedInitcapName++;
+        String i = v + "_i";
+        String s = v + ".s";
+        String ch = "substr(" + s + ", " + i + ", 1)";
+        return "list_extract(list_transform([struct_pack(s := (" + a.get(0) + "), d := " + d + ")], " + v
+                + " -> CASE WHEN " + s + " IS NULL OR " + v + ".d IS NULL THEN NULL ELSE array_to_string(list_transform("
+                + "range(1, length(" + s + ") + 1), " + i + " -> CASE WHEN strpos(" + v + ".d, " + ch + ") > 0 THEN "
+                + ch + " WHEN " + i + " = 1 OR strpos(" + v + ".d, substr(" + s + ", " + i + " - 1, 1)) > 0 THEN upper("
+                + ch + ") ELSE lower(" + ch + ") END), '') END), 1)";
     }
 
     private static String args(List<String> a, int expected, String name, String rendered) {

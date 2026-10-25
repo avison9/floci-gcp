@@ -649,6 +649,23 @@ class SqlDialectTranslatorTest {
     }
 
     @Test
+    void initcapWalksTheCharactersAgainstTheDelimiters() {
+        String rendered = sql("SELECT INITCAP(name) AS n FROM ds.t");
+        assertTrue(rendered.startsWith("SELECT list_extract(list_transform([struct_pack(s := (name), d := (' ' || chr(9)"),
+                rendered);
+        assertTrue(rendered.contains("'[](){}/|\\<>!?@\"^#$&~_,.:;*%+-'"), rendered);
+        assertTrue(rendered.contains("range(1, length(_floci_initcap_0.s) + 1), _floci_initcap_0_i ->"), rendered);
+        String custom = sql("SELECT INITCAP(f(name), g(d)) AS n FROM ds.t");
+        assertEquals(1, custom.split("f\\(name\\)", -1).length - 1, custom);
+        assertEquals(1, custom.split("g\\(d\\)", -1).length - 1, custom);
+        assertFalse(custom.contains("__i"), custom);
+        assertEquals("invalidQuery", assertThrows(GcpException.class,
+                () -> sql("SELECT INITCAP() FROM ds.t")).getReason());
+        assertEquals("invalidQuery", assertThrows(GcpException.class,
+                () -> sql("SELECT INITCAP(a, b, c) FROM ds.t")).getReason());
+    }
+
+    @Test
     void arrayAggNullModifiers() {
         assertEquals("SELECT ARRAY_AGG(x) FILTER (WHERE (x) IS NOT NULL) AS xs FROM \"ds\".\"t\"", sql("SELECT ARRAY_AGG(x IGNORE NULLS) AS xs FROM ds.t"));
         assertEquals("SELECT ARRAY_AGG(DISTINCT x ORDER BY x DESC) FILTER (WHERE (x) IS NOT NULL) AS xs FROM \"ds\".\"t\"", sql("SELECT ARRAY_AGG(DISTINCT x IGNORE NULLS ORDER BY x DESC) AS xs FROM ds.t"));
