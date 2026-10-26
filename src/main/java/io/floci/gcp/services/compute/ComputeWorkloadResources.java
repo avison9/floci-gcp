@@ -93,6 +93,12 @@ public class ComputeWorkloadResources implements ComputeResourceHandler {
                 ObjectNode original = c.reference(r, source, source.equals("sourceImage") ? "images" : "snapshots");
                 sourceSize = original.path("diskSizeGb").asInt();
                 r.put(source + "Id", original.path("id").asText());
+                if (source.equals("sourceImage") && !ComputePublicImages.isPublicReference(r.path(source).asText())) {
+                    ObjectNode image = c.object();
+                    if (original.has("name")) { image.set("name", original.get("name")); }
+                    if (original.has("family")) { image.set("family", original.get("family")); }
+                    c.state.diskImages.put(c.key(), image);
+                }
             }
         }
         if (sources > 1) { throw GcpException.invalidArgument("Only one disk source is allowed"); }
@@ -217,7 +223,11 @@ public class ComputeWorkloadResources implements ComputeResourceHandler {
         if (r.path("deletionProtection").asBoolean()) { throw GcpException.failedPrecondition("Deletion protection is enabled"); }
         for (JsonNode disk : r.path("disks")) {
             detach(c, r, (ObjectNode) disk);
-            if (disk.path("autoDelete").asBoolean()) { c.state.resources.remove(c.path(disk.path("source").asText())); }
+            if (disk.path("autoDelete").asBoolean()) {
+                String diskKey = c.path(disk.path("source").asText());
+                c.state.resources.remove(diskKey);
+                c.state.diskImages.remove(diskKey);
+            }
         }
         for (JsonNode nic : r.path("networkInterfaces")) {
             for (JsonNode access : nic.path("accessConfigs")) { release(c, access.path("natIP").asText(), r.path("selfLink").asText()); }

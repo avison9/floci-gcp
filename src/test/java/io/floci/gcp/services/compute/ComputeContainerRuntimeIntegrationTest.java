@@ -184,6 +184,69 @@ class ComputeContainerRuntimeIntegrationTest extends ComputeTestSupport {
         assertNull(compute.instanceSshKeys(project, "us-central1-a", "missing"));
     }
 
+    @Test void cloudInitReadsOnlyInstanceUserDataAndOnlyOnImagesThatShipIt() throws Exception {
+        String root = network();
+        String fingerprint = given().get(root).jsonPath().getString("commonInstanceMetadata.fingerprint");
+        done(root, post(root + "/setCommonInstanceMetadata", Map.of("fingerprint", fingerprint, "items",
+                List.of(Map.of("key", "user-data", "value", "#cloud-config\nproject: true")))));
+        List<Map<String, String>> userData = List.of(Map.of("key", "user-data", "value", "I2Nsb3VkLWNvbmZpZwo="),
+                Map.of("key", "user-data-encoding", "value", "base64"));
+        String ubuntu = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64";
+        done(root, post(root + ZONE + "/instances", withMetadata(vm("ubuntu", ubuntu), userData)));
+        done(root, post(root + ZONE + "/instances", withMetadata(vm("cos", "projects/cos-cloud/global/images/family/cos-stable"), userData)));
+        done(root, post(root + ZONE + "/instances", withMetadata(vm("debian", "projects/debian-cloud/global/images/family/debian-12"), userData)));
+        done(root, post(root + ZONE + "/instances", vm("project-only", ubuntu)));
+        String project = root.substring(root.lastIndexOf('/') + 1);
+
+        ComputeGuestScripts.CloudInit seed = compute.instanceCloudInit(project, "us-central1-a", "ubuntu");
+        assertEquals(new ComputeGuestScripts.CloudInit(
+                given().get(root + ZONE + "/instances/ubuntu").jsonPath().getString("id"), "ubuntu",
+                "I2Nsb3VkLWNvbmZpZwo=", "base64", false), seed);
+        assertTrue(compute.instanceCloudInit(project, "us-central1-a", "cos").everyBoot());
+        assertNull(compute.instanceCloudInit(project, "us-central1-a", "debian"), "Debian images ship no cloud-init");
+        assertNull(compute.instanceCloudInit(project, "us-central1-a", "project-only"), "project user-data is not read");
+        assertNull(compute.instanceCloudInit(project, "us-central1-a", "missing"));
+    }
+
+    @Test void aDiskKeepsItsImageCloudInitSettingAfterThatImageIsDeleted() throws Exception {
+        String root = network();
+        done(root, post(root + ZONE + "/disks", Map.of("name", "seed", "sizeGb", "10")));
+        done(root, post(root + "/global/images", Map.of("name", "golden-v2", "family", "ubuntu-2404-lts-amd64",
+                "sourceDisk", "zones/us-central1-a/disks/seed")));
+        done(root, post(root + ZONE + "/instances", withMetadata(vm("vm", "global/images/golden-v2"),
+                List.of(Map.of("key", "user-data", "value", "#cloud-config")))));
+        String project = root.substring(root.lastIndexOf('/') + 1);
+        assertNotNull(compute.instanceCloudInit(project, "us-central1-a", "vm"));
+
+        done(root, given().delete(root + "/global/images/golden-v2"));
+
+        assertNotNull(compute.instanceCloudInit(project, "us-central1-a", "vm"),
+                "cloud-init is on the disk, not in the image record");
+    }
+
+    @Test void deletingAnInstanceDropsTheImageRecordOfItsAutoDeletedDisks() throws Exception {
+        String root = network();
+        done(root, post(root + ZONE + "/disks", Map.of("name", "seed", "sizeGb", "10")));
+        done(root, post(root + "/global/images", Map.of("name", "golden-v3", "family", "ubuntu-2404-lts-amd64",
+                "sourceDisk", "zones/us-central1-a/disks/seed")));
+        Map<String, Object> vm = new HashMap<>(vm("vm", "global/images/golden-v3"));
+        vm.put("disks", List.of(Map.of("boot", true, "autoDelete", true,
+                "initializeParams", Map.of("diskSizeGb", "20", "sourceImage", "global/images/golden-v3"))));
+        done(root, post(root + ZONE + "/instances", vm));
+        String project = root.substring(root.lastIndexOf('/') + 1);
+        assertFalse(compute.recordedDiskImages(project).isEmpty());
+
+        done(root, given().delete(root + ZONE + "/instances/vm"));
+
+        assertTrue(compute.recordedDiskImages(project).isEmpty(), "auto-deleted disks keep no image record");
+    }
+
+    private static Map<String, Object> withMetadata(Map<String, Object> vm, List<Map<String, String>> items) {
+        Map<String, Object> copy = new HashMap<>(vm);
+        copy.put("metadata", Map.of("items", items));
+        return copy;
+    }
+
     @Test void projectKeyChangesAlsoReachInstancesStillStarting() throws Exception {
         String root = network();
         when(runtime.phase(anyString())).thenReturn(Phase.PROVISIONING);

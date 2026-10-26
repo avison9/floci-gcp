@@ -15,8 +15,10 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.Base64;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.function.BooleanSupplier;
 
 /**
@@ -41,6 +43,17 @@ public class ComputeGuestScripts {
     static final String ACCOUNTS_REQUEST = DIRECTORY + "/floci-accounts.request";
     /** Held while one update changes accounts. */
     static final String ACCOUNTS_LOCK = DIRECTORY + "/floci-accounts.lock";
+    /** Held while a guest script installs packages, so the sshd and cloud-init installs never race for apt. */
+    static final String PACKAGE_LOCK = DIRECTORY + "/floci-packages.lock";
+    /**
+     * Shell functions that take and release {@link #PACKAGE_LOCK} with flock, which the kernel releases when its
+     * holder dies, so an interrupted install never leaves it held. apt-get update fails at once rather than waiting
+     * when another apt-get holds its lists lock, and DPkg::Lock::Timeout only covers the dpkg lock. A guest without
+     * flock installs unserialised, as before.
+     */
+    static final String PACKAGE_LOCK_FUNCTIONS = "packages_lock() { if has flock; then exec 9>\"" + PACKAGE_LOCK
+            + "\"; flock -w 900 9; locked=1; fi; }\n"
+            + "packages_unlock() { if [ -n \"${locked:-}\" ]; then flock -u 9; exec 9>&-; locked=; fi; }";
     /** Longest the account step waits, an sshd package install included. */
     static final Duration ACCOUNTS_TIMEOUT = Duration.ofMinutes(5);
     /** The guest agent's default extra groups for the users it creates ({@code cfg.go}: groups). */
@@ -58,6 +71,25 @@ public class ComputeGuestScripts {
      */
     static final String BOOT_GUARD = "[ \"$(cut -d ' ' -f22 /proc/1/stat)\" = \"$1\" ] || exit " + REBOOTED
             + "; exec \"$0\"";
+
+    /** The unit cloud-init's lines carry on the serial console. */
+    static final String CLOUD_INIT = "cloud-init";
+    /** The NoCloud seed directory cloud-init reads user-data and meta-data from. */
+    static final String CLOUD_INIT_SEED = "/var/lib/cloud/seed/nocloud";
+    /**
+     * Each boot stages its seed and scripts in a directory of its own, which only its own script, past the boot guard,
+     * copies into the seed directory: a superseded boot still uploading can never overwrite a later boot's seed.
+     */
+    static final String CLOUD_INIT_STAGE = DIRECTORY + "/floci-cloud-init-";
+    static final String CLOUD_INIT_EARLY = "early.sh";
+    static final String CLOUD_INIT_FINAL = "final.sh";
+
+    /**
+     * What cloud-init needs for one boot: the instance's id (cloud-init's instance-id), its name, its own
+     * {@code user-data} and {@code user-data-encoding} attributes (cloud-init's GCE source reads no project
+     * user-data), and whether write_files and runcmd run on every boot, as on Container-Optimized OS.
+     */
+    public record CloudInit(String instanceId, String hostname, String userData, String encoding, boolean everyBoot) {}
 
     public enum Phase {
         STARTUP("startup"), SHUTDOWN("shutdown");
@@ -199,9 +231,11 @@ public class ComputeGuestScripts {
                 failed() { echo "$1"; status=1; }
                 has() { command -v "$1" >/dev/null 2>&1; }
                 sshd_bin() { for b in /usr/sbin/sshd /usr/local/sbin/sshd /sbin/sshd "$(command -v sshd 2>/dev/null)"; do [ -n "$b" ] && [ -x "$b" ] && { echo "$b"; return; }; done; }
+                PACKAGE_LOCK_FUNCTIONS
+                if [ -z "$(sshd_bin)" ]; then packages_lock; fi
                 if [ -z "$(sshd_bin)" ]; then
                   echo "Installing openssh-server."
-                  if has apt-get; then DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server sudo >/dev/null 2>&1
+                  if has apt-get; then DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 update -qq >/dev/null 2>&1; DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -y -qq openssh-server sudo >/dev/null 2>&1
                   elif has apk; then apk add --no-cache openssh-server shadow sudo >/dev/null 2>&1
                   elif has dnf; then dnf install -y -q openssh-server sudo shadow-utils >/dev/null 2>&1
                   elif has microdnf; then microdnf install -y openssh-server sudo shadow-utils >/dev/null 2>&1
@@ -209,6 +243,7 @@ public class ComputeGuestScripts {
                   fi
                   [ -n "$(sshd_bin)" ] || failed "Could not install openssh-server: no supported package manager or no network."
                 fi
+                packages_unlock
                 owner() { s="$(sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | cut -d' ' -f20)"; [ -n "$s" ] && echo "$1 $s"; }
                 me="$(owner $$)"
                 take_lock() {
@@ -224,7 +259,7 @@ public class ComputeGuestScripts {
                 }
                 take_lock
                 [ "$(cat "$mark" 2>/dev/null)" = "$request" ] || exit 0
-                """.replace("REQUEST_FILE", ACCOUNTS_REQUEST).replace("LOCK_DIR", ACCOUNTS_LOCK)
+                """.replace("PACKAGE_LOCK_FUNCTIONS", PACKAGE_LOCK_FUNCTIONS).replace("REQUEST_FILE", ACCOUNTS_REQUEST).replace("LOCK_DIR", ACCOUNTS_LOCK)
                 .replace("REQUEST", Long.toString(request)));
         if (users != null) {
             sh.append("""
@@ -298,6 +333,185 @@ public class ComputeGuestScripts {
     /** One shell word: single quotes around the value, each embedded single quote closed, escaped and reopened. */
     static String quote(String value) {
         return "'" + value.replace("'", "'\\''") + "'";
+    }
+
+    /**
+     * Runs cloud-init's early stages with the instance's {@code user-data}, as the images that ship it do at boot: the
+     * local, network and config stages run before google-startup-scripts, while the final stage (packages, runcmd,
+     * user scripts) waits for multi-user.target, which the startup scripts are part of; {@link #cloudInitFinal} runs it.
+     * The guest gets cloud-init from its package manager the first time; the user-data and meta-data are seeded for
+     * the NoCloud data source (cloud-init's GCE source only runs on Google hardware), and the output goes to serial
+     * port 1. Per-instance modules run once per instance, keyed by its id, unless {@link CloudInit#everyBoot()} reruns
+     * write_files and runcmd. A step that fails is reported on serial port 1.
+     *
+     * @return this boot's staging directory, for {@link #cloudInitFinal}; null when cloud-init did not start
+     */
+    String cloudInit(String instance, String containerId, CloudInit seed, Duration timeout, ComputeSerialPort port,
+                     BooleanSupplier current, String bootMark) {
+        byte[] userData;
+        try {
+            userData = userData(seed);
+        } catch (IllegalArgumentException e) {
+            port.write(line(instance, CLOUD_INIT, "Could not decode base64 user-data: " + e.getMessage()));
+            return null;
+        }
+        if (!current.getAsBoolean()) { return null; }
+        String stage = CLOUD_INIT_STAGE + UUID.randomUUID().toString().replace("-", "");
+        try {
+            lifecycleManager.execStreaming(containerId, ROOT, List.of(), List.of("mkdir", "-p", stage),
+                    Duration.ofSeconds(30), OutputStream.nullOutputStream(), OutputStream.nullOutputStream());
+            RetryingTarCopier.copyBytes(lifecycleManager.getDockerClient(), containerId, stage, "user-data", userData, 0600);
+            RetryingTarCopier.copyBytes(lifecycleManager.getDockerClient(), containerId, stage, "meta-data",
+                    metaData(seed).getBytes(StandardCharsets.UTF_8), 0600);
+            RetryingTarCopier.copyBytes(lifecycleManager.getDockerClient(), containerId, stage, CLOUD_INIT_EARLY,
+                    cloudInitEarlyScript(seed.everyBoot(), stage).getBytes(StandardCharsets.UTF_8), 0700);
+            RetryingTarCopier.copyBytes(lifecycleManager.getDockerClient(), containerId, stage, CLOUD_INIT_FINAL,
+                    cloudInitFinalScript(stage).getBytes(StandardCharsets.UTF_8), 0700);
+            if (!current.getAsBoolean()) { return null; }
+            ContainerExec.Result result = runCloudInitStage(containerId, stage + "/" + CLOUD_INIT_EARLY, timeout, port,
+                    instance, bootMark);
+            if (rebooted(containerId, bootMark, result)) {
+                port.write(line(instance, CLOUD_INIT, "cloud-init not run: the instance rebooted since this boot."));
+                return null;
+            }
+            if (result.timedOut()) {
+                port.write(line(instance, CLOUD_INIT, "cloud-init still running after " + timeout
+                        + "; no longer waiting for it. Its final stage runs once it is done."));
+            } else if (result.exitCode() != 0) {
+                port.write(line(instance, CLOUD_INIT, "cloud-init exit status " + result.exitCode()));
+            }
+            return stage;
+        } catch (RuntimeException e) {
+            LOG.warnf("Compute instance %s could not run cloud-init: %s", instance, e.getMessage());
+            port.write(line(instance, CLOUD_INIT, "Could not run cloud-init: " + e.getMessage()));
+            return null;
+        }
+    }
+
+    /**
+     * Runs cloud-init's final stage for a boot whose early stages {@link #cloudInit} started, after the startup
+     * scripts; it waits for the early stages first, should they still be running. A nonzero {@code cloud-init status}
+     * is reported on serial port 1.
+     */
+    void cloudInitFinal(String instance, String containerId, String stage, Duration timeout, ComputeSerialPort port,
+                        BooleanSupplier current, String bootMark) {
+        if (stage == null || !current.getAsBoolean()) { return; }
+        try {
+            ContainerExec.Result result = runCloudInitStage(containerId, stage + "/" + CLOUD_INIT_FINAL, timeout, port,
+                    instance, bootMark);
+            if (rebooted(containerId, bootMark, result)) {
+                return;
+            }
+            if (result.timedOut()) {
+                port.write(line(instance, CLOUD_INIT, "cloud-init final stage still running after " + timeout
+                        + "; no longer waiting for it."));
+            } else if (result.exitCode() != 0) {
+                port.write(line(instance, CLOUD_INIT, "cloud-init exit status " + result.exitCode()));
+            }
+        } catch (RuntimeException e) {
+            LOG.warnf("Compute instance %s could not run cloud-init: %s", instance, e.getMessage());
+            port.write(line(instance, CLOUD_INIT, "Could not run cloud-init: " + e.getMessage()));
+        }
+    }
+
+    private ContainerExec.Result runCloudInitStage(String containerId, String path, Duration timeout,
+                                                   ComputeSerialPort port, String instance, String bootMark) {
+        LineWriter out = new LineWriter(port, instance, CLOUD_INIT, "");
+        List<String> command = bootMark == null
+                ? List.of("/bin/sh", "-c", "\"$0\"", path)
+                : List.of("/bin/sh", "-c", BOOT_GUARD, path, bootMark);
+        ContainerExec.Result result = lifecycleManager.execStreaming(containerId, ROOT, List.of(), command, timeout,
+                out, out);
+        out.close();
+        return result;
+    }
+
+    private boolean rebooted(String containerId, String bootMark, ContainerExec.Result result) {
+        return bootMark != null && result.exitCode() == REBOOTED && !result.timedOut()
+                && !bootMark.equals(currentBootMark(containerId));
+    }
+
+    /**
+     * The user-data bytes: base64-decoded when {@code user-data-encoding} is {@code base64}, as cloud-init's GCE source
+     * does (other encodings are used as they are); throws IllegalArgumentException on invalid base64.
+     */
+    static byte[] userData(CloudInit seed) {
+        return "base64".equals(seed.encoding()) ? Base64.getMimeDecoder().decode(seed.userData())
+                : seed.userData().getBytes(StandardCharsets.UTF_8);
+    }
+
+    /** NoCloud meta-data: the instance id keys per-instance modules, and the name is the local hostname. */
+    static String metaData(CloudInit seed) {
+        return "instance-id: " + yamlString(seed.instanceId()) + "\nlocal-hostname: " + yamlString(seed.hostname()) + "\n";
+    }
+
+    private static String yamlString(String value) {
+        return "'" + value.replace("'", "''") + "'";
+    }
+
+    /**
+     * The early stages for the boot staged in {@code stage}: installs cloud-init when missing, points it at the NoCloud
+     * seed only, leaves the container's network and hostname alone (Docker owns both), moves this boot's seed into
+     * place, drops what earlier boots staged, and runs the local, network and config stages systemd would. Marks the
+     * stage {@code early.done} when it ends, however it ends, for the final stage to wait on.
+     */
+    static String cloudInitEarlyScript(boolean everyBoot, String stage) {
+        String staged = stage.substring(0, stage.lastIndexOf('-') + 1);
+        return """
+                #!/bin/sh
+                stage=STAGE
+                trap 'touch "$stage/early.done"' EXIT
+                for old in STAGED*; do [ "$old" = "$stage" ] || rm -rf "$old"; done
+                has() { command -v "$1" >/dev/null 2>&1; }
+                PACKAGE_LOCK_FUNCTIONS
+                if ! has cloud-init; then packages_lock; fi
+                if ! has cloud-init; then
+                  echo "Installing cloud-init."
+                  if has apt-get; then DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 update -qq >/dev/null 2>&1; DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -y -qq --no-install-recommends cloud-init >/dev/null 2>&1
+                  elif has dnf; then dnf install -y -q cloud-init >/dev/null 2>&1
+                  elif has microdnf; then microdnf install -y cloud-init >/dev/null 2>&1
+                  elif has yum; then yum install -y -q cloud-init >/dev/null 2>&1
+                  elif has apk; then apk add --no-cache cloud-init >/dev/null 2>&1
+                  fi
+                  has cloud-init || { echo "Could not install cloud-init: no supported package manager or no network."; exit 1; }
+                fi
+                packages_unlock
+                mkdir -p /etc/cloud/cloud.cfg.d SEED
+                cat > /etc/cloud/cloud.cfg.d/90_floci.cfg <<'EOF'
+                datasource_list: [NoCloud, None]
+                network:
+                  config: disabled
+                preserve_hostname: true
+                ssh_deletekeys: false
+                locale: false
+                EOF
+                cp "$stage/user-data" "$stage/meta-data" SEED/
+                """.replace("PACKAGE_LOCK_FUNCTIONS", PACKAGE_LOCK_FUNCTIONS).replace("STAGED", quote(staged)).replace("STAGE", quote(stage)).replace("SEED", CLOUD_INIT_SEED)
+                + (everyBoot ? """
+                for sem in config_write_files config_write_files_deferred config_runcmd config_scripts_user; do
+                  rm -f /var/lib/cloud/instances/*/sem/"$sem"
+                done
+                """ : "") + """
+                cloud-init init --local
+                cloud-init init
+                cloud-init modules --mode=config
+                """;
+    }
+
+    /**
+     * The final stage for the boot staged in {@code stage}: waits for the early stages to end, runs the final modules
+     * when cloud-init is there, and exits with {@code cloud-init status}, which is 1 on errors and 2 when degraded.
+     */
+    static String cloudInitFinalScript(String stage) {
+        return """
+                #!/bin/sh
+                stage=STAGE
+                trap 'rm -rf "$stage"' EXIT
+                while [ ! -e "$stage/early.done" ]; do sleep 1; done
+                command -v cloud-init >/dev/null 2>&1 || exit 0
+                cloud-init modules --mode=final
+                cloud-init status
+                """.replace("STAGE", quote(stage));
     }
 
     /**

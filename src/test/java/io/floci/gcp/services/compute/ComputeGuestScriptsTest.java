@@ -16,6 +16,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -26,9 +27,12 @@ import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.mock;
@@ -373,6 +377,190 @@ class ComputeGuestScriptsTest {
         Files.delete(dir.resolve("request"));
         Files.delete(output);
         return out;
+    }
+
+    @Test
+    void theEarlyCloudInitScriptSeedsThisBootDropsEarlierStagesAndRunsTheStagesBeforeFinal() throws Exception {
+        Path dir = Files.createTempDirectory("cloud-init");
+        Path bin = Files.createDirectories(dir.resolve("bin"));
+        Path fake = bin.resolve("cloud-init");
+        Files.writeString(fake, "#!/bin/sh\necho \"[$*]\"\nexit 0\n");
+        fake.toFile().setExecutable(true);
+        Path sem = Files.createDirectories(dir.resolve("lib/instances/7/sem"));
+        for (String name : List.of("config_runcmd", "config_write_files", "config_ssh")) {
+            Files.writeString(sem.resolve(name), "");
+        }
+        Path stage = stage(dir, "b", "#cloud-config\nnew: true\n");
+        Path earlier = stage(dir, "a", "#cloud-config\nold: true\n");
+
+        String out = runScript(dir, ComputeGuestScripts.cloudInitEarlyScript(true, stage.toString()));
+
+        assertEquals("""
+                [init --local]
+                [init]
+                [modules --mode=config]
+                exit 0
+                """, out);
+        assertEquals("#cloud-config\nnew: true\n", Files.readString(dir.resolve("lib/seed/nocloud/user-data")),
+                "only this boot's own staged seed is moved into place");
+        assertFalse(Files.exists(earlier), "what an earlier boot staged is dropped");
+        assertTrue(Files.exists(stage.resolve("early.done")));
+        assertTrue(Files.readString(dir.resolve("etc/cloud.cfg.d/90_floci.cfg")).contains("datasource_list: [NoCloud, None]"));
+        try (var files = Files.list(sem)) {
+            assertEquals(List.of(sem.resolve("config_ssh")), files.toList(),
+                    "write_files and runcmd rerun on every boot; other modules still run once");
+        }
+    }
+
+    @Test
+    void onAPerInstanceImageCloudInitKeepsItsOncePerInstanceRecord() throws Exception {
+        Path dir = Files.createTempDirectory("cloud-init");
+        Path bin = Files.createDirectories(dir.resolve("bin"));
+        Files.writeString(bin.resolve("cloud-init"), "#!/bin/sh\nexit 0\n");
+        bin.resolve("cloud-init").toFile().setExecutable(true);
+        Path runcmd = Files.createDirectories(dir.resolve("lib/instances/7/sem")).resolve("config_runcmd");
+        Files.writeString(runcmd, "");
+
+        assertEquals("exit 0\n", runScript(dir, ComputeGuestScripts.cloudInitEarlyScript(false,
+                stage(dir, "a", "#cloud-config\n").toString())));
+        assertTrue(Files.exists(runcmd));
+    }
+
+    @Test
+    void theFinalCloudInitScriptWaitsForTheEarlyStagesThenExitsWithTheCloudInitStatus() throws Exception {
+        Path dir = Files.createTempDirectory("cloud-init");
+        Path bin = Files.createDirectories(dir.resolve("bin"));
+        Path fake = bin.resolve("cloud-init");
+        Files.writeString(fake, "#!/bin/sh\necho \"[$*]\"\n[ \"$1\" = status ] && exit 2\nexit 0\n");
+        fake.toFile().setExecutable(true);
+        Path stage = stage(dir, "a", "#cloud-config\n");
+        Thread done = new Thread(() -> {
+            try {
+                Thread.sleep(1500);
+                Files.writeString(stage.resolve("early.done"), "");
+            } catch (Exception e) {
+                throw new IllegalStateException(e);
+            }
+        });
+        done.start();
+        long started = System.nanoTime();
+
+        String out = runScript(dir, ComputeGuestScripts.cloudInitFinalScript(stage.toString()));
+
+        done.join();
+        assertTrue(System.nanoTime() - started >= 1_000_000_000L, "waited for the early stages: " + out);
+        assertEquals("""
+                [modules --mode=final]
+                [status]
+                exit 2
+                """, out);
+        assertFalse(Files.exists(stage), "the boot's stage is removed once the final stage ends");
+    }
+
+    /** A boot's staging directory under {@code dir}, holding its user-data. */
+    private static Path stage(Path dir, String boot, String userData) throws Exception {
+        Path stage = Files.createDirectories(dir.resolve("google/floci-cloud-init-" + boot));
+        Files.writeString(stage.resolve("user-data"), userData);
+        Files.writeString(stage.resolve("meta-data"), "instance-id: '7'\n");
+        return stage;
+    }
+
+    /** Runs a cloud-init script against {@code dir} instead of /etc/cloud and /var/lib/cloud, with dir/bin first on PATH. */
+    private static String runScript(Path dir, String script) throws Exception {
+        Path file = dir.resolve("run.sh");
+        Files.writeString(file, script.replace("/etc/cloud", dir.resolve("etc").toString())
+                .replace("/var/lib/cloud", dir.resolve("lib").toString()));
+        ProcessBuilder builder = new ProcessBuilder("sh", "-c", "sh \"$0\"; echo \"exit $?\"", file.toString())
+                .redirectErrorStream(true);
+        builder.environment().put("PATH", dir.resolve("bin") + ":" + System.getenv("PATH"));
+        Process run = builder.start();
+        String out = new String(run.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        assertEquals(0, run.waitFor(), out);
+        return out;
+    }
+
+    @Test
+    void eachBootStagesCloudInitInADirectoryOfItsOwnAndRunsItUnderTheBootGuard() {
+        ComputeGuestScripts.CloudInit seed = new ComputeGuestScripts.CloudInit("7", "vm", "#cloud-config\n", null, false);
+        List<String> early = new ArrayList<>();
+        when(lifecycleManager.execStreaming(eq("c-1"), eq("root"), anyList(), argThat(command -> command.size() == 5
+                && command.get(2).equals(ComputeGuestScripts.BOOT_GUARD) && command.get(4).equals("4242")), any(), any(),
+                any())).thenAnswer(inv -> {
+                    early.add(inv.<List<String>>getArgument(3).get(3));
+                    return print(inv.getArgument(5), "", 0);
+                });
+
+        String first = scripts.cloudInit("vm", "c-1", seed, TIMEOUT, port, () -> true, "4242");
+        String second = scripts.cloudInit("vm", "c-1", seed, TIMEOUT, port, () -> true, "4242");
+
+        assertTrue(first.startsWith(ComputeGuestScripts.CLOUD_INIT_STAGE), first);
+        assertNotEquals(first, second, "two boots never share a staging directory");
+        assertEquals(List.of(first + "/early.sh", second + "/early.sh"), early);
+    }
+
+    @Test
+    void theFinalStageReportsAFailedStatus() {
+        String stage = ComputeGuestScripts.CLOUD_INIT_STAGE + "abc";
+        when(lifecycleManager.execStreaming(eq("c-1"), eq("root"), anyList(), eq(List.of("/bin/sh", "-c",
+                ComputeGuestScripts.BOOT_GUARD, stage + "/final.sh", "4242")), any(), any(), any()))
+                .thenAnswer(inv -> print(inv.getArgument(5), "status: error\n", 1));
+
+        scripts.cloudInitFinal("vm", "c-1", stage, TIMEOUT, port, () -> true, "4242");
+
+        assertEquals(List.of("status: error", "cloud-init exit status 1"), unitMessages(ComputeGuestScripts.CLOUD_INIT));
+    }
+
+    @Test
+    void invalidBase64UserDataIsReportedAndCloudInitDoesNotRun() {
+        ComputeGuestScripts.CloudInit seed = new ComputeGuestScripts.CloudInit("7", "vm", "Q", "base64", false);
+
+        assertNull(scripts.cloudInit("vm", "c-1", seed, TIMEOUT, port, () -> true, "4242"));
+
+        assertTrue(unitMessages(ComputeGuestScripts.CLOUD_INIT).getFirst().startsWith("Could not decode base64 user-data"),
+                port.read(0).contents());
+        verify(lifecycleManager, never()).execStreaming(any(), any(), anyList(), anyList(), any(), any(), any());
+    }
+
+    @Test
+    void userDataIsDecodedOnlyWhenItsEncodingIsBase64AndMetaDataIsQuoted() {
+        assertEquals("#cloud-config\n", new String(ComputeGuestScripts.userData(new ComputeGuestScripts.CloudInit(
+                "7", "vm", "I2Nsb3VkLWNvbmZpZwo=", "base64", false)), StandardCharsets.UTF_8));
+        assertEquals("I2Nsb3Vk", new String(ComputeGuestScripts.userData(new ComputeGuestScripts.CloudInit(
+                "7", "vm", "I2Nsb3Vk", "gzip", false)), StandardCharsets.UTF_8));
+        assertEquals("instance-id: '7'\nlocal-hostname: 'it''s'\n",
+                ComputeGuestScripts.metaData(new ComputeGuestScripts.CloudInit("7", "it's", "", null, false)));
+    }
+
+    /** The serial lines of one unit, without their time, host and unit prefix. */
+    private List<String> unitMessages(String unit) {
+        String prefix = " " + unit + "[1]: ";
+        return port.read(0).contents().lines().filter(line -> line.contains(prefix))
+                .map(line -> line.substring(line.indexOf(prefix) + prefix.length())).toList();
+    }
+
+    @Test
+    @EnabledOnOs(OS.LINUX)
+    void aPackageInstallWaitsForTheOneAlreadyRunning() throws Exception {
+        Path dir = Files.createTempDirectory("packages");
+        String functions = ComputeGuestScripts.PACKAGE_LOCK_FUNCTIONS
+                .replace(ComputeGuestScripts.PACKAGE_LOCK, dir.resolve("lock").toString());
+        Process run = new ProcessBuilder("sh", "-c", "has() { command -v \"$1\" >/dev/null 2>&1; }\n" + functions + "\n"
+                + "( packages_lock; echo first; sleep 1; echo first-done; packages_unlock ) & sleep 0.3\n"
+                + "packages_lock; echo second; packages_unlock; wait").redirectErrorStream(true).start();
+        String out = new String(run.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+
+        assertEquals(0, run.waitFor(), out);
+        assertEquals("first\nfirst-done\nsecond\n", out);
+    }
+
+    @Test
+    void theSshdAndCloudInitInstallsBothTakeThePackageLock() {
+        for (String script : List.of(ComputeGuestScripts.accountsScript(Map.of(), 1),
+                ComputeGuestScripts.cloudInitEarlyScript(false, "/var/lib/google/floci-cloud-init-abc"))) {
+            assertTrue(script.contains("packages_lock() {"), script);
+            assertTrue(script.indexOf("packages_lock;") < script.indexOf("apt-get"), script);
+            assertTrue(script.indexOf("\npackages_unlock\n") > script.lastIndexOf("apt-get"), script);
+        }
     }
 
     @Test

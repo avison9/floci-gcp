@@ -192,6 +192,50 @@ script still running after `FLOCI_GCP_SERVICES_COMPUTE_STARTUP_SCRIPT_TIMEOUT`
 instance is `STOPPING`, for up to `FLOCI_GCP_SERVICES_COMPUTE_SHUTDOWN_SCRIPT_TIMEOUT`
 (90 seconds). Reset is a hard reset and runs none.
 
+### cloud-init
+
+On images that ship cloud-init (Ubuntu and Container-Optimized OS), an instance
+with a `user-data` metadata key runs cloud-init on every boot, around its startup
+scripts as on Compute Engine: the local, network and config stages run before
+them, and the final stage (`packages`, `runcmd`, `#!` scripts) after them and
+after a declared container starts, since `cloud-final.service` waits for
+`multi-user.target`. A startup script therefore cannot rely on what `runcmd`
+sets up. Only the instance's own `user-data` counts, as with cloud-init's GCE data
+source; `user-data-encoding: base64` is decoded. Any format cloud-init accepts
+works: `#cloud-config`, `#!` scripts, MIME multipart, gzip.
+
+```bash
+gcloud compute instances create web --zone us-central1-a \
+  --image-family ubuntu-2404-lts-amd64 --image-project ubuntu-os-cloud \
+  --metadata-from-file user-data=cloud-config.yaml
+```
+
+The container gets cloud-init from its package manager on the first boot that
+needs it, so that boot needs network access. The user-data and meta-data
+(`instance-id` is the instance's id, `local-hostname` its name) are written to the
+NoCloud seed `/var/lib/cloud/seed/nocloud`, because cloud-init's GCE data source
+only runs on Google hardware. The output of every stage and `cloud-init status`
+go to serial port 1 under `cloud-init[1]`.
+
+- Per-instance modules (`runcmd`, `write_files`, `packages`, `#!` scripts) run once
+  per instance and not again after a stop and start or a reset, as the boot disk
+  keeps cloud-init's records. On Container-Optimized OS, `write_files` and `runcmd`
+  run on every boot, as Google documents for that image.
+- Docker owns the container's network and hostname, so cloud-init leaves both alone
+  (`network: {config: disabled}`, `preserve_hostname: true`). Container images
+  ship no locales, so the `locale` module is off unless your cloud-config sets
+  `locale`. Modules that need
+  systemd or a real kernel, such as `ntp` or `growpart`, may fail or do nothing.
+- Each part of cloud-init (the early stages, then the final stage) waits up to
+  `FLOCI_GCP_SERVICES_COMPUTE_STARTUP_SCRIPT_TIMEOUT`, as the startup scripts do.
+  Past it the boot moves on and says so on serial port 1; the final stage still
+  waits for the early stages to finish.
+- The image setting comes from the image the boot disk was created from, and stays
+  with the disk if that image is deleted later.
+- Debian, Rocky Linux and CentOS images do not run it. To run it on another image,
+  add `"cloudInit": "per-instance"` (or `"every-boot"`) to that image's entry in
+  your own image catalog.
+
 ### SSH and published ports
 
 A new instance container publishes port 22 and every TCP port an enabled ingress
