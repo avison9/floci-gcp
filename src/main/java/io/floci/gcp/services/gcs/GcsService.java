@@ -981,9 +981,14 @@ public class GcsService {
             }
             objectDataStore.get(key).ifPresent(oldData -> objectDataStore.put(archiveKey, oldData));
             objectMetaStore.put(archiveKey, archived);
+        } else {
+            // Only an unversioned bucket soft-deletes here. With versioning, "The live version
+            // becomes a noncurrent version and keeps the same generation number"
+            // (https://cloud.google.com/storage/docs/object-versioning), and soft delete applies
+            // when that noncurrent version is deleted, in deleteObjectVersionLocked.
+            softDelete(bucket, objectName, live);
         }
         GcsObjectMeta deletedMeta = live;
-        softDelete(bucket, objectName, live);
         objectMetaStore.delete(key);
         objectDataStore.delete(key);
         if (deletedMeta != null) {
@@ -1300,9 +1305,9 @@ public class GcsService {
                 String key = objectKey(bucket, objectName);
                 // Restoring onto a name that is live again displaces that object, so route it
                 // through the ordinary delete path first: that enforces holds and retention, archives
-                // it when versioning is on, and retains it under the soft delete policy. Writing
-                // straight over it would destroy a live generation, which is the opposite of what
-                // this feature exists to do.
+                // it when versioning is on, and retains it under the soft delete policy otherwise.
+                // Writing straight over it would destroy a live generation, which is the opposite of
+                // what this feature exists to do.
                 if (getLiveObjectMeta(bucket, objectName).isPresent()) {
                     if (requireOverwritePermission != null) {
                         requireOverwritePermission.run();
