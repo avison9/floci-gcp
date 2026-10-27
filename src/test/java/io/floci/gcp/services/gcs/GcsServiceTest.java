@@ -632,6 +632,49 @@ class GcsServiceTest {
     }
 
     @Test
+    void aSoftDeletedObjectPastItsHardDeleteTimeIsHiddenBeforeTheSweep() {
+        StorageBackend<String, GcsObjectMeta> metadata = new InMemoryStorage<>();
+        GcsService expiring = new GcsService(new InMemoryStorage<>(), metadata, new InMemoryStorage<>(),
+                new InMemoryStorage<>(), "test-project");
+        expiring.createBucket("expiring", "p1", BASE_URL, Map.of());
+        String generation = expiring.putObject("expiring", "expired.txt", "text/plain",
+                new byte[]{1}, BASE_URL).getGeneration();
+        expiring.deleteObject("expiring", "expired.txt");
+        assertEquals(1, expiring.listSoftDeletedObjects("expiring", null).size());
+
+        for (String key : List.copyOf(metadata.keys())) {
+            GcsObjectMeta meta = metadata.get(key).orElseThrow();
+            if (meta.getHardDeleteTime() != null) {
+                meta.setHardDeleteTime(Instant.now().minusSeconds(1).toString());
+                metadata.put(key, meta);
+            }
+        }
+
+        assertTrue(expiring.listSoftDeletedObjects("expiring", null).isEmpty());
+        GcpException restore = assertThrows(GcpException.class,
+                () -> expiring.restoreObject("expiring", "expired.txt", generation));
+        assertEquals("NOT_FOUND", restore.getGcpStatus());
+    }
+
+    @Test
+    void anInvalidSoftDeleteRetentionLeavesTheBucketUnchanged() {
+        GcsBucket created = service.createBucket("rejected-patch", "p1", BASE_URL, Map.of());
+        String metageneration = created.getMetageneration();
+
+        GcpException rejected = assertThrows(GcpException.class, () -> service.updateBucket("rejected-patch",
+                Map.of("versioning", Map.of("enabled", true),
+                        "labels", Map.of("env", "test"),
+                        "softDeletePolicy", Map.of("retentionDurationSeconds", "86400"))));
+
+        assertEquals("INVALID_ARGUMENT", rejected.getGcpStatus());
+        GcsBucket stored = service.getBucket("rejected-patch");
+        assertNull(stored.getVersioning());
+        assertNull(stored.getLabels());
+        assertEquals(metageneration, stored.getMetageneration());
+        assertEquals("604800", stored.getSoftDeletePolicy().get("retentionDurationSeconds"));
+    }
+
+    @Test
     void listingByProjectNumberKeepsProjectsWithCollidingHashesApart() {
         assertEquals("project-an".hashCode(), "project-c0".hashCode());
         service.createBucket("an-bucket", "project-an", BASE_URL, Map.of());
