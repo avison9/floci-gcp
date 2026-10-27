@@ -47,8 +47,43 @@ public class GkeOperationService {
             String clusterId,
             OperationType type) {
 
-        return createOperation(project, location, type,
-                "projects/" + project + "/locations/" + location + "/clusters/" + clusterId);
+        return createOperation(project, location, type, clusterTargetLink(project, location, clusterId), "DONE");
+    }
+
+    /**
+     * Creates an operation that stays {@code RUNNING} until {@link #completeOperation} finishes
+     * it, for work that outlives the request (a k3s control plane still starting).
+     */
+    public StoredOperation createRunningOperation(
+            String project,
+            String location,
+            String clusterId,
+            OperationType type) {
+
+        return createOperation(project, location, type, clusterTargetLink(project, location, clusterId), "RUNNING");
+    }
+
+    /**
+     * Moves the named operation to {@code DONE} unless it already is, so a late caller cannot
+     * rewrite an outcome. A non-null {@code error} is reported both as {@code error} and as the
+     * deprecated {@code statusMessage}, which is the field terraform-provider-google's operation
+     * waiter reads.
+     */
+    public synchronized void completeOperation(String operationName, Map<String, Object> error) {
+        if (operationName == null) {
+            return;
+        }
+        operationStore.get(operationName)
+                .filter(op -> !"DONE".equals(op.getStatus()))
+                .ifPresent(op -> {
+                    op.setStatus("DONE");
+                    op.setEndTime(Instant.now().toString());
+                    if (error != null) {
+                        op.setError(error);
+                        op.setStatusMessage(String.valueOf(error.get("message")));
+                    }
+                    operationStore.put(op.getName(), op);
+                });
     }
 
     /** For node-pool-scoped mutations, whose target is the pool, not the cluster. */
@@ -60,11 +95,15 @@ public class GkeOperationService {
             OperationType type) {
 
         return createOperation(project, location, type,
-                "projects/" + project + "/locations/" + location
-                        + "/clusters/" + clusterId + "/nodePools/" + nodePoolId);
+                clusterTargetLink(project, location, clusterId) + "/nodePools/" + nodePoolId, "DONE");
     }
 
-    private StoredOperation createOperation(String project, String location, OperationType type, String targetLink) {
+    private static String clusterTargetLink(String project, String location, String clusterId) {
+        return "projects/" + project + "/locations/" + location + "/clusters/" + clusterId;
+    }
+
+    private StoredOperation createOperation(String project, String location, OperationType type, String targetLink,
+                                            String status) {
         String operationId = "operation-" + UUID.randomUUID();
         String now = Instant.now().toString();
 
@@ -75,12 +114,12 @@ public class GkeOperationService {
         StoredOperation op = new StoredOperation(
                 operationId,
                 type,
-                "DONE",
+                status,
                 location,
                 targetLink,
                 selfLink,
                 now,
-                now);
+                "DONE".equals(status) ? now : null);
 
         operationStore.put(operationId, op);
 

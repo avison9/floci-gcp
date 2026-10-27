@@ -14,6 +14,7 @@ import io.floci.gcp.services.gke.model.StoredNodePool;
 import io.floci.gcp.services.gke.operations.GkeOperationService;
 import io.floci.gcp.services.gke.operations.OperationType;
 import io.floci.gcp.services.gke.operations.StoredOperation;
+import io.grpc.Status;
 import io.quarkus.runtime.StartupEvent;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
@@ -22,14 +23,19 @@ import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.time.Duration;
 import java.time.Instant;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -50,6 +56,9 @@ public class GkeService {
     private static final Pattern EXPLICIT_VERSION = Pattern.compile("^\\d+\\.\\d+\\.\\d+-gke\\.\\d+$");
     private static final Pattern VALID_NODE_POOL_NAME =
             Pattern.compile("^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$");
+    /** How long a k3s control plane may stay {@code PROVISIONING} before its create fails. It
+     * counts from {@code createTime}, so it also covers pulling the image on a first start. */
+    static final Duration STARTUP_TIMEOUT = Duration.ofMinutes(10);
 
     /** Cluster-level fields with dedicated typed storage — everything else in a create/update
      * body is stored verbatim under {@link StoredCluster#getExtraConfig()}. */
@@ -65,6 +74,12 @@ public class GkeService {
     private final GkeOperationService operationService;
     private final ServiceRegistry serviceRegistry;
     private final LocationCatalog locations;
+    /** Serializes the writes that settle a cluster's lifecycle (storing a new cluster, deleting
+     * one, and the readiness poller's outcome) so a pass that read an older record never writes
+     * over a deleted or recreated one. Never held across Docker calls. */
+    private final Object lifecycleLock = new Object();
+    /** Create operations whose cluster has an unreadable {@code createTime}, already logged once. */
+    private final Set<String> unreadableCreateTimes = ConcurrentHashMap.newKeySet();
     private final ScheduledExecutorService poller = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "gke-readiness-poller");
         t.setDaemon(true);
@@ -280,24 +295,45 @@ public class GkeService {
         cluster.setEtag(newFingerprint());
         cluster.setExtraConfig(extraFields(clusterMap, TYPED_CLUSTER_FIELDS));
 
+        StoredOperation op;
+        String startFailure = null;
         if (mock()) {
             cluster.setStatus("RUNNING");
             cluster.setEndpoint("127.0.0.1");
+            op = operationService.createOperation(project, location, name, OperationType.CREATE_CLUSTER);
+            cluster.setCreateOperation(op.getName());
         } else {
             cluster.setStatus("PROVISIONING");
+            // CREATE_CLUSTER: "The cluster should be assumed to be unusable until the operation
+            // finishes" (cluster_service.proto), so the operation stays RUNNING until the readiness
+            // poller has the endpoint and CA in place. It exists before the cluster is stored so
+            // the poller can never finish the cluster ahead of it.
+            op = operationService.createRunningOperation(project, location, name, OperationType.CREATE_CLUSTER);
+            cluster.setCreateOperation(op.getName());
             try {
                 clusterManager.startCluster(cluster);
             } catch (Exception e) {
                 LOG.errorv("Failed to start k3s container for cluster {0}: {1}", name, e.getMessage());
                 cluster.setStatus("ERROR");
+                startFailure = "Failed to start the control plane for cluster " + name + ": " + e.getMessage();
             }
         }
 
-        clusterStore.put(key, cluster);
+        synchronized (lifecycleLock) {
+            clusterStore.put(key, cluster);
+        }
         createInitialNodePools(project, location, name, clusterMap);
         refreshCurrentNodeVersion(project, location, name, cluster);
 
-        return operationService.createOperation(project, location, name, OperationType.CREATE_CLUSTER);
+        if (startFailure == null) {
+            return op;
+        }
+        operationService.completeOperation(op.getName(), operationError(Status.Code.INTERNAL, startFailure));
+        return operationService.getOperation(project, op.getName());
+    }
+
+    private static Map<String, Object> operationError(Status.Code code, String message) {
+        return Map.of("code", code.value(), "message", message);
     }
 
     /** Returns a detached copy carrying the cluster's node pools. The store hands back the live
@@ -334,7 +370,11 @@ public class GkeService {
         for (StoredNodePool pool : listNodePools(project, location, clusterId)) {
             nodePoolStore.delete(nodePoolKey(project, location, clusterId, pool.getName()));
         }
-        clusterStore.delete(key);
+        synchronized (lifecycleLock) {
+            clusterStore.delete(key);
+            operationService.completeOperation(cluster.getCreateOperation(), operationError(Status.Code.CANCELLED,
+                    "Cluster " + clusterId + " was deleted before it finished creating"));
+        }
         return operationService.createOperation(project, location, clusterId, OperationType.DELETE_CLUSTER);
     }
 
@@ -997,20 +1037,91 @@ public class GkeService {
         cluster.setExtraConfig(extra);
     }
 
-    private void pollReadiness() {
-        try {
-            for (StoredCluster cluster : clusterStore.scan(k -> true)) {
-                if ("PROVISIONING".equals(cluster.getStatus()) && clusterManager.isReady(cluster)) {
-                    clusterManager.finalizeCluster(cluster);
-                    cluster.setStatus("RUNNING");
-                    clusterStore.put(clusterKey(cluster.getProject(), cluster.getLocation(), cluster.getName()),
-                            cluster);
-                    LOG.infov("GKE cluster {0} is now RUNNING", cluster.getName());
+    void pollReadiness() {
+        for (StoredCluster cluster : clusterStore.scan(k -> true)) {
+            if ("PROVISIONING".equals(cluster.getStatus())) {
+                try {
+                    pollCluster(cluster);
+                } catch (Exception e) {
+                    LOG.errorv(e, "Error polling readiness of GKE cluster {0}", cluster.getName());
                 }
             }
-        } catch (Exception e) {
-            LOG.error("Error in GKE readiness poller", e);
         }
+    }
+
+    /**
+     * One readiness pass. The Docker and HTTP checks run on a copy without the lock, and only the
+     * outcome is written, under {@link #lifecycleLock}, to the record that is current by then.
+     */
+    private void pollCluster(StoredCluster seen) {
+        StoredCluster probe = new StoredCluster(seen);
+        if (clusterManager.isReady(probe)) {
+            clusterManager.finalizeCluster(probe);
+            if (probe.getCaCertificate() != null && !probe.getCaCertificate().isBlank()) {
+                settle(seen, probe.getCaCertificate(), null);
+                return;
+            }
+        } else if (clusterManager.isControlPlaneStopped(probe)) {
+            settle(seen, null, "The control plane of cluster " + seen.getName() + " stopped before it became ready");
+            return;
+        }
+        if (startupExpired(seen)) {
+            settle(seen, null, "The control plane of cluster " + seen.getName() + " did not become ready within "
+                    + STARTUP_TIMEOUT.toMinutes() + " minutes");
+        }
+    }
+
+    /** Moves a still-provisioning cluster to {@code RUNNING} (with its CA) or, given a failure, to
+     * {@code ERROR}, and finishes the create operation recorded on it. A pass whose cluster was
+     * deleted, recreated or settled meanwhile writes nothing. */
+    private void settle(StoredCluster seen, String caCertificate, String failure) {
+        String key = clusterKey(seen.getProject(), seen.getLocation(), seen.getName());
+        synchronized (lifecycleLock) {
+            Optional<StoredCluster> current = clusterStore.get(key);
+            if (current.isEmpty()
+                    || !Objects.equals(current.get().getCreateOperation(), seen.getCreateOperation())
+                    || !"PROVISIONING".equals(current.get().getStatus())) {
+                return;
+            }
+            StoredCluster cluster = current.get();
+            if (failure == null) {
+                cluster.setCaCertificate(caCertificate);
+                cluster.setStatus("RUNNING");
+            } else {
+                cluster.setStatus("ERROR");
+                cluster.setStatusMessage(failure);
+            }
+            clusterStore.put(key, cluster);
+            operationService.completeOperation(cluster.getCreateOperation(),
+                    failure == null ? null : operationError(Status.Code.INTERNAL, failure));
+        }
+        if (failure == null) {
+            LOG.infov("GKE cluster {0} is now RUNNING", seen.getName());
+        } else {
+            LOG.warnv("GKE cluster {0} failed to start: {1}", seen.getName(), failure);
+        }
+    }
+
+    /** A cluster without a readable {@code createTime} is never expired: the emulator always
+     * writes an RFC3339 instant, so only a hand-edited store gets here, and failing a create that
+     * may still be starting is worse than waiting. The stopped-container check still applies. */
+    boolean startupExpired(StoredCluster cluster) {
+        Instant created = null;
+        if (cluster.getCreateTime() != null) {
+            try {
+                created = Instant.parse(cluster.getCreateTime());
+            } catch (DateTimeParseException e) {
+                // Logged below, once per cluster.
+            }
+        }
+        if (created == null) {
+            if (unreadableCreateTimes.add(cluster.getCreateOperation() + "|" + cluster.getName())) {
+                LOG.warnv("Cluster {0} has an unreadable createTime \"{1}\"; its startup deadline is not enforced",
+                        cluster.getName(), cluster.getCreateTime());
+            }
+            return false;
+        }
+        return created.plus(STARTUP_TIMEOUT).isBefore(Instant.now());
     }
 
     private boolean mock() {
