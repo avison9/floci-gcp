@@ -123,6 +123,7 @@ final class SqlDialectTranslator {
     private int generatedInitcapName;
     private int generatedAnyValueName;
     private boolean needsUnicodeCaseFold;
+    private boolean queryResult;
 
     private List<Token> tokens;
     /** The {@code UNNEST} token of an unaliased MERGE source, rendered with {@link #mergeUnnestName} as its name. */
@@ -2128,6 +2129,7 @@ final class SqlDialectTranslator {
             throw invalidQuery("Statement type " + statement + " is not supported by the floci BigQuery"
                     + " emulator yet; only SELECT queries run on the SQL engine.");
         }
+        queryResult = true;
         collectCteNames();
         rewriteTypedArrayLiterals();
         rewriteArraySubscripts();
@@ -2337,6 +2339,15 @@ final class SqlDialectTranslator {
             if (items.isEmpty()) {
                 continue;
             }
+            if (queryResult && isOutermostQuerySelect(select)) {
+                nameAnonymousStructFields(items);
+                int end = struct + 1;
+                if (end < tokens.size() && tokens.get(end).kind == Kind.SPACE) {
+                    end++;
+                }
+                tokens.subList(marker, end).clear();
+                continue;
+            }
             if (structProjectionHasAliasClause(listEnd, parenthesisDepth(select))) {
                 nameAnonymousStructFields(items);
                 listEnd = selectStructListEnd(listStart);
@@ -2405,6 +2416,43 @@ final class SqlDialectTranslator {
             replaceSelectHead(select, modifier, replacement.toString());
             select = tokens.size();
         }
+    }
+
+    /**
+     * A query returns the struct of its outermost {@code SELECT AS STRUCT}, in every branch of a set
+     * operation, as one column per field, so that SELECT runs as a plain one. Nested ones (subqueries,
+     * CTEs, {@code ARRAY(...)}) and the source of an INSERT stay one struct value.
+     */
+    private boolean isOutermostQuerySelect(int select) {
+        for (int open = enclosingParenthesis(select); open >= 0; open = enclosingParenthesis(open)) {
+            int before = previousSignificant(open - 1);
+            if (before >= 0 && !tokens.get(before).isPunct("(") && !opensSetOperationBranch(before)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** {@code UNION ALL (}, {@code INTERSECT DISTINCT (} and the like start a parenthesized branch. */
+    private boolean opensSetOperationBranch(int keyword) {
+        Token token = tokens.get(keyword);
+        if (token.isKeyword("ALL") || token.isKeyword("DISTINCT")) {
+            int operator = previousSignificant(keyword - 1);
+            return operator >= 0 && opensSetOperationBranch(operator);
+        }
+        return token.isKeyword("UNION") || token.isKeyword("INTERSECT") || token.isKeyword("EXCEPT");
+    }
+
+    private int enclosingParenthesis(int index) {
+        int depth = 0;
+        for (int k = index - 1; k >= 0; k--) {
+            if (tokens.get(k).isPunct(")")) {
+                depth++;
+            } else if (tokens.get(k).isPunct("(") && depth-- == 0) {
+                return k;
+            }
+        }
+        return -1;
     }
 
     /** Clauses that can resolve names assigned by the SELECT list must stay inside the struct wrapper. */
