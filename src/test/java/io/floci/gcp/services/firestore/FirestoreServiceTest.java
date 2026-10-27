@@ -11,6 +11,7 @@ import com.google.firestore.v1.StructuredQuery;
 import com.google.firestore.v1.Value;
 import com.google.firestore.v1.Write;
 import com.google.protobuf.ByteString;
+import com.google.protobuf.Int32Value;
 import com.google.protobuf.NullValue;
 import com.google.protobuf.Timestamp;
 import com.google.type.LatLng;
@@ -1035,6 +1036,231 @@ class FirestoreServiceTest {
     }
 
     @Test
+    void kindlessAllDescendantsQueryReturnsEveryDescendantOfTheParent() {
+        writeCollectionGroupFixture();
+
+        StructuredQuery query = StructuredQuery.newBuilder()
+                .addFrom(StructuredQuery.CollectionSelector.newBuilder().setAllDescendants(true))
+                .build();
+
+        List<String> names = service.runQuery(DB + "/documents/p/1", query)
+                .stream().map(StoredDocument::getName).toList();
+
+        assertEquals(List.of(
+                DB + "/documents/p/1/sub/s1",
+                DB + "/documents/p/1/sub/s1/deeper/d1",
+                DB + "/documents/p/1/sub/s1/deeper/d1/sub/s3"), names);
+    }
+
+    @Test
+    void unorderedQueryReturnsDocumentsByName() {
+        service.applyWrite(topLevelValueDocument("c", "v", intValue(1)), Instant.now());
+        service.applyWrite(topLevelValueDocument("a", "v", intValue(1)), Instant.now());
+        service.applyWrite(topLevelValueDocument("b", "v", intValue(1)), Instant.now());
+
+        StructuredQuery query = StructuredQuery.newBuilder()
+                .addFrom(StructuredQuery.CollectionSelector.newBuilder().setCollectionId("customers"))
+                .build();
+
+        assertEquals(List.of("a", "b", "c"), ids(service.runQuery(DB + "/documents", query)));
+    }
+
+    @Test
+    void tiesOnTheOrderedFieldBreakByNameInTheLastDirection() {
+        service.applyWrite(topLevelValueDocument("b", "v", intValue(1)), Instant.now());
+        service.applyWrite(topLevelValueDocument("c", "v", intValue(2)), Instant.now());
+        service.applyWrite(topLevelValueDocument("a", "v", intValue(1)), Instant.now());
+        service.applyWrite(topLevelValueDocument("d", "v", intValue(2)), Instant.now());
+
+        assertEquals(List.of("a", "b", "c", "d"),
+                ids(runOrder("v", StructuredQuery.Direction.ASCENDING, null)));
+        assertEquals(List.of("d", "c", "b", "a"),
+                ids(runOrder("v", StructuredQuery.Direction.DESCENDING, null)));
+    }
+
+    @Test
+    void cursorPastTheOrderedFieldUsesTheImplicitNameOrder() {
+        service.applyWrite(topLevelValueDocument("a", "v", intValue(1)), Instant.now());
+        service.applyWrite(topLevelValueDocument("b", "v", intValue(1)), Instant.now());
+        service.applyWrite(topLevelValueDocument("c", "v", intValue(1)), Instant.now());
+
+        Cursor startAfterA = Cursor.newBuilder()
+                .addValues(intValue(1))
+                .addValues(Value.newBuilder().setReferenceValue(DB + "/documents/customers/a"))
+                .setBefore(false)
+                .build();
+
+        assertEquals(List.of("b", "c"), ids(runOrder("v", StructuredQuery.Direction.ASCENDING, startAfterA)));
+    }
+
+    @Test
+    void nameCursorWithoutOrderByPositionsByName() {
+        service.applyWrite(topLevelValueDocument("a", "v", intValue(1)), Instant.now());
+        service.applyWrite(topLevelValueDocument("b", "v", intValue(1)), Instant.now());
+        service.applyWrite(topLevelValueDocument("c", "v", intValue(1)), Instant.now());
+
+        StructuredQuery query = StructuredQuery.newBuilder()
+                .addFrom(StructuredQuery.CollectionSelector.newBuilder().setCollectionId("customers"))
+                .setStartAt(Cursor.newBuilder()
+                        .addValues(Value.newBuilder().setReferenceValue(DB + "/documents/customers/b"))
+                        .setBefore(true))
+                .build();
+
+        assertEquals(List.of("b", "c"), ids(service.runQuery(DB + "/documents", query)));
+    }
+
+    @Test
+    void inequalityFilterWithoutOrderBySortsByTheFilteredField() {
+        service.applyWrite(topLevelValueDocument("a", "v", intValue(5)), Instant.now());
+        service.applyWrite(topLevelValueDocument("b", "v", intValue(2)), Instant.now());
+        service.applyWrite(topLevelValueDocument("c", "v", intValue(3)), Instant.now());
+        service.applyWrite(topLevelValueDocument("d", "v", intValue(1)), Instant.now());
+
+        assertEquals(List.of("b", "c", "a"), ids(runTopLevelFilter("v",
+                StructuredQuery.FieldFilter.Operator.GREATER_THAN, intValue(1))));
+    }
+
+    @Test
+    void isNotNullFilterWithoutOrderBySortsByTheFilteredField() {
+        service.applyWrite(topLevelValueDocument("a", "v", intValue(5)), Instant.now());
+        service.applyWrite(topLevelValueDocument("b", "v", intValue(2)), Instant.now());
+        service.applyWrite(topLevelValueDocument("c", "v", Value.newBuilder()
+                .setNullValue(NullValue.NULL_VALUE).build()), Instant.now());
+        StructuredQuery query = StructuredQuery.newBuilder()
+                .addFrom(StructuredQuery.CollectionSelector.newBuilder().setCollectionId("customers").build())
+                .setWhere(StructuredQuery.Filter.newBuilder()
+                        .setUnaryFilter(StructuredQuery.UnaryFilter.newBuilder()
+                                .setField(StructuredQuery.FieldReference.newBuilder().setFieldPath("v"))
+                                .setOp(StructuredQuery.UnaryFilter.Operator.IS_NOT_NULL)))
+                .build();
+
+        assertEquals(List.of("b", "a"), ids(service.runQuery(DB + "/documents", query)));
+    }
+
+    @Test
+    void implicitInequalityOrderLeavesOutDocumentsWithoutTheField() {
+        service.applyWrite(fieldsDocument("d1", "a", intValue(2)), Instant.now());
+        service.applyWrite(fieldsDocument("d2", "b", boolValue(true)), Instant.now());
+        service.applyWrite(fieldsDocument("d3", "a", intValue(0), "b", boolValue(true)), Instant.now());
+        service.applyWrite(fieldsDocument("d4", "a", intValue(5), "b", boolValue(false)), Instant.now());
+        StructuredQuery.Builder query = StructuredQuery.newBuilder()
+                .addFrom(StructuredQuery.CollectionSelector.newBuilder().setCollectionId("customers"))
+                .setWhere(compositeFilter(StructuredQuery.CompositeFilter.Operator.OR,
+                        fieldFilter("a", StructuredQuery.FieldFilter.Operator.GREATER_THAN, intValue(1)),
+                        fieldFilter("b", StructuredQuery.FieldFilter.Operator.EQUAL, boolValue(true))));
+
+        assertEquals(List.of("d3", "d1", "d4"), ids(service.runQuery(DB + "/documents", query.build())));
+        assertEquals(List.of("d3", "d1"), ids(service.runQuery(DB + "/documents",
+                query.setLimit(Int32Value.of(2)).build())));
+    }
+
+    @Test
+    void notEqualFilterWithoutOrderBySortsByTheFilteredField() {
+        service.applyWrite(topLevelValueDocument("e1", "k", intValue(3)), Instant.now());
+        service.applyWrite(topLevelValueDocument("e2", "k", intValue(1)), Instant.now());
+        service.applyWrite(topLevelValueDocument("e3", "k", intValue(2)), Instant.now());
+
+        assertEquals(List.of("e2", "e1"), ids(runTopLevelFilter("k",
+                StructuredQuery.FieldFilter.Operator.NOT_EQUAL, intValue(2))));
+    }
+
+    @Test
+    void twoInequalityFieldsAreOrderedByFieldPath() {
+        service.applyWrite(fieldsDocument("x", "a", intValue(2), "b", intValue(1)), Instant.now());
+        service.applyWrite(fieldsDocument("y", "a", intValue(1), "b", intValue(2)), Instant.now());
+        service.applyWrite(fieldsDocument("z", "a", intValue(1), "b", intValue(1)), Instant.now());
+        StructuredQuery query = StructuredQuery.newBuilder()
+                .addFrom(StructuredQuery.CollectionSelector.newBuilder().setCollectionId("customers"))
+                .setWhere(compositeFilter(StructuredQuery.CompositeFilter.Operator.AND,
+                        fieldFilter("b", StructuredQuery.FieldFilter.Operator.GREATER_THAN, intValue(0)),
+                        fieldFilter("a", StructuredQuery.FieldFilter.Operator.GREATER_THAN, intValue(0))))
+                .build();
+
+        assertEquals(List.of("z", "y", "x"), ids(service.runQuery(DB + "/documents", query)));
+    }
+
+    @Test
+    void quotedExplicitOrderIsNotRepeatedForTheInequalityField() {
+        service.applyWrite(topLevelValueDocument("p", "age", intValue(30)), Instant.now());
+        service.applyWrite(topLevelValueDocument("q", "age", intValue(30)), Instant.now());
+        service.applyWrite(topLevelValueDocument("r", "age", intValue(40)), Instant.now());
+        StructuredQuery query = StructuredQuery.newBuilder()
+                .addFrom(StructuredQuery.CollectionSelector.newBuilder().setCollectionId("customers"))
+                .setWhere(fieldFilter("age", StructuredQuery.FieldFilter.Operator.GREATER_THAN, intValue(1)))
+                .addOrderBy(StructuredQuery.Order.newBuilder()
+                        .setField(StructuredQuery.FieldReference.newBuilder().setFieldPath("`age`"))
+                        .setDirection(StructuredQuery.Direction.ASCENDING))
+                .setStartAt(Cursor.newBuilder()
+                        .addValues(intValue(30))
+                        .addValues(Value.newBuilder().setReferenceValue(DB + "/documents/customers/p"))
+                        .setBefore(false))
+                .build();
+
+        assertEquals(List.of("q", "r"), ids(service.runQuery(DB + "/documents", query)));
+    }
+
+    @Test
+    void orderByReturnsOnlyDocumentsThatHaveTheOrderedField() {
+        service.applyWrite(topLevelValueDocument("young", "age", intValue(20)), Instant.now());
+        service.applyWrite(topLevelValueDocument("old", "age", intValue(70)), Instant.now());
+        service.applyWrite(topLevelValueDocument("unknown", "name", Value.newBuilder()
+                .setStringValue("x").build()), Instant.now());
+        service.applyWrite(topLevelValueDocument("nulled", "age", Value.newBuilder()
+                .setNullValue(NullValue.NULL_VALUE).build()), Instant.now());
+
+        assertEquals(List.of("nulled", "young", "old"),
+                ids(runOrder("age", StructuredQuery.Direction.ASCENDING, null)));
+        assertEquals(List.of("old", "young", "nulled"),
+                ids(runOrder("age", StructuredQuery.Direction.DESCENDING, null)));
+    }
+
+    @Test
+    void listDocumentsDefaultsToNameOrderAndHonoursOrderBy() {
+        service.applyWrite(topLevelValueDocument("b", "age", intValue(30)), Instant.now());
+        service.applyWrite(topLevelValueDocument("c", "age", intValue(10)), Instant.now());
+        service.applyWrite(topLevelValueDocument("a", "age", intValue(20)), Instant.now());
+        service.applyWrite(topLevelValueDocument("d", "name", Value.newBuilder()
+                .setStringValue("x").build()), Instant.now());
+
+        assertEquals(List.of("a", "b", "c", "d"),
+                ids(service.listDocuments(DB + "/documents", "customers", "")));
+        assertEquals(List.of("b", "a", "c"),
+                ids(service.listDocuments(DB + "/documents", "customers", "age desc")));
+        assertEquals(List.of("d", "c", "b", "a"),
+                ids(service.listDocuments(DB + "/documents", "customers", "__name__ DESC")));
+    }
+
+    @Test
+    void listDocumentsOrdersByABacktickedFieldPath() {
+        service.applyWrite(topLevelValueDocument("a", "x y", intValue(1)), Instant.now());
+        service.applyWrite(topLevelValueDocument("b", "x y", intValue(3)), Instant.now());
+        service.applyWrite(topLevelValueDocument("c", "x y", intValue(2)), Instant.now());
+
+        assertEquals(List.of("b", "c", "a"),
+                ids(service.listDocuments(DB + "/documents", "customers", "`x y` desc")));
+    }
+
+    @Test
+    void listDocumentsWithoutCollectionIdListsDirectChildrenOfEveryCollection() {
+        writeCollectionGroupFixture();
+
+        List<String> names = service.listDocuments(DB + "/documents/p/2", "", "")
+                .stream().map(StoredDocument::getName).toList();
+
+        assertEquals(List.of(
+                DB + "/documents/p/2/other/o1",
+                DB + "/documents/p/2/sub/s2",
+                DB + "/documents/p/2/subway/w1"), names);
+    }
+
+    @Test
+    void listDocumentsRejectsMalformedOrderBy() {
+        GcpException e = assertThrows(GcpException.class,
+                () -> service.listDocuments(DB + "/documents", "customers", "age sideways"));
+        assertEquals(Status.Code.INVALID_ARGUMENT, e.getGrpcCode());
+    }
+
+    @Test
     void beginTransactionReturnsByteArray() {
         byte[] txn = service.beginTransaction();
         assertNotNull(txn);
@@ -1421,6 +1647,37 @@ class FirestoreServiceTest {
                 .putFields("a", intValue(1))
                 .putFields("keep", Value.newBuilder().setStringValue("k").build())
                 .putFields("m", mapOf("x", intValue(1), "y", intValue(2)))
+                .build();
+    }
+
+    private static Value boolValue(boolean value) {
+        return Value.newBuilder().setBooleanValue(value).build();
+    }
+
+    private Write fieldsDocument(String id, Object... fieldsAndValues) {
+        Document.Builder doc = Document.newBuilder().setName(DB + "/documents/customers/" + id);
+        for (int i = 0; i < fieldsAndValues.length; i += 2) {
+            doc.putFields((String) fieldsAndValues[i], (Value) fieldsAndValues[i + 1]);
+        }
+        return Write.newBuilder().setUpdate(doc).build();
+    }
+
+    private static StructuredQuery.Filter fieldFilter(String fieldPath,
+            StructuredQuery.FieldFilter.Operator operator, Value value) {
+        return StructuredQuery.Filter.newBuilder()
+                .setFieldFilter(StructuredQuery.FieldFilter.newBuilder()
+                        .setField(StructuredQuery.FieldReference.newBuilder().setFieldPath(fieldPath))
+                        .setOp(operator)
+                        .setValue(value))
+                .build();
+    }
+
+    private static StructuredQuery.Filter compositeFilter(StructuredQuery.CompositeFilter.Operator operator,
+            StructuredQuery.Filter... filters) {
+        return StructuredQuery.Filter.newBuilder()
+                .setCompositeFilter(StructuredQuery.CompositeFilter.newBuilder()
+                        .setOp(operator)
+                        .addAllFilters(List.of(filters)))
                 .build();
     }
 
