@@ -181,7 +181,8 @@ registration.remove();
 - `RunAggregationQuery` (COUNT with `up_to`, SUM, AVG)
 - `PartitionQuery`
 - `Write` (streaming)
-- `Listen` (real-time change streams)
+- `Listen` (real-time change streams: query and document targets, several per
+  stream, `remove_target`)
 - `ListCollectionIds`
 
 ## Deviations from real Firestore
@@ -205,3 +206,16 @@ registration.remove();
 - Transaction state is held in memory; transactions do not survive an emulator
   restart. A commit against an unknown transaction id is applied without conflict
   validation.
+- `Listen` keeps no change history: a target added with a `resume_token` or
+  `read_time` is sent a `RESET` and its full current state, as Google's Firestore
+  emulator does, rather than only the changes since that point. Resume tokens are
+  opaque and only round-trip.
+- `Listen` ignores `once` and `expected_count`, never sends an `ExistenceFilter`,
+  and sends no periodic `NO_CHANGE` heartbeats: a snapshot follows only a write
+  that changes a target's results.
+- `Listen` answers a duplicate or negative `target_id`, or a target with neither a
+  query nor documents, with `INVALID_ARGUMENT` and ends the stream. Google's
+  emulator also ends the stream; the status production returns was not verified.
+- Clearing all emulator state through the floci reset endpoint does not notify
+  open `Listen` streams; the next write in a target's scope reports the documents
+  that disappeared.

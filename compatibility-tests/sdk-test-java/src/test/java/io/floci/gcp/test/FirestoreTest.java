@@ -7,6 +7,7 @@ import com.google.cloud.firestore.DocumentSnapshot;
 import com.google.cloud.firestore.FieldValue;
 import com.google.cloud.firestore.Firestore;
 import com.google.cloud.firestore.GeoPoint;
+import com.google.cloud.firestore.ListenerRegistration;
 import com.google.cloud.firestore.Precondition;
 import com.google.cloud.firestore.Query;
 import com.google.cloud.firestore.QueryDocumentSnapshot;
@@ -23,8 +24,12 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -343,6 +348,56 @@ class FirestoreTest {
             for (String id : ids) {
                 firestore.collection(collection).document(id).delete().get();
             }
+        }
+    }
+
+    /**
+     * Firestore.Listen: the SDK raises a snapshot only on a NO_CHANGE with no target ids and a
+     * read_time once its target is CURRENT, then on every later consistent snapshot. Covers the
+     * initial snapshot, a document entering the query, one leaving it, and a delete, for a query
+     * listener and a document listener.
+     */
+    @Test
+    @Order(14)
+    void snapshotListenersSeeTheInitialStateAndLaterWrites() throws Exception {
+        String collection = TestFixtures.uniqueName("listen");
+        firestore.collection(collection).document("a").set(Map.of("n", 1L)).get();
+        BlockingQueue<String> queryEvents = new LinkedBlockingQueue<>();
+        BlockingQueue<String> documentEvents = new LinkedBlockingQueue<>();
+
+        ListenerRegistration query = firestore.collection(collection).whereLessThan("n", 3L)
+                .addSnapshotListener((snapshot, error) -> {
+                    if (error != null) {
+                        queryEvents.add("error " + error.getMessage());
+                        return;
+                    }
+                    queryEvents.add(snapshot.getDocumentChanges().stream()
+                            .map(change -> change.getType() + ":" + change.getDocument().getId())
+                            .sorted()
+                            .collect(Collectors.joining(",")));
+                });
+        ListenerRegistration document = firestore.collection(collection).document("b")
+                .addSnapshotListener((snapshot, error) -> documentEvents.add(error != null
+                        ? "error " + error.getMessage()
+                        : snapshot.exists() ? "exists n=" + snapshot.getLong("n") : "missing"));
+        try {
+            assertThat(queryEvents.poll(10, TimeUnit.SECONDS)).isEqualTo("ADDED:a");
+            assertThat(documentEvents.poll(10, TimeUnit.SECONDS)).isEqualTo("missing");
+
+            firestore.collection(collection).document("b").set(Map.of("n", 2L)).get();
+            assertThat(queryEvents.poll(10, TimeUnit.SECONDS)).isEqualTo("ADDED:b");
+            assertThat(documentEvents.poll(10, TimeUnit.SECONDS)).isEqualTo("exists n=2");
+
+            firestore.collection(collection).document("a").set(Map.of("n", 10L)).get();
+            assertThat(queryEvents.poll(10, TimeUnit.SECONDS)).isEqualTo("REMOVED:a");
+
+            firestore.collection(collection).document("b").delete().get();
+            assertThat(queryEvents.poll(10, TimeUnit.SECONDS)).isEqualTo("REMOVED:b");
+            assertThat(documentEvents.poll(10, TimeUnit.SECONDS)).isEqualTo("missing");
+        } finally {
+            query.remove();
+            document.remove();
+            firestore.collection(collection).document("a").delete().get();
         }
     }
 }

@@ -8,6 +8,7 @@ import com.google.firestore.v1.DocumentMask;
 import com.google.firestore.v1.Precondition;
 import com.google.firestore.v1.StructuredAggregationQuery;
 import com.google.firestore.v1.StructuredQuery;
+import com.google.firestore.v1.Target;
 import com.google.firestore.v1.Value;
 import com.google.firestore.v1.Write;
 import com.google.protobuf.NullValue;
@@ -38,10 +39,12 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalInt;
+import java.util.Set;
 import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -95,7 +98,9 @@ public class FirestoreService {
         synchronized (writeLock) {
             validateFieldPaths(write);
             checkPrecondition(write);
-            return applyWriteUnchecked(write, commitTime);
+            WriteCommitResult result = applyWriteUnchecked(write, commitTime);
+            publishToListeners(List.of(write));
+            return result;
         }
     }
 
@@ -115,6 +120,7 @@ public class FirestoreService {
                 results.add(applyWriteUnchecked(write, commitTime));
             }
             discardTransaction(transactionId);
+            publishToListeners(writes);
             return results;
         }
     }
@@ -340,7 +346,7 @@ public class FirestoreService {
         return applyLimitAndOffset(results, query);
     }
 
-    private static Predicate<String> inCollection(String parent,
+    static Predicate<String> inCollection(String parent,
             StructuredQuery.CollectionSelector from) {
         String collectionId = from.getCollectionId();
         if (!from.getAllDescendants()) {
@@ -661,6 +667,84 @@ public class FirestoreService {
     /** Transaction ids are opaque bytes from the client and need not be valid UTF-8. */
     private static String toTransactionKey(byte[] transactionId) {
         return HexFormat.of().formatHex(transactionId);
+    }
+
+    // ── Listen ─────────────────────────────────────────────────────────────────
+    //
+    // Listen state is guarded by writeLock, the lock every write holds. A target's initial snapshot
+    // and its registration happen in one critical section, and each write publishes its changes
+    // before it releases the lock, so a listener sees every committed write exactly once, in commit
+    // order, and never one that its initial snapshot already contained.
+
+    /** Streams with at least one target; guarded by writeLock. */
+    private final Set<FirestoreListenStream> listenStreams = new LinkedHashSet<>();
+    /** Last read time handed to a listener; guarded by writeLock. */
+    private Instant lastListenReadTime = Instant.EPOCH;
+
+    public void addListenTarget(FirestoreListenStream stream, Target target) {
+        synchronized (writeLock) {
+            if (stream.isClosed()) {
+                return;
+            }
+            stream.addTarget(target, nextListenReadTime());
+            listenStreams.add(stream);
+        }
+    }
+
+    public void removeListenTarget(FirestoreListenStream stream, int targetId) {
+        synchronized (writeLock) {
+            if (!stream.isClosed()) {
+                stream.removeTarget(targetId);
+            }
+        }
+    }
+
+    /**
+     * Stops publishing to the stream. Returns whether it was still open, so the caller ends the
+     * call exactly once; once this returns, no write can send on the stream again.
+     */
+    public boolean closeListen(FirestoreListenStream stream) {
+        synchronized (writeLock) {
+            listenStreams.remove(stream);
+            return stream.close();
+        }
+    }
+
+    /** Callers must hold writeLock. */
+    private void publishToListeners(List<Write> writes) {
+        if (listenStreams.isEmpty()) {
+            return;
+        }
+        List<String> names = writes.stream()
+                .map(FirestoreService::writeTargetName)
+                .filter(name -> !name.isEmpty())
+                .toList();
+        if (names.isEmpty()) {
+            return;
+        }
+        Instant readTime = nextListenReadTime();
+        for (FirestoreListenStream stream : new ArrayList<>(listenStreams)) {
+            try {
+                stream.publish(names, readTime);
+            } catch (RuntimeException e) {
+                // The write has already landed: a listener that cannot be reached, typically a
+                // cancelled call, is dropped instead of failing the write.
+                LOG.debugf("dropping listen stream after a failed send: %s", e.getMessage());
+                listenStreams.remove(stream);
+                stream.close();
+            }
+        }
+    }
+
+    /**
+     * TargetChange.read_time is monotonically increasing per stream (firestore.proto). Commit times
+     * are taken before writeLock is acquired, so they are not, and listeners use this clock instead.
+     * Callers must hold writeLock.
+     */
+    private Instant nextListenReadTime() {
+        Instant now = Instant.now();
+        lastListenReadTime = now.isAfter(lastListenReadTime) ? now : lastListenReadTime.plusNanos(1);
+        return lastListenReadTime;
     }
 
     // ── Filter evaluation ──────────────────────────────────────────────────────

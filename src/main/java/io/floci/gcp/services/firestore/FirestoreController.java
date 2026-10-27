@@ -12,7 +12,6 @@ import com.google.firestore.v1.CommitResponse;
 import com.google.firestore.v1.CreateDocumentRequest;
 import com.google.firestore.v1.DeleteDocumentRequest;
 import com.google.firestore.v1.Document;
-import com.google.firestore.v1.DocumentChange;
 import com.google.firestore.v1.FirestoreGrpc;
 import com.google.firestore.v1.GetDocumentRequest;
 import com.google.firestore.v1.ListCollectionIdsRequest;
@@ -30,8 +29,6 @@ import com.google.firestore.v1.RunAggregationQueryResponse;
 import com.google.firestore.v1.RunQueryRequest;
 import com.google.firestore.v1.RunQueryResponse;
 import com.google.firestore.v1.StructuredQuery;
-import com.google.firestore.v1.Target;
-import com.google.firestore.v1.TargetChange;
 import com.google.firestore.v1.UpdateDocumentRequest;
 import com.google.firestore.v1.Write;
 import com.google.firestore.v1.WriteRequest;
@@ -403,68 +400,39 @@ public class FirestoreController extends FirestoreGrpc.FirestoreImplBase {
 
     @Override
     public StreamObserver<ListenRequest> listen(StreamObserver<ListenResponse> responseObserver) {
+        FirestoreListenStream stream = new FirestoreListenStream(service, responseObserver);
         return new StreamObserver<>() {
-            private volatile boolean initialized = false;
-
             public void onNext(ListenRequest req) {
                 try {
-                    if (req.hasAddTarget() && !initialized) {
-                        initialized = true;
-                        Target target = req.getAddTarget();
-                        int targetId = target.getTargetId();
-                        Instant now = Instant.now();
-                        Timestamp readTime = toTimestamp(now.toString());
-
-                        responseObserver.onNext(ListenResponse.newBuilder()
-                                .setTargetChange(TargetChange.newBuilder()
-                                        .setTargetChangeType(TargetChange.TargetChangeType.ADD)
-                                        .addTargetIds(targetId)
-                                        .setReadTime(readTime)
-                                        .build())
-                                .build());
-
-                        if (target.hasQuery()) {
-                            Target.QueryTarget qt = target.getQuery();
-                            List<StoredDocument> docs = service.runQuery(qt.getParent(),
-                                    qt.hasStructuredQuery() ? qt.getStructuredQuery()
-                                            : StructuredQuery.getDefaultInstance());
-                            for (StoredDocument doc : docs) {
-                                responseObserver.onNext(ListenResponse.newBuilder()
-                                        .setDocumentChange(DocumentChange.newBuilder()
-                                                .setDocument(toProto(doc))
-                                                .addTargetIds(targetId)
-                                                .build())
-                                        .build());
-                            }
-                        }
-
-                        responseObserver.onNext(ListenResponse.newBuilder()
-                                .setTargetChange(TargetChange.newBuilder()
-                                        .setTargetChangeType(TargetChange.TargetChangeType.CURRENT)
-                                        .addTargetIds(targetId)
-                                        .setReadTime(readTime)
-                                        .build())
-                                .build());
+                    switch (req.getTargetChangeCase()) {
+                        case ADD_TARGET -> service.addListenTarget(stream, req.getAddTarget());
+                        case REMOVE_TARGET -> service.removeListenTarget(stream, req.getRemoveTarget());
+                        case TARGETCHANGE_NOT_SET -> {}
                     }
                 } catch (Exception e) {
                     LOG.warnf("listen error: %s", e.getMessage());
-                    responseObserver.onError(GcpGrpcController.grpcException(e));
+                    if (service.closeListen(stream)) {
+                        responseObserver.onError(GcpGrpcController.grpcException(e));
+                    }
                 }
             }
 
             public void onError(Throwable t) {
                 LOG.debugf("listen stream closed by client: %s", t.getMessage());
+                service.closeListen(stream);
             }
 
             public void onCompleted() {
-                responseObserver.onCompleted();
+                if (service.closeListen(stream)) {
+                    responseObserver.onCompleted();
+                }
             }
         };
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────────
 
-    private static Document toProto(StoredDocument stored) {
+    static Document toProto(StoredDocument stored) {
         Document.Builder builder = Document.newBuilder()
                 .setName(stored.getName())
                 .setCreateTime(toTimestamp(stored.getCreateTime()))
