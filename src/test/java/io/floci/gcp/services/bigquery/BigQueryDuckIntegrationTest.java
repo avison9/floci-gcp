@@ -1586,6 +1586,84 @@ class BigQueryDuckIntegrationTest {
 
     @Test
     @Order(5)
+    void isDistinctFromMatchesBigQuery() {
+        String t = "UNNEST([STRUCT(1 AS a, 1 AS b), (1, 2), (NULL, 2), (NULL, NULL)])";
+        query("{\"query\": \"SELECT a, b, a IS DISTINCT FROM b d, a IS NOT DISTINCT FROM b nd, a IS NOT DISTINCT FROM NULL AS c"
+                + " FROM " + t + " ORDER BY a NULLS FIRST, b NULLS FIRST\", \"useLegacySql\": false}")
+                .then().statusCode(200)
+                .body("schema.fields.name", equalTo(List.of("a", "b", "d", "nd", "c")))
+                .body("rows.f.v", equalTo(List.of(
+                        Arrays.asList(null, null, "false", "true", "true"),
+                        Arrays.asList(null, "2", "true", "false", "true"),
+                        List.of("1", "1", "false", "true", "false"),
+                        List.of("1", "2", "true", "false", "false"))));
+        query("{\"query\": \"SELECT a IS DISTINCT FROM b, a IS NOT DISTINCT FROM NULL FROM " + t + "\", \"useLegacySql\": false}")
+                .then().statusCode(200)
+                .body("schema.fields.name", equalTo(List.of("f0_", "f1_")));
+        query("{\"query\": \"SELECT COUNT(*) n FROM " + t + " WHERE a IS DISTINCT FROM b\", \"useLegacySql\": false}")
+                .then().statusCode(200)
+                .body("rows[0].f[0].v", equalTo("2"));
+        query("{\"query\": \"SELECT COUNT(*) n FROM " + t + " t1 JOIN " + t + " t2 ON t1.a IS NOT DISTINCT FROM t2.a\","
+                + " \"useLegacySql\": false}")
+                .then().statusCode(200)
+                .body("rows[0].f[0].v", equalTo("8"));
+        query("{\"query\": \"SELECT CASE WHEN a IS DISTINCT FROM b THEN 'diff' ELSE 'same' END k FROM " + t
+                + " ORDER BY a NULLS FIRST, b NULLS FIRST\", \"useLegacySql\": false}")
+                .then().statusCode(200)
+                .body("rows.f.v", equalTo(List.of(List.of("same"), List.of("diff"), List.of("same"), List.of("diff"))));
+        query("""
+                {"query": "SELECT (SELECT AS STRUCT 1 IS DISTINCT FROM 2 AS d, 1 IS NOT DISTINCT FROM 1 AS e) s", "useLegacySql": false}
+                """)
+                .then().statusCode(200)
+                .body("schema.fields[0].fields.name", equalTo(List.of("d", "e")))
+                .body("rows[0].f[0].v.f.v", equalTo(List.of("true", "true")));
+        query("""
+                {"query": "SELECT ARRAY(SELECT AS STRUCT x IS DISTINCT FROM 2 AS d, x FROM UNNEST([1, 2]) x ORDER BY x) a", "useLegacySql": false}
+                """)
+                .then().statusCode(200)
+                .body("schema.fields[0].fields.name", equalTo(List.of("d", "x")))
+                .body("rows[0].f[0].v.v.f.v", equalTo(List.of(List.of("true", "1"), List.of("false", "2"))));
+        query("{\"query\": \"SELECT a IS DISTINCT FROM b AS d, t.* FROM " + t + " t ORDER BY a NULLS FIRST, b NULLS FIRST\","
+                + " \"useLegacySql\": false}")
+                .then().statusCode(200)
+                .body("schema.fields.name", equalTo(List.of("d", "a", "b")))
+                .body("rows.f.v", equalTo(List.of(Arrays.asList("false", null, null), Arrays.asList("true", null, "2"),
+                        List.of("false", "1", "1"), List.of("true", "1", "2"))));
+        query("{\"query\": \"SELECT t.*, a IS DISTINCT FROM b AS d FROM " + t + " t ORDER BY a NULLS FIRST, b NULLS FIRST\","
+                + " \"useLegacySql\": false}")
+                .then().statusCode(200)
+                .body("schema.fields.name", equalTo(List.of("a", "b", "d")))
+                .body("rows.f.v", equalTo(List.of(Arrays.asList(null, null, "false"), Arrays.asList(null, "2", "true"),
+                        List.of("1", "1", "false"), List.of("1", "2", "true"))));
+        query("""
+                {"query": "SELECT x IS DISTINCT FROM 2 AS d, * FROM UNNEST([1, 2]) x WITH OFFSET o ORDER BY o", "useLegacySql": false}
+                """)
+                .then().statusCode(200)
+                .body("schema.fields.name", equalTo(List.of("d", "x", "o")))
+                .body("rows.f.v", equalTo(List.of(List.of("true", "1", "0"), List.of("false", "2", "1"))));
+        query("""
+                {"query": "SELECT 1 IS DISTINCT FROM 2 AS d, STRUCT(MAX(x) AS n) AS s FROM UNNEST([1, 2]) x HAVING s.n > 0", "useLegacySql": false}
+                """)
+                .then().statusCode(200)
+                .body("schema.fields.name", equalTo(List.of("d", "s")))
+                .body("rows[0].f[0].v", equalTo("true"))
+                .body("rows[0].f[1].v.f.v", equalTo(List.of("2")));
+        query("""
+                {"query": "SELECT *, x IS DISTINCT FROM 2 AS d FROM UNNEST([1, 2]) x WITH OFFSET o ORDER BY o", "useLegacySql": false}
+                """)
+                .then().statusCode(200)
+                .body("schema.fields.name", equalTo(List.of("x", "o", "d")))
+                .body("rows.f.v", equalTo(List.of(List.of("1", "0", "true"), List.of("2", "1", "false"))));
+        query("""
+                {"query": "SELECT * EXCEPT (o), x IS DISTINCT FROM 2 AS d FROM UNNEST([1, 2]) x WITH OFFSET o ORDER BY o", "useLegacySql": false}
+                """)
+                .then().statusCode(200)
+                .body("schema.fields.name", equalTo(List.of("x", "d")))
+                .body("rows.f.v", equalTo(List.of(List.of("1", "true"), List.of("2", "false"))));
+    }
+
+    @Test
+    @Order(5)
     void offsetIsAnOrdinaryName() {
         query("""
                 {"query": "SELECT 1 offset", "useLegacySql": false}
