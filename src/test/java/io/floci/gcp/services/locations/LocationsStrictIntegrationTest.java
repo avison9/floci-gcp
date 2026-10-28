@@ -94,6 +94,11 @@ class LocationsStrictIntegrationTest {
                 .then().statusCode(400);
         given().when().get("/v2/projects/loc-strict/locations/us-central1/functions")
                 .then().statusCode(200);
+        given().when().get("/v1/projects/loc-strict/locations/mars-north1/operations")
+                .then().statusCode(400)
+                .body("error.status", equalTo("INVALID_ARGUMENT"));
+        given().when().get("/v1/projects/loc-strict/locations/us-central1/operations")
+                .then().statusCode(200);
         given().when().get("/v2/projects/loc-strict/locations/-/services")
                 .then().statusCode(400)
                 .body("error.status", equalTo("INVALID_ARGUMENT"));

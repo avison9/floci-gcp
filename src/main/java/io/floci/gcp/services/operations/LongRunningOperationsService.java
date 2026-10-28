@@ -20,6 +20,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.function.Predicate;
 
 @ApplicationScoped
 public class LongRunningOperationsService {
@@ -121,9 +122,14 @@ public class LongRunningOperationsService {
     }
 
     public ListOperationsResponse list(String parent, int pageSize, String pageToken) {
+        return list(parent, pageSize, pageToken, operation -> true);
+    }
+
+    public ListOperationsResponse list(String parent, int pageSize, String pageToken, Predicate<Operation> include) {
         String prefix = operationsPrefix(parent);
         List<Operation> operations = operationStore.scan(k -> k.startsWith(prefix)).stream()
                 .map(this::parse)
+                .filter(include)
                 .sorted(Comparator.comparing(Operation::getName))
                 .toList();
         PageToken.Page<Operation> page = PageToken.paginate(operations, pageSize, pageToken);

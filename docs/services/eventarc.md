@@ -21,8 +21,12 @@ REST JSON under `/v1/projects/{project}/locations/{location}`:
 | Delete trigger | `DELETE /triggers/{id}` (supports `allowMissing`, `validateOnly`) |
 | List providers | `GET /providers`: returns `storage.googleapis.com` and `pubsub.googleapis.com` |
 | List channels | `GET /channels`: always empty (stub) |
+| List operations | `GET /operations` (with `pageSize`/`pageToken`) |
+| Get operation | `GET /operations/{id}` |
+| Delete operation | `DELETE /operations/{id}` |
+| Cancel operation | `POST /operations/{id}:cancel` |
 
-Mutations return completed `google.longrunning.Operation` responses, readable via the shared operations surface at `/v2/projects/{project}/locations/{location}/operations`.
+Mutations return completed `google.longrunning.Operation` responses, which the operations routes above serve back. They list and return only Eventarc's own operations, not the Cloud Run or Cloud Functions operations floci keeps in the same store. Every Eventarc operation is created done, so cancel succeeds without changing it.
 
 ## Event Delivery
 
@@ -82,5 +86,6 @@ Supported destinations: **Cloud Run services** (resolved through the emulator's 
 - `match-path-pattern` operators: event filters use exact-value matching (a bare `topic` value resolves to `projects/{trigger project}/topics/{name}`; `bucket` falls back to last-segment matching)
 - Delivery retries and dead-lettering: delivery is fire-and-forget; failures are logged, not surfaced
 - Channels and third-party providers (stubs)
+- `operations.list` ignores `filter` and `returnPartialSuccess`, and the `-` location wildcard lists nothing
 
 A trigger with no `eventFilters` never matches. A Pub/Sub trigger fires only for the topic named in `transport.pubsub.topic` (a bare name resolves against the trigger's project), even if its filters do not match. The topic must be in the same project as the trigger; a transport topic in another project never fires. Without a transport topic, it fires only when an explicit `topic` event filter matches the published topic in the same project. floci does not provision an Eventarc-managed topic, so a `messagePublished` trigger with neither never fires.
