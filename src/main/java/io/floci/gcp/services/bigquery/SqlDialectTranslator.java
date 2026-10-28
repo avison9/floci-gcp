@@ -5177,11 +5177,13 @@ final class SqlDialectTranslator {
             // DATE. DuckDB's cast_to_type preserves that runtime type for column expressions too.
             case "DATE_TRUNC" -> renderDateTrunc(a, name);
             case "FORMAT_TIMESTAMP", "FORMAT_DATETIME", "FORMAT_DATE", "FORMAT_TIME" -> args(a, 2, name,
-                    "strftime(" + at(a, 1) + ", " + at(a, 0) + ")");
+                    // DuckDB's strftime takes no TIME, so a TIME is formatted on a placeholder date it never prints.
+                    formatCall(name, name.equals("FORMAT_TIME") ? "(DATE '1970-01-01' + " + at(a, 1) + ")" : at(a, 1), at(a, 0)));
             case "PARSE_TIMESTAMP" -> renderParseTimestamp(a, name, false);
-            case "PARSE_DATETIME" -> args(a, 2, name, "strptime(" + at(a, 1) + ", " + at(a, 0) + ")");
+            case "PARSE_DATETIME" -> args(a, 2, name,
+                    "strptime(" + at(a, 1) + ", " + timeFormat(at(a, 0)) + ")");
             case "PARSE_DATE" -> args(a, 2, name,
-                    "CAST(strptime(" + at(a, 1) + ", " + at(a, 0) + ") AS DATE)");
+                    "CAST(strptime(" + at(a, 1) + ", " + timeFormat(at(a, 0)) + ") AS DATE)");
             case "DATE" -> a.size() == 3 ? "make_date(" + String.join(", ", a) + ")"
                     : "CAST(" + at(a, 0) + " AS DATE)";
             case "DATETIME" -> "CAST(" + at(a, 0) + " AS TIMESTAMP)";
@@ -5336,7 +5338,7 @@ final class SqlDialectTranslator {
         List<String> a = arguments(open, close);
         return switch (function) {
             case "PARSE_DATE" -> args(a, 2, "SAFE.PARSE_DATE",
-                    "CAST(try_strptime(" + at(a, 1) + ", " + at(a, 0) + ") AS DATE)");
+                    "CAST(try_strptime(" + at(a, 1) + ", " + timeFormat(at(a, 0)) + ") AS DATE)");
             case "PARSE_TIMESTAMP" -> renderParseTimestamp(a, "SAFE.PARSE_TIMESTAMP", true);
             case "FROM_HEX" -> renderSafeFromHex(a);
             default -> null;
@@ -5357,7 +5359,7 @@ final class SqlDialectTranslator {
                     + " arguments");
         }
         String parser = safe ? "try_strptime" : "strptime";
-        String parsed = parser + "(" + at(arguments, 1) + ", " + at(arguments, 0) + ")";
+        String parsed = parser + "(" + at(arguments, 1) + ", " + timeFormat(at(arguments, 0)) + ")";
         String zone = arguments.size() == 3 ? at(arguments, 2) : DuckTypes.quoteLiteral("UTC");
         return "list_extract(list_transform([" + parsed + "], _floci_parsed_timestamp -> CASE WHEN"
                 + " typeof(_floci_parsed_timestamp) = 'TIMESTAMP WITH TIME ZONE'"
@@ -5412,6 +5414,263 @@ final class SqlDialectTranslator {
             throw invalidQuery("Missing function argument " + (index + 1));
         }
         return a.get(index).trim();
+    }
+
+    /** BigQuery format elements that DuckDB's strftime and strptime handle the same way. */
+    private static final String SHARED_ELEMENTS = "AaBbdGHhIjMmpSTUuVWwXYyZ";
+
+    /** BigQuery composite elements, spelled with elements DuckDB knows; valid for strptime too. */
+    private static final Map<String, String> COMPOSITE_ELEMENTS = Map.of(
+            "%F", "%Y-%m-%d", "%D", "%m/%d/%y", "%x", "%m/%d/%y", "%R", "%H:%M", "%r", "%I:%M:%S %p",
+            "%E4Y", "%Y");
+
+    /** Elements DuckDB lacks or renders differently, emulated in SQL by {@link #emulatedElement}. */
+    private static final List<String> EMULATED_ELEMENTS = List.of(
+            "%C", "%c", "%e", "%g", "%J", "%k", "%l", "%P", "%Q", "%s", "%E*S");
+
+    /** Every element a format read from a column may use, each rendered with a constant format. */
+    private static final List<String> PER_ROW_ELEMENTS = perRowElements();
+
+    private static List<String> perRowElements() {
+        List<String> elements = new ArrayList<>(List.of("%%", "%t", "%n", "%z", "%Ez"));
+        for (char c : SHARED_ELEMENTS.toCharArray()) {
+            elements.add("%" + c);
+        }
+        elements.addAll(COMPOSITE_ELEMENTS.keySet());
+        elements.addAll(EMULATED_ELEMENTS);
+        return List.copyOf(elements);
+    }
+
+    /**
+     * Renders FORMAT_DATE, FORMAT_DATETIME, FORMAT_TIME and FORMAT_TIMESTAMP. A constant format (a
+     * literal or a parameter) is split into elements here: those strftime renders like BigQuery stay in
+     * one strftime call, the rest are emulated and concatenated. DuckDB only takes a constant strftime
+     * format, so a format read from a column is split per row in SQL instead, with a constant strftime
+     * per element. The value (and a per-row format) is evaluated once, outside the lambdas: emulated
+     * elements read it several times, and a subquery may not appear inside a lambda.
+     */
+    private static String formatCall(String function, String value, String format) {
+        String constant = constantString(format);
+        if (constant == null) {
+            return perRowFormat(function, value, format);
+        }
+        List<String> parts = new ArrayList<>();
+        StringBuilder pattern = new StringBuilder();
+        boolean emulated = false;
+        for (String element : formatElements(constant)) {
+            String fragment = printedAsWritten(function, element) ? element.replace("%", "%%") : strftimePattern(element);
+            if (fragment != null) {
+                pattern.append(fragment);
+                continue;
+            }
+            if (!pattern.isEmpty()) {
+                parts.add(strftimeCall(FORMAT_VALUE, pattern.toString()));
+                pattern.setLength(0);
+            }
+            parts.add(emulatedElement(FORMAT_VALUE, element));
+            emulated = true;
+        }
+        if (!emulated) {
+            return strftimeCall(value, pattern.toString());
+        }
+        if (!pattern.isEmpty()) {
+            parts.add(strftimeCall(FORMAT_VALUE, pattern.toString()));
+        }
+        String body = parts.size() == 1 ? parts.getFirst() : "(" + String.join(" || ", parts) + ")";
+        return "list_extract(list_transform([(" + value + ")], " + FORMAT_VALUE + " -> " + body + "), 1)";
+    }
+
+    /**
+     * Elements a function prints as written because its type has no such part, as BigQuery does: the time and zone
+     * elements for a DATE, the zone elements for a DATETIME, and the date, epoch and zone elements for a TIME.
+     */
+    private static final Map<String, Set<String>> PRINTED_AS_WRITTEN = Map.of(
+            "FORMAT_DATE", Set.of("%c", "%H", "%I", "%k", "%l", "%M", "%P", "%p", "%R", "%r", "%S", "%s", "%T", "%X", "%Z",
+                    "%z", "%Ez", "%E*S"),
+            "FORMAT_DATETIME", Set.of("%Z", "%z", "%Ez"),
+            "FORMAT_TIME", Set.of("%A", "%a", "%B", "%b", "%C", "%c", "%D", "%d", "%e", "%F", "%G", "%g", "%h", "%J", "%j", "%m",
+                    "%Q", "%s", "%U", "%u", "%V", "%W", "%w", "%x", "%Y", "%y", "%Z", "%z", "%Ez", "%E4Y"));
+
+    private static boolean printedAsWritten(String function, String element) {
+        return PRINTED_AS_WRITTEN.getOrDefault(function, Set.of()).contains(element)
+                || function.equals("FORMAT_DATE") && element.matches("%E\\d+S");
+    }
+
+    private static final String FORMAT_VALUE = "_floci_format_value";
+    private static final String FORMAT_ROW = "_floci_format_row";
+    private static final String FORMAT_ELEMENT = "_floci_format_element";
+
+    private static String perRowFormat(String function, String value, String format) {
+        String rowValue = FORMAT_ROW + ".v";
+        StringBuilder elements = new StringBuilder("CASE " + FORMAT_ELEMENT);
+        for (String element : PER_ROW_ELEMENTS) {
+            if (printedAsWritten(function, element)) {
+                continue;
+            }
+            String pattern = strftimePattern(element);
+            elements.append(" WHEN ").append(DuckTypes.quoteLiteral(element)).append(" THEN ")
+                    .append(pattern != null ? strftimeCall(rowValue, pattern) : emulatedElement(rowValue, element));
+        }
+        elements.append(" ELSE ").append(FORMAT_ELEMENT).append(" END");
+        String digits = "ltrim(regexp_extract(" + FORMAT_ELEMENT + ", '[0-9]+'), '0')";
+        String fraction = printedAsWritten(function, "%E0S") ? elements.toString() : "CASE WHEN regexp_full_match("
+                + FORMAT_ELEMENT + ", '%E[0-9]+S') THEN " + fractionalSeconds(rowValue, "CASE WHEN length(" + digits + ") > 2 THEN "
+                + MAX_FRACTION_DIGITS + " ELSE least(CAST('0' || " + digits + " AS INTEGER), " + MAX_FRACTION_DIGITS + ") END")
+                + " ELSE " + elements + " END";
+        return "list_extract(list_transform([struct_pack(v := (" + value + "), f := (" + format + "))], " + FORMAT_ROW
+                + " -> CASE WHEN " + FORMAT_ROW + ".f IS NULL OR " + rowValue + " IS NULL THEN NULL ELSE array_to_string("
+                + "list_transform(regexp_extract_all(" + FORMAT_ROW + ".f, '%E\\*S|%E[0-9]+S|%E4Y|%Ez|%.?|[^%]+'), "
+                + FORMAT_ELEMENT + " -> " + fraction + "), '') END), 1)";
+    }
+
+    private static String strftimeCall(String value, String pattern) {
+        return "strftime(" + value + ", " + DuckTypes.quoteLiteral(pattern) + ")";
+    }
+
+    /** Splits a format into BigQuery elements ({@code %Y}, {@code %%}, {@code %E*S}, ...) and literal text. */
+    private static List<String> formatElements(String format) {
+        List<String> elements = new ArrayList<>();
+        int i = 0;
+        while (i < format.length()) {
+            int end;
+            if (format.charAt(i) != '%') {
+                end = format.indexOf('%', i);
+                end = end < 0 ? format.length() : end;
+            } else if (i + 1 == format.length()) {
+                end = i + 1;
+            } else if (format.charAt(i + 1) == 'E') {
+                end = extendedElementEnd(format, i + 2);
+            } else {
+                end = i + 2;
+            }
+            elements.add(format.substring(i, end));
+            i = end;
+        }
+        return elements;
+    }
+
+    /** End of a {@code %E} element whose modifier starts at {@code i}: *S, a digit count and S, 4Y or z. */
+    private static int extendedElementEnd(String format, int i) {
+        if (format.startsWith("*S", i) || format.startsWith("4Y", i)) {
+            return i + 2;
+        }
+        if (format.startsWith("z", i)) {
+            return i + 1;
+        }
+        int digits = i;
+        while (digits < format.length() && Character.isDigit(format.charAt(digits))) {
+            digits++;
+        }
+        return digits > i && digits < format.length() && format.charAt(digits) == 'S' ? digits + 1 : i;
+    }
+
+    /**
+     * The strftime pattern for one element, or null when it has to be emulated. Literal text has no
+     * percent sign; an element BigQuery does not know is printed as written, as BigQuery does.
+     */
+    private static String strftimePattern(String element) {
+        if (element.charAt(0) != '%') {
+            return element;
+        }
+        String composite = COMPOSITE_ELEMENTS.get(element);
+        if (composite != null) {
+            return composite;
+        }
+        if (element.length() == 2
+                && (element.charAt(1) == '%' || SHARED_ELEMENTS.indexOf(element.charAt(1)) >= 0)) {
+            return element;
+        }
+        if (EMULATED_ELEMENTS.contains(element) || element.matches("%E\\d+S")) {
+            return null;
+        }
+        return switch (element) {
+            case "%t" -> "\t";
+            case "%n" -> "\n";
+            // Values are formatted in UTC: FORMAT_TIMESTAMP's time zone argument is not applied.
+            case "%z" -> "+0000";
+            case "%Ez" -> "+00:00";
+            default -> "%" + element;
+        };
+    }
+
+    private static String emulatedElement(String value, String element) {
+        return switch (element) {
+            case "%C" -> "lpad(CAST(year(" + value + ") // 100 AS VARCHAR), 2, '0')";
+            case "%c" -> "(strftime(" + value + ", '%a %b ') || " + emulatedElement(value, "%e")
+                    + " || strftime(" + value + ", ' %H:%M:%S %Y'))";
+            case "%e" -> "lpad(CAST(day(" + value + ") AS VARCHAR), 2, ' ')";
+            case "%g" -> "right(strftime(" + value + ", '%G'), 2)";
+            case "%J" -> "lpad(CAST((weekofyear(" + value + ") - 1) * 7 + isodow(" + value + ") AS VARCHAR), 3, '0')";
+            case "%k" -> "lpad(CAST(hour(" + value + ") AS VARCHAR), 2, ' ')";
+            case "%l" -> "lpad(CAST((hour(" + value + ") + 11) % 12 + 1 AS VARCHAR), 2, ' ')";
+            case "%P" -> "lower(strftime(" + value + ", '%p'))";
+            case "%Q" -> "CAST(quarter(" + value + ") AS VARCHAR)";
+            case "%s" -> "CAST((epoch_us(" + value + ") - (epoch_us(" + value + ") % 1000000 + 1000000) % 1000000) // 1000000"
+                    + " AS VARCHAR)";
+            case "%E*S" -> "(strftime(" + value + ", '%S') || CASE WHEN strftime(" + value + ", '%f') = '000000'"
+                    + " THEN '' ELSE '.' || rtrim(strftime(" + value + ", '%f'), '0') END)";
+            default -> {
+                int digits = fractionDigits(element);
+                yield digits == 0 ? strftimeCall(value, "%S") : "(strftime(" + value + ", '%S.') || left(rpad(strftime("
+                        + value + ", '%f'), " + digits + ", '0'), " + digits + "))";
+            }
+        };
+    }
+
+    /** BigQuery prints at most this many fractional digits for {@code %E<n>S}, however large n is. */
+    private static final int MAX_FRACTION_DIGITS = 18;
+
+    /** The digit count of a {@code %E<n>S} element, capped at {@link #MAX_FRACTION_DIGITS}; leading zeros are ignored. */
+    private static int fractionDigits(String element) {
+        String digits = element.substring(2, element.length() - 1).replaceFirst("^0+", "");
+        return digits.length() > 2 ? MAX_FRACTION_DIGITS : Math.min(digits.isEmpty() ? 0 : Integer.parseInt(digits),
+                MAX_FRACTION_DIGITS);
+    }
+
+    /** Seconds with {@code digits} (a SQL integer expression) fractional digits, as {@code %E<n>S} prints them. */
+    private static String fractionalSeconds(String value, String digits) {
+        return "list_extract(list_transform([" + digits + "], _floci_format_digits -> CASE WHEN _floci_format_digits = 0"
+                + " THEN strftime(" + value + ", '%S') ELSE strftime(" + value + ", '%S.') || left(rpad(strftime(" + value
+                + ", '%f'), _floci_format_digits, '0'), _floci_format_digits) END), 1)";
+    }
+
+    /**
+     * Format for strptime: composite elements of a constant format (a literal or a parameter) are
+     * expanded. DuckDB only takes a constant strptime format, so any other format is passed through.
+     */
+    private static String timeFormat(String format) {
+        String constant = constantString(format);
+        if (constant == null) {
+            return format;
+        }
+        StringBuilder out = new StringBuilder(constant.length() + 16);
+        for (String element : formatElements(constant)) {
+            out.append(COMPOSITE_ELEMENTS.getOrDefault(element, element));
+        }
+        return DuckTypes.quoteLiteral(out.toString());
+    }
+
+    /** The value of a string literal or of a STRING parameter ({@code CAST('...' AS VARCHAR)}); null otherwise. */
+    private static String constantString(String sql) {
+        String literal = sql.startsWith("CAST(") && sql.endsWith(" AS VARCHAR)")
+                ? sql.substring("CAST(".length(), sql.length() - " AS VARCHAR)".length()) : sql;
+        return isStringLiteral(literal) ? literal.substring(1, literal.length() - 1).replace("''", "'") : null;
+    }
+
+    /** True for exactly one single-quoted SQL string literal, with quotes escaped by doubling. */
+    private static boolean isStringLiteral(String sql) {
+        if (sql.length() < 2 || sql.charAt(0) != '\'' || sql.charAt(sql.length() - 1) != '\'') {
+            return false;
+        }
+        for (int i = 1; i < sql.length() - 1; i++) {
+            if (sql.charAt(i) == '\'') {
+                if (sql.charAt(i + 1) != '\'' || i + 1 == sql.length() - 1) {
+                    return false;
+                }
+                i++;
+            }
+        }
+        return true;
     }
 
     private static String datePart(String part) {
