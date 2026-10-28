@@ -14,6 +14,9 @@ public class StoredCryptoKey {
     private Integer primaryVersion;
     private int nextVersionNumber;
     private Map<String, String> labels;
+    private String rotationPeriod;
+    private String nextRotationTime;
+    private String destroyScheduledDuration;
 
     public StoredCryptoKey() {}
 
@@ -45,4 +48,15 @@ public class StoredCryptoKey {
 
     public Map<String, String> getLabels() { return labels; }
     public void setLabels(Map<String, String> labels) { this.labels = labels; }
+
+    public String getRotationPeriod() { return rotationPeriod; }
+    public void setRotationPeriod(String rotationPeriod) { this.rotationPeriod = rotationPeriod; }
+
+    public String getNextRotationTime() { return nextRotationTime; }
+    public void setNextRotationTime(String nextRotationTime) { this.nextRotationTime = nextRotationTime; }
+
+    public String getDestroyScheduledDuration() { return destroyScheduledDuration; }
+    public void setDestroyScheduledDuration(String destroyScheduledDuration) {
+        this.destroyScheduledDuration = destroyScheduledDuration;
+    }
 }

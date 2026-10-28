@@ -4,6 +4,9 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.protobuf.Timestamp;
+import com.google.protobuf.util.Durations;
+import com.google.protobuf.util.Timestamps;
 import io.floci.gcp.core.common.GcpException;
 import io.floci.gcp.core.common.ProtoJsonBytes;
 import io.floci.gcp.services.cloudkms.model.StoredCryptoKey;
@@ -28,10 +31,15 @@ import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.text.ParseException;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.zip.CRC32C;
 
@@ -97,18 +105,14 @@ public class CloudKmsHttpController {
 
     @POST
     @Path("/{location}/keyRings/{keyRing}/cryptoKeys")
-    @SuppressWarnings("unchecked")
     public Response createCryptoKey(@PathParam("project") String project, @PathParam("location") String location,
             @PathParam("keyRing") String keyRing, @QueryParam("cryptoKeyId") String cryptoKeyId,
             @QueryParam("skipInitialVersionCreation") @DefaultValue("false") boolean skip, Map<String, Object> body) {
         try {
             String purpose = body != null ? (String) body.get("purpose") : null;
-            String algorithm = null;
-            if (body != null && body.get("versionTemplate") instanceof Map<?, ?> vt) {
-                algorithm = (String) ((Map<String, Object>) vt).get("algorithm");
-            }
             StoredCryptoKey stored = service.createCryptoKey(
-                    keyRingName(project, location, keyRing), cryptoKeyId, purpose, algorithm, skip);
+                    keyRingName(project, location, keyRing), cryptoKeyId, purpose, versionTemplateAlgorithm(body), skip,
+                    cryptoKeyFields(body));
             return Response.ok(toCryptoKeyJson(stored)).build();
         } catch (GcpException e) {
             return error(e);
@@ -142,18 +146,18 @@ public class CloudKmsHttpController {
 
     @PATCH
     @Path("/{location}/keyRings/{keyRing}/cryptoKeys/{cryptoKey}")
-    @SuppressWarnings("unchecked")
     public Response updateCryptoKey(@PathParam("project") String project, @PathParam("location") String location,
-            @PathParam("keyRing") String keyRing, @PathParam("cryptoKey") String cryptoKey, Map<String, Object> body) {
+            @PathParam("keyRing") String keyRing, @PathParam("cryptoKey") String cryptoKey,
+            @QueryParam("updateMask") String updateMask, Map<String, Object> body) {
         try {
-            Map<String, String> labels = body != null && body.get("labels") instanceof Map<?, ?> l
-                    ? (Map<String, String>) l : null;
-            String algorithm = null;
-            if (body != null && body.get("versionTemplate") instanceof Map<?, ?> vt) {
-                algorithm = (String) ((Map<String, Object>) vt).get("algorithm");
+            Set<String> paths;
+            if (updateMask != null && !updateMask.isBlank()) {
+                paths = CloudKmsService.snakeCasePaths(Arrays.asList(updateMask.split(",")));
+            } else {
+                paths = body != null ? CloudKmsService.snakeCasePaths(body.keySet()) : Set.of();
             }
-            StoredCryptoKey stored = service.updateCryptoKey(
-                    cryptoKeyName(project, location, keyRing, cryptoKey), labels, algorithm);
+            StoredCryptoKey stored = service.updateCryptoKey(cryptoKeyName(project, location, keyRing, cryptoKey),
+                    cryptoKeyFields(body), versionTemplateAlgorithm(body), paths);
             return Response.ok(toCryptoKeyJson(stored)).build();
         } catch (GcpException e) {
             return error(e);
@@ -475,6 +479,13 @@ public class CloudKmsHttpController {
         if (stored.getLabels() != null && !stored.getLabels().isEmpty()) {
             json.put("labels", stored.getLabels());
         }
+        if (stored.getNextRotationTime() != null) {
+            json.put("nextRotationTime", stored.getNextRotationTime());
+        }
+        if (stored.getRotationPeriod() != null) {
+            json.put("rotationPeriod", stored.getRotationPeriod());
+        }
+        json.put("destroyScheduledDuration", CloudKmsService.destroyScheduledDurationOf(stored));
         if (stored.getPrimaryVersion() != null) {
             service.getCryptoKeyVersionOptional(stored.getName() + "/cryptoKeyVersions/" + stored.getPrimaryVersion())
                     .ifPresent(v -> json.put("primary", toVersionJson(v)));
@@ -515,6 +526,77 @@ public class CloudKmsHttpController {
     private static String versionName(String project, String location, String keyRing, String cryptoKey,
             String version) {
         return cryptoKeyName(project, location, keyRing, cryptoKey) + "/cryptoKeyVersions/" + version;
+    }
+
+    private static String versionTemplateAlgorithm(Map<String, Object> body) {
+        if (body == null || !(body.get("versionTemplate") instanceof Map<?, ?> template)) {
+            return null;
+        }
+        Object algorithm = template.get("algorithm");
+        if (algorithm != null && !(algorithm instanceof String)) {
+            throw GcpException.invalidArgument("versionTemplate.algorithm must be a string");
+        }
+        return (String) algorithm;
+    }
+
+    private static CloudKmsService.CryptoKeyFields cryptoKeyFields(Map<String, Object> body) {
+        if (body == null) {
+            return new CloudKmsService.CryptoKeyFields(null, null, null, null);
+        }
+        return new CloudKmsService.CryptoKeyFields(durationField(body, "rotationPeriod"),
+                timestampField(body, "nextRotationTime"), durationField(body, "destroyScheduledDuration"),
+                labelsField(body));
+    }
+
+    private static Duration durationField(Map<String, Object> body, String field) {
+        Object value = body.get(field);
+        if (value == null) {
+            return null;
+        }
+        if (!(value instanceof String s)) {
+            throw GcpException.invalidArgument(field + " must be a duration string such as \"86400s\"");
+        }
+        try {
+            // Qualified: com.google.protobuf.Duration clashes with the imported java.time.Duration.
+            com.google.protobuf.Duration parsed = Durations.parse(s);
+            return Duration.ofSeconds(parsed.getSeconds(), parsed.getNanos());
+        } catch (ParseException e) {
+            throw GcpException.invalidArgument("Invalid duration for " + field + ": " + s);
+        }
+    }
+
+    private static Instant timestampField(Map<String, Object> body, String field) {
+        Object value = body.get(field);
+        if (value == null) {
+            return null;
+        }
+        if (!(value instanceof String s)) {
+            throw GcpException.invalidArgument(field + " must be an RFC 3339 timestamp string");
+        }
+        try {
+            Timestamp parsed = Timestamps.parse(s);
+            return Instant.ofEpochSecond(parsed.getSeconds(), parsed.getNanos());
+        } catch (ParseException e) {
+            throw GcpException.invalidArgument("Invalid timestamp for " + field + ": " + s);
+        }
+    }
+
+    private static Map<String, String> labelsField(Map<String, Object> body) {
+        Object value = body.get("labels");
+        if (value == null) {
+            return null;
+        }
+        if (!(value instanceof Map<?, ?> map)) {
+            throw GcpException.invalidArgument("labels must be an object of string values");
+        }
+        Map<String, String> labels = new LinkedHashMap<>();
+        for (Map.Entry<?, ?> entry : map.entrySet()) {
+            if (!(entry.getValue() instanceof String labelValue)) {
+                throw GcpException.invalidArgument("Label " + entry.getKey() + " must have a string value");
+            }
+            labels.put(String.valueOf(entry.getKey()), labelValue);
+        }
+        return labels;
     }
 
     private static byte[] decodeField(Map<String, Object> body, String field) {

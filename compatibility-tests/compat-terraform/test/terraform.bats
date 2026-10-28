@@ -374,6 +374,22 @@ setup() {
     assert_output --partial '"purpose":"ENCRYPT_DECRYPT"'
 }
 
+@test "Terraform: KMS crypto key keeps its rotation, destroy duration and labels" {
+    run gcp_curl "${FLOCI_ENDPOINT}/v1/projects/${FLOCI_PROJECT}/locations/${FLOCI_REGION:-us-central1}/keyRings/floci-compat-keyring/cryptoKeys/floci-compat-key"
+    assert_success
+    assert_output --partial '"rotationPeriod":"7776000s"'
+    assert_output --partial '"destroyScheduledDuration":"604800s"'
+    assert_output --partial '"env":"compat-test"'
+}
+
+@test "Terraform: KMS crypto key plans no changes after apply" {
+    run terraform plan -detailed-exitcode \
+        -target=google_kms_crypto_key.compat \
+        -var="endpoint=${FLOCI_ENDPOINT}" -var="project=${FLOCI_PROJECT}" \
+        -input=false -no-color
+    assert_success
+}
+
 @test "Terraform: KMS crypto key has a primary version" {
     result=$(gcp_curl "${FLOCI_ENDPOINT}/v1/projects/${FLOCI_PROJECT}/locations/${FLOCI_REGION:-us-central1}/keyRings/floci-compat-keyring/cryptoKeys/floci-compat-key/cryptoKeyVersions")
     [[ "$result" == *'"state":"ENABLED"'* ]]

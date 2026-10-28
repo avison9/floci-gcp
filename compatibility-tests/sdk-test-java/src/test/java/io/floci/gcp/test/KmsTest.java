@@ -5,6 +5,9 @@ import com.google.cloud.location.GetLocationRequest;
 import com.google.cloud.location.ListLocationsRequest;
 import com.google.cloud.location.Location;
 import com.google.protobuf.ByteString;
+import com.google.protobuf.Duration;
+import com.google.protobuf.FieldMask;
+import com.google.protobuf.Timestamp;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.MethodOrderer;
@@ -214,6 +217,43 @@ class KmsTest {
                 GetLocationRequest.newBuilder()
                         .setName("projects/" + PROJECT_ID + "/locations/global").build());
         assertThat(global.getLocationId()).isEqualTo("global");
+    }
+
+    @Test
+    @Order(10)
+    void cryptoKeyKeepsItsRotationScheduleDestroyDurationAndLabels() {
+        Duration ninetyDays = Duration.newBuilder().setSeconds(7_776_000).build();
+        Timestamp nextRotation = Timestamp.newBuilder().setSeconds(1_798_761_600).build(); // 2027-01-01T00:00:00Z
+        Duration sevenDays = Duration.newBuilder().setSeconds(604_800).build();
+        CryptoKey created = client.createCryptoKey(keyRing(), TestFixtures.uniqueName("sched"),
+                CryptoKey.newBuilder()
+                        .setPurpose(CryptoKey.CryptoKeyPurpose.ENCRYPT_DECRYPT)
+                        .setRotationPeriod(ninetyDays)
+                        .setNextRotationTime(nextRotation)
+                        .setDestroyScheduledDuration(sevenDays)
+                        .putLabels("team", "compat")
+                        .build());
+
+        CryptoKey fetched = client.getCryptoKey(CryptoKeyName.parse(created.getName()));
+        assertThat(fetched.getRotationPeriod()).isEqualTo(ninetyDays);
+        assertThat(fetched.getNextRotationTime()).isEqualTo(nextRotation);
+        assertThat(fetched.getDestroyScheduledDuration()).isEqualTo(sevenDays);
+        assertThat(fetched.getLabelsMap()).containsEntry("team", "compat");
+
+        CryptoKey updated = client.updateCryptoKey(
+                CryptoKey.newBuilder().setName(created.getName())
+                        .setRotationPeriod(Duration.newBuilder().setSeconds(172_800))
+                        .setNextRotationTime(nextRotation)
+                        .build(),
+                FieldMask.newBuilder().addPaths("rotation_period").addPaths("next_rotation_time").build());
+        assertThat(updated.getRotationPeriod().getSeconds()).isEqualTo(172_800);
+        assertThat(updated.getDestroyScheduledDuration()).isEqualTo(sevenDays);
+        assertThat(updated.getLabelsMap()).containsEntry("team", "compat");
+
+        CryptoKey plain = client.createCryptoKey(keyRing(), TestFixtures.uniqueName("plain"),
+                CryptoKey.newBuilder().setPurpose(CryptoKey.CryptoKeyPurpose.ENCRYPT_DECRYPT).build());
+        assertThat(plain.getDestroyScheduledDuration().getSeconds()).isEqualTo(2_592_000);
+        assertThat(plain.hasRotationPeriod()).isFalse();
     }
 
     private static PublicKey parsePem(String pem, String algorithm) throws Exception {

@@ -9,14 +9,19 @@ import com.google.cloud.kms.v1.CryptoKeyVersionTemplate;
 import com.google.cloud.kms.v1.DecryptRequest;
 import com.google.cloud.kms.v1.Digest;
 import com.google.cloud.kms.v1.EncryptRequest;
+import com.google.cloud.kms.v1.GetCryptoKeyRequest;
 import com.google.cloud.kms.v1.KeyManagementServiceGrpc;
 import com.google.cloud.kms.v1.MacSignRequest;
 import com.google.cloud.kms.v1.MacSignResponse;
 import com.google.cloud.kms.v1.MacVerifyRequest;
 import com.google.cloud.kms.v1.MacVerifyResponse;
 import com.google.cloud.kms.v1.ProtectionLevel;
+import com.google.cloud.kms.v1.UpdateCryptoKeyRequest;
 import com.google.protobuf.ByteString;
+import com.google.protobuf.FieldMask;
 import com.google.protobuf.Int64Value;
+import com.google.protobuf.util.Durations;
+import com.google.protobuf.util.Timestamps;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.Status;
@@ -30,6 +35,8 @@ import org.junit.jupiter.api.Test;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.zip.CRC32C;
 
@@ -193,5 +200,76 @@ class CloudKmsGrpcIntegrationTest {
         assertEquals(Status.Code.INVALID_ARGUMENT, assertThrows(StatusRuntimeException.class,
                 () -> kms.macVerify(verify.toBuilder().setMacCrc32C(Int64Value.of(1)).build()))
                 .getStatus().getCode());
+    }
+
+    @Test
+    void createStoresTheRotationScheduleDestroyDurationAndLabels() {
+        kms.createKeyRing(CreateKeyRingRequest.newBuilder().setParent(LOCATION).setKeyRingId("fields-ring").build());
+        CryptoKey created = kms.createCryptoKey(CreateCryptoKeyRequest.newBuilder()
+                .setParent(LOCATION + "/keyRings/fields-ring").setCryptoKeyId("scheduled")
+                .setCryptoKey(CryptoKey.newBuilder().setPurpose(CryptoKey.CryptoKeyPurpose.ENCRYPT_DECRYPT)
+                        .setRotationPeriod(Durations.fromDays(90))
+                        .setNextRotationTime(Timestamps.parseUnchecked("2027-01-01T00:00:00Z"))
+                        .setDestroyScheduledDuration(Durations.fromDays(7))
+                        .putLabels("team", "repro"))
+                .build());
+
+        for (CryptoKey key : List.of(created,
+                kms.getCryptoKey(GetCryptoKeyRequest.newBuilder().setName(created.getName()).build()))) {
+            assertEquals(Durations.fromDays(90), key.getRotationPeriod());
+            assertEquals(Timestamps.parseUnchecked("2027-01-01T00:00:00Z"), key.getNextRotationTime());
+            assertEquals(Durations.fromDays(7), key.getDestroyScheduledDuration());
+            assertEquals(Map.of("team", "repro"), key.getLabelsMap());
+        }
+
+        CryptoKey plain = kms.createCryptoKey(CreateCryptoKeyRequest.newBuilder()
+                .setParent(LOCATION + "/keyRings/fields-ring").setCryptoKeyId("plain")
+                .setCryptoKey(CryptoKey.newBuilder().setPurpose(CryptoKey.CryptoKeyPurpose.ENCRYPT_DECRYPT))
+                .build());
+        assertEquals(Durations.fromDays(30), plain.getDestroyScheduledDuration());
+        assertFalse(plain.hasRotationPeriod());
+        assertFalse(plain.hasNextRotationTime());
+    }
+
+    @Test
+    void createRejectsRotationOnAKeyThatCannotRotate() {
+        kms.createKeyRing(CreateKeyRingRequest.newBuilder().setParent(LOCATION).setKeyRingId("bad-ring").build());
+        StatusRuntimeException error = assertThrows(StatusRuntimeException.class,
+                () -> kms.createCryptoKey(CreateCryptoKeyRequest.newBuilder()
+                        .setParent(LOCATION + "/keyRings/bad-ring").setCryptoKeyId("sign")
+                        .setCryptoKey(CryptoKey.newBuilder().setPurpose(CryptoKey.CryptoKeyPurpose.ASYMMETRIC_SIGN)
+                                .setVersionTemplate(CryptoKeyVersionTemplate.newBuilder().setAlgorithm(
+                                        CryptoKeyVersion.CryptoKeyVersionAlgorithm.EC_SIGN_P256_SHA256))
+                                .setRotationPeriod(Durations.fromDays(30))
+                                .setNextRotationTime(Timestamps.parseUnchecked("2027-01-01T00:00:00Z")))
+                        .build()));
+        assertEquals(Status.Code.INVALID_ARGUMENT, error.getStatus().getCode());
+    }
+
+    @Test
+    void updateAppliesTheMaskedRotationFields() {
+        kms.createKeyRing(CreateKeyRingRequest.newBuilder().setParent(LOCATION).setKeyRingId("update-ring").build());
+        CryptoKey created = kms.createCryptoKey(CreateCryptoKeyRequest.newBuilder()
+                .setParent(LOCATION + "/keyRings/update-ring").setCryptoKeyId("rotate")
+                .setCryptoKey(CryptoKey.newBuilder().setPurpose(CryptoKey.CryptoKeyPurpose.ENCRYPT_DECRYPT)
+                        .putLabels("team", "a"))
+                .build());
+
+        CryptoKey updated = kms.updateCryptoKey(UpdateCryptoKeyRequest.newBuilder()
+                .setCryptoKey(CryptoKey.newBuilder().setName(created.getName())
+                        .setRotationPeriod(Durations.fromDays(2))
+                        .setNextRotationTime(Timestamps.parseUnchecked("2027-02-01T00:00:00Z")))
+                .setUpdateMask(FieldMask.newBuilder().addPaths("rotation_period").addPaths("next_rotation_time"))
+                .build());
+        assertEquals(Durations.fromDays(2), updated.getRotationPeriod());
+        assertEquals(Timestamps.parseUnchecked("2027-02-01T00:00:00Z"), updated.getNextRotationTime());
+        assertEquals(Map.of("team", "a"), updated.getLabelsMap());
+
+        CryptoKey cleared = kms.updateCryptoKey(UpdateCryptoKeyRequest.newBuilder()
+                .setCryptoKey(CryptoKey.newBuilder().setName(created.getName()))
+                .setUpdateMask(FieldMask.newBuilder().addPaths("rotation_period").addPaths("next_rotation_time"))
+                .build());
+        assertFalse(cleared.hasRotationPeriod());
+        assertFalse(cleared.hasNextRotationTime());
     }
 }
