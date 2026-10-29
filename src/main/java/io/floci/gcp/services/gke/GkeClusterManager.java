@@ -94,7 +94,35 @@ public class GkeClusterManager {
                 config.services().gke().apiServerBasePort(),
                 config.services().gke().apiServerMaxPort());
         cluster.setHostPort(hostPort);
+        try {
+            launchContainer(cluster, image, containerName, hostPort);
+        } catch (RuntimeException e) {
+            removeFailedContainer(cluster);
+            portAllocator.release(hostPort);
+            cluster.setHostPort(0);
+            throw e;
+        }
+    }
 
+    /**
+     * A container this start created would keep the published port, so it goes before the port is reused,
+     * together with the volume: with no container ID left, stopCluster would never remove it.
+     */
+    private void removeFailedContainer(StoredCluster cluster) {
+        if (cluster.getContainerId() == null) {
+            return;
+        }
+        try {
+            lifecycleManager.stopAndRemove(cluster.getContainerId(), null);
+            lifecycleManager.removeVolume(volumeName(cluster));
+        } catch (RuntimeException e) {
+            LOG.warnv("Could not remove k3s container {0} after a failed start of cluster {1}: {2}",
+                    cluster.getContainerId(), cluster.getName(), e.getMessage());
+        }
+        cluster.setContainerId(null);
+    }
+
+    private void launchContainer(StoredCluster cluster, String image, String containerName, int hostPort) {
         lifecycleManager.removeIfExists(containerName);
 
         // A named Docker volume (not a host bind mount) for the k3s data dir: bind mounts to a
@@ -231,6 +259,9 @@ public class GkeClusterManager {
         }
         lifecycleManager.stopAndRemove(cluster.getContainerId(), null);
         lifecycleManager.removeVolume(volumeName(cluster));
+        if (cluster.getHostPort() > 0) {
+            portAllocator.release(cluster.getHostPort());
+        }
         LOG.infov("Stopped k3s container for cluster {0}", cluster.getName());
     }
 
