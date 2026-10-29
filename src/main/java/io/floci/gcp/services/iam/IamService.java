@@ -5,6 +5,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.gcp.config.EmulatorConfig;
 import io.floci.gcp.core.common.GcpException;
 import io.floci.gcp.core.common.ProtoJsonBytes;
+import io.floci.gcp.core.common.ProjectRecord;
+import io.floci.gcp.core.common.ProjectRegistry;
 import io.floci.gcp.core.common.ServiceDescriptor;
 import io.floci.gcp.core.common.ServiceProtocol;
 import io.floci.gcp.core.common.ServiceRegistry;
@@ -72,19 +74,21 @@ public class IamService {
     private final Instance<IamAuthorizationService> authorization;
     private final Instance<SecretManagerService> secretManager;
     private final SecretManagerIamAuthorizationAdapter secretManagerIamAdapter;
+    private final ProjectRegistry projects;
     private final Map<String, Consumer<String>> policyResolvers = new ConcurrentHashMap<>();
 
     @Inject
     public IamService(ServiceRegistry serviceRegistry, EmulatorConfig config, StorageFactory storageFactory,
             GrpcServerManager grpcServerManager, Instance<IamAuthorizationService> authorization,
             Instance<SecretManagerService> secretManager,
-            SecretManagerIamAuthorizationAdapter secretManagerIamAdapter) {
+            SecretManagerIamAuthorizationAdapter secretManagerIamAdapter, ProjectRegistry projects) {
         this.serviceRegistry = serviceRegistry;
         this.config = config;
         this.grpcServerManager = grpcServerManager;
         this.authorization = authorization;
         this.secretManager = secretManager;
         this.secretManagerIamAdapter = secretManagerIamAdapter;
+        this.projects = projects;
         this.saStore = storageFactory.createGlobal("iam-service-accounts", "iam-service-accounts.json",
                 new TypeReference<Map<String, StoredServiceAccount>>() {});
         this.keyStore = storageFactory.createGlobal("iam-sa-keys", "iam-sa-keys.json",
@@ -106,6 +110,13 @@ public class IamService {
             StorageBackend<String, StoredServiceAccountKey> keyStore,
             StorageBackend<String, StoredPolicy> policyStore,
             StorageBackend<String, StoredSigningKey> signingKeyStore) {
+        this(saStore, keyStore, policyStore, signingKeyStore, null);
+    }
+
+    IamService(StorageBackend<String, StoredServiceAccount> saStore,
+            StorageBackend<String, StoredServiceAccountKey> keyStore,
+            StorageBackend<String, StoredPolicy> policyStore,
+            StorageBackend<String, StoredSigningKey> signingKeyStore, ProjectRegistry projects) {
         this.saStore = saStore;
         this.keyStore = keyStore;
         this.policyStore = policyStore;
@@ -116,6 +127,7 @@ public class IamService {
         this.authorization = null;
         this.secretManager = null;
         this.secretManagerIamAdapter = null;
+        this.projects = projects;
         registerServiceAccountPolicyResolver();
     }
 
@@ -291,14 +303,16 @@ public class IamService {
     }
 
     public StoredPolicy getPolicy(String resource) {
+        resource = canonicalProjectName(resource);
         String key = policyKey(resource);
         synchronized (policyLock(key)) {
             requireResourceExists(resource);
-            return policyStore.get(key).map(StoredPolicy::copy).orElseGet(IamService::emptyPolicy);
+            return storedPolicy(resource).map(StoredPolicy::copy).orElseGet(IamService::emptyPolicy);
         }
     }
 
     public StoredPolicy setPolicy(String resource, StoredPolicy policy) {
+        resource = canonicalProjectName(resource);
         String key = policyKey(resource);
         // Serializes existence check + etag read-compare-write per resource, both
         // against concurrent setPolicy (two writers passing the etag check on the
@@ -307,7 +321,7 @@ public class IamService {
         // resurrect the policy when the same name is recreated).
         synchronized (policyLock(key)) {
             requireResourceExists(resource);
-            Optional<StoredPolicy> current = policyStore.get(key);
+            Optional<StoredPolicy> current = storedPolicy(resource);
             String currentEtag = current.map(StoredPolicy::getEtag).orElse(EMPTY_POLICY_ETAG);
             String requestEtag = policy.getEtag();
             if (requestEtag != null && !requestEtag.isEmpty() && !requestEtag.equals(currentEtag)) {
@@ -320,6 +334,7 @@ public class IamService {
             }
             policy.setEtag(newEtag());
             policyStore.put(key, policy.copy());
+            numberKeyedPolicy(resource).ifPresent(policyStore::delete);
             return policy;
         }
     }
@@ -450,6 +465,7 @@ public class IamService {
                 String[] parts = resource.split("/", 4);
                 resource = canonicalServiceAccountName(parts[1], parts[3]);
             }
+            resource = canonicalProjectName(resource);
             requireResourceExists(resource);
         } catch (GcpException e) {
             if (e.getHttpStatus() == 404) {
@@ -472,7 +488,7 @@ public class IamService {
         }
         String key = policyKey(resource);
         synchronized (policyLock(key)) {
-            return policyStore.get(key).orElseGet(IamService::emptyPolicy);
+            return storedPolicy(resource).orElseGet(IamService::emptyPolicy);
         }
     }
 
@@ -795,6 +811,32 @@ public class IamService {
 
     private static String saKey(String project, String email) {
         return "sa:" + project + ":" + email;
+    }
+
+    /**
+     * The stored policy of {@code resource}. A project policy set through {@code projects/{number}} before
+     * numbers resolved to IDs is still stored under the number; it is read from there until the next write
+     * moves it to the ID. Nothing writes number keys any more, so reading one needs no lock of its own.
+     */
+    private Optional<StoredPolicy> storedPolicy(String resource) {
+        Optional<StoredPolicy> policy = policyStore.get(policyKey(resource));
+        return policy.isPresent() ? policy : numberKeyedPolicy(resource).flatMap(policyStore::get);
+    }
+
+    private Optional<String> numberKeyedPolicy(String resource) {
+        if (projects == null || !resource.startsWith("projects/") || resource.indexOf('/', "projects/".length()) >= 0) {
+            return Optional.empty();
+        }
+        String projectId = resource.substring("projects/".length());
+        return projects.find(projectId)
+                .map(ProjectRecord::getProjectNumber)
+                .filter(number -> number != null && !number.equals(projectId))
+                .map(number -> policyKey("projects/" + number));
+    }
+
+    /** A project policy is stored under the project ID, whether the request names the ID or the number. */
+    private String canonicalProjectName(String resource) {
+        return projects == null ? resource : projects.canonicalProjectName(resource);
     }
 
     private static String policyKey(String resource) {
