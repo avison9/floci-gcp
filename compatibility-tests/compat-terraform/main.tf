@@ -172,6 +172,13 @@ resource "google_kms_crypto_key" "compat" {
   name     = "floci-compat-key"
   key_ring = google_kms_key_ring.compat.id
   purpose  = "ENCRYPT_DECRYPT"
+
+  rotation_period            = "7776000s"
+  destroy_scheduled_duration = "604800s"
+
+  labels = {
+    env = "compat-test"
+  }
 }
 
 # ── Pub/Sub ───────────────────────────────────────────────────────────────────

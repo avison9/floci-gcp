@@ -43,6 +43,7 @@ import com.google.cloud.kms.v1.UpdateCryptoKeyVersionRequest;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Int64Value;
 import com.google.protobuf.Timestamp;
+import com.google.protobuf.util.Durations;
 import io.floci.gcp.core.common.GcpException;
 import io.floci.gcp.core.common.GcpGrpcController;
 import io.floci.gcp.core.common.PageToken;
@@ -53,8 +54,11 @@ import io.grpc.stub.StreamObserver;
 import org.jboss.logging.Logger;
 
 import java.security.MessageDigest;
+import java.time.Duration;
 import java.time.Instant;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.zip.CRC32C;
 
 public class CloudKmsController extends KeyManagementServiceGrpc.KeyManagementServiceImplBase {
@@ -119,7 +123,8 @@ public class CloudKmsController extends KeyManagementServiceGrpc.KeyManagementSe
             CryptoKey input = request.getCryptoKey();
             String algorithm = input.getVersionTemplate().getAlgorithm().name();
             StoredCryptoKey stored = service.createCryptoKey(request.getParent(), request.getCryptoKeyId(),
-                    input.getPurpose().name(), algorithm, request.getSkipInitialVersionCreation());
+                    input.getPurpose().name(), algorithm, request.getSkipInitialVersionCreation(),
+                    cryptoKeyFields(input));
             responseObserver.onNext(toProto(stored));
             responseObserver.onCompleted();
         } catch (Exception e) {
@@ -162,8 +167,11 @@ public class CloudKmsController extends KeyManagementServiceGrpc.KeyManagementSe
             CryptoKey input = request.getCryptoKey();
             String versionTemplateAlgorithm = input.hasVersionTemplate()
                     ? input.getVersionTemplate().getAlgorithm().name() : null;
-            StoredCryptoKey stored = service.updateCryptoKey(input.getName(),
-                    input.getLabelsCount() > 0 ? input.getLabelsMap() : null, versionTemplateAlgorithm);
+            Set<String> paths = request.hasUpdateMask()
+                    ? CloudKmsService.snakeCasePaths(request.getUpdateMask().getPathsList())
+                    : presentFields(input);
+            StoredCryptoKey stored = service.updateCryptoKey(input.getName(), cryptoKeyFields(input),
+                    versionTemplateAlgorithm, paths);
             responseObserver.onNext(toProto(stored));
             responseObserver.onCompleted();
         } catch (Exception e) {
@@ -434,6 +442,36 @@ public class CloudKmsController extends KeyManagementServiceGrpc.KeyManagementSe
 
     // ── proto mapping ────────────────────────────────────────────────────────
 
+    private static CloudKmsService.CryptoKeyFields cryptoKeyFields(CryptoKey input) {
+        return new CloudKmsService.CryptoKeyFields(
+                input.hasRotationPeriod() ? Duration.ofSeconds(input.getRotationPeriod().getSeconds(),
+                        input.getRotationPeriod().getNanos()) : null,
+                input.hasNextRotationTime() ? Instant.ofEpochSecond(input.getNextRotationTime().getSeconds(),
+                        input.getNextRotationTime().getNanos()) : null,
+                input.hasDestroyScheduledDuration() ? Duration.ofSeconds(
+                        input.getDestroyScheduledDuration().getSeconds(),
+                        input.getDestroyScheduledDuration().getNanos()) : null,
+                input.getLabelsMap());
+    }
+
+    /** The update paths implied by a request without an update mask: the fields it sets. */
+    private static Set<String> presentFields(CryptoKey input) {
+        Set<String> paths = new HashSet<>();
+        if (input.getLabelsCount() > 0) {
+            paths.add("labels");
+        }
+        if (input.hasVersionTemplate()) {
+            paths.add("version_template");
+        }
+        if (input.hasRotationPeriod()) {
+            paths.add("rotation_period");
+        }
+        if (input.hasNextRotationTime()) {
+            paths.add("next_rotation_time");
+        }
+        return paths;
+    }
+
     private static KeyRing toProto(StoredKeyRing stored) {
         return KeyRing.newBuilder()
                 .setName(stored.getName())
@@ -453,6 +491,14 @@ public class CloudKmsController extends KeyManagementServiceGrpc.KeyManagementSe
         if (stored.getLabels() != null && !stored.getLabels().isEmpty()) {
             builder.putAllLabels(stored.getLabels());
         }
+        if (stored.getNextRotationTime() != null) {
+            builder.setNextRotationTime(toTimestamp(stored.getNextRotationTime()));
+        }
+        if (stored.getRotationPeriod() != null) {
+            builder.setRotationPeriod(Durations.parseUnchecked(stored.getRotationPeriod()));
+        }
+        builder.setDestroyScheduledDuration(
+                Durations.parseUnchecked(CloudKmsService.destroyScheduledDurationOf(stored)));
         if (stored.getPrimaryVersion() != null) {
             service.getCryptoKeyVersionOptional(stored.getName() + "/cryptoKeyVersions/" + stored.getPrimaryVersion())
                     .ifPresent(v -> builder.setPrimary(toProto(v)));

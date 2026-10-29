@@ -154,6 +154,29 @@ selects the version that produced the ciphertext. Rotate by calling `CreateCrypt
   returns it to `DISABLED`. Crypto operations on a non-`ENABLED` version fail with
   `FAILED_PRECONDITION`.
 
+## Key Settings
+
+`CreateCryptoKey` stores `labels`, `rotation_period`, `next_rotation_time` and
+`destroy_scheduled_duration`, and every read returns them. A key created without
+`destroy_scheduled_duration` reports the 30 day default (`2592000s`). As the proto requires,
+`rotation_period` and `next_rotation_time` are accepted only on `ENCRYPT_DECRYPT` keys,
+`rotation_period` must be between 24 and 876,000 hours, and `next_rotation_time` must be set
+with it; anything else is `INVALID_ARGUMENT`.
+
+`UpdateCryptoKey` applies the fields its update mask names (`labels`, `rotation_period`,
+`next_rotation_time`, `version_template.algorithm`); a named field left out of the request is
+cleared. Without a mask it applies the fields the request sets.
+
+Deviations:
+
+- Keys are never rotated automatically: `next_rotation_time` is stored and returned, but no
+  version is created when it passes.
+- `destroy_scheduled_duration` is not validated against a range, and `DestroyCryptoKeyVersion`
+  does not use it yet: `destroy_time` is still the time of the call.
+- Update mask paths floci does not support, including immutable fields such as
+  `destroy_scheduled_duration` and `purpose`, are ignored rather than rejected.
+- The `INVALID_ARGUMENT` messages are floci's own; production's wording was not verified.
+
 ## Integrity (CRC32C)
 
 Requests may include `*_crc32c` checksums (e.g. `plaintext_crc32c`); when present, floci-gcp

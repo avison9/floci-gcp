@@ -1,6 +1,7 @@
 package io.floci.gcp.services.cloudkms;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.google.protobuf.util.Durations;
 import io.floci.gcp.config.EmulatorConfig;
 import io.floci.gcp.core.common.GcpException;
 import io.floci.gcp.core.common.LocationCatalog;
@@ -19,8 +20,13 @@ import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.time.Duration;
 import java.time.Instant;
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
@@ -33,6 +39,10 @@ public class CloudKmsService {
     private static final Set<String> SIGN_ALGORITHMS =
             Set.of("EC_SIGN_P256_SHA256", "RSA_SIGN_PKCS1_2048_SHA256");
     private static final String DECRYPT_ALGORITHM = "RSA_DECRYPT_OAEP_2048_SHA256";
+
+    private static final Duration DEFAULT_DESTROY_SCHEDULED_DURATION = Duration.ofDays(30);
+    private static final Duration MIN_ROTATION_PERIOD = Duration.ofHours(24);
+    private static final Duration MAX_ROTATION_PERIOD = Duration.ofHours(876_000);
 
     private static final LocationCatalog.Kind[] KMS_LOCATION_KINDS = {
             LocationCatalog.Kind.REGION, LocationCatalog.Kind.GLOBAL, LocationCatalog.Kind.KMS_MULTI_REGION};
@@ -116,8 +126,24 @@ public class CloudKmsService {
 
     // ── CryptoKeys ───────────────────────────────────────────────────────────
 
+    /**
+     * The settable fields of a CryptoKey besides purpose and algorithm. A null field is unset;
+     * for an update, only the fields named in the update paths are applied, so null clears.
+     */
+    public record CryptoKeyFields(Duration rotationPeriod, Instant nextRotationTime,
+            Duration destroyScheduledDuration, Map<String, String> labels) {
+
+        static final CryptoKeyFields NONE = new CryptoKeyFields(null, null, null, null);
+    }
+
     public StoredCryptoKey createCryptoKey(String parent, String cryptoKeyId, String purpose,
             String algorithm, boolean skipInitialVersionCreation) {
+        return createCryptoKey(parent, cryptoKeyId, purpose, algorithm, skipInitialVersionCreation,
+                CryptoKeyFields.NONE);
+    }
+
+    public StoredCryptoKey createCryptoKey(String parent, String cryptoKeyId, String purpose,
+            String algorithm, boolean skipInitialVersionCreation, CryptoKeyFields fields) {
         getKeyRing(parent); // validates the parent key ring exists
         String name = parent + "/cryptoKeys/" + cryptoKeyId;
         LOG.infof("createCryptoKey name=%s purpose=%s", name, purpose);
@@ -125,7 +151,15 @@ public class CloudKmsService {
             throw GcpException.alreadyExists("CryptoKey already exists: " + name);
         }
         String effectiveAlgorithm = resolveAlgorithm(purpose, algorithm);
+        validateRotationSchedule(purpose, fields.rotationPeriod(), fields.nextRotationTime());
         StoredCryptoKey key = new StoredCryptoKey(name, purpose, effectiveAlgorithm, Instant.now().toString());
+        key.setRotationPeriod(formatDuration(fields.rotationPeriod()));
+        key.setNextRotationTime(fields.nextRotationTime() != null ? fields.nextRotationTime().toString() : null);
+        key.setDestroyScheduledDuration(formatDuration(fields.destroyScheduledDuration() != null
+                ? fields.destroyScheduledDuration() : DEFAULT_DESTROY_SCHEDULED_DURATION));
+        if (fields.labels() != null && !fields.labels().isEmpty()) {
+            key.setLabels(new LinkedHashMap<>(fields.labels()));
+        }
         cryptoKeyStore.put(name, key);
         if (!skipInitialVersionCreation) {
             StoredCryptoKeyVersion version = createCryptoKeyVersion(name);
@@ -147,16 +181,93 @@ public class CloudKmsService {
         return cryptoKeyStore.scan(k -> k.startsWith(prefix));
     }
 
-    public StoredCryptoKey updateCryptoKey(String name, Map<String, String> labels, String versionTemplateAlgorithm) {
+    /**
+     * Applies the fields named in {@code paths}, each a snake_case update mask path: {@code labels},
+     * {@code rotation_period}, {@code next_rotation_time} or {@code version_template.algorithm}
+     * ({@code version_template} alone counts as the algorithm). Other paths are ignored. Everything
+     * is validated before the stored key is touched.
+     */
+    public StoredCryptoKey updateCryptoKey(String name, CryptoKeyFields fields, String versionTemplateAlgorithm,
+            Set<String> paths) {
         StoredCryptoKey key = getCryptoKey(name);
-        if (labels != null) {
-            key.setLabels(labels);
+        boolean setAlgorithm = (paths.contains("version_template.algorithm") || paths.contains("version_template"))
+                && versionTemplateAlgorithm != null && !versionTemplateAlgorithm.isBlank();
+        String algorithm = setAlgorithm
+                ? resolveAlgorithm(key.getPurpose(), versionTemplateAlgorithm) : key.getAlgorithm();
+        Duration rotationPeriod = paths.contains("rotation_period")
+                ? fields.rotationPeriod() : parseStoredDuration(key.getRotationPeriod());
+        Instant nextRotationTime = paths.contains("next_rotation_time")
+                ? fields.nextRotationTime()
+                : key.getNextRotationTime() != null ? Instant.parse(key.getNextRotationTime()) : null;
+        validateRotationSchedule(key.getPurpose(), rotationPeriod, nextRotationTime);
+
+        if (paths.contains("labels")) {
+            key.setLabels(fields.labels() != null && !fields.labels().isEmpty()
+                    ? new LinkedHashMap<>(fields.labels()) : null);
         }
-        if (versionTemplateAlgorithm != null && !versionTemplateAlgorithm.isBlank()) {
-            key.setAlgorithm(resolveAlgorithm(key.getPurpose(), versionTemplateAlgorithm));
-        }
+        key.setAlgorithm(algorithm);
+        key.setRotationPeriod(formatDuration(rotationPeriod));
+        key.setNextRotationTime(nextRotationTime != null ? nextRotationTime.toString() : null);
         cryptoKeyStore.put(name, key);
         return key;
+    }
+
+    /** Converts lowerCamelCase update mask paths (REST) to the snake_case the proto uses. */
+    public static Set<String> snakeCasePaths(Collection<String> paths) {
+        Set<String> result = new HashSet<>();
+        for (String path : paths) {
+            String trimmed = path.trim();
+            if (!trimmed.isEmpty()) {
+                result.add(trimmed.replaceAll("([A-Z])", "_$1").toLowerCase(Locale.ROOT));
+            }
+        }
+        return result;
+    }
+
+    /** The destroy scheduled duration a key reports, defaulting keys stored before the field existed. */
+    public static String destroyScheduledDurationOf(StoredCryptoKey key) {
+        return key.getDestroyScheduledDuration() != null
+                ? key.getDestroyScheduledDuration() : formatDuration(DEFAULT_DESTROY_SCHEDULED_DURATION);
+    }
+
+    private static void validateRotationSchedule(String purpose, Duration rotationPeriod, Instant nextRotationTime) {
+        if (rotationPeriod == null && nextRotationTime == null) {
+            return;
+        }
+        if (!"ENCRYPT_DECRYPT".equals(purpose)) {
+            throw GcpException.invalidArgument(
+                    "rotation_period and next_rotation_time are only supported for ENCRYPT_DECRYPT keys");
+        }
+        if (rotationPeriod == null) {
+            return;
+        }
+        if (nextRotationTime == null) {
+            throw GcpException.invalidArgument("next_rotation_time must be set when rotation_period is set");
+        }
+        if (rotationPeriod.compareTo(MIN_ROTATION_PERIOD) < 0 || rotationPeriod.compareTo(MAX_ROTATION_PERIOD) > 0) {
+            throw GcpException.invalidArgument("rotation_period must be at least 24 hours and at most 876000 hours");
+        }
+    }
+
+    /** Formats a duration the way proto3 JSON writes {@code google.protobuf.Duration}, e.g. "7776000s". */
+    static String formatDuration(Duration duration) {
+        if (duration == null) {
+            return null;
+        }
+        if (duration.getNano() == 0) {
+            return duration.getSeconds() + "s";
+        }
+        return Durations.toString(Durations.fromSeconds(duration.getSeconds()).toBuilder()
+                .setNanos(duration.getNano()).build());
+    }
+
+    private static Duration parseStoredDuration(String value) {
+        if (value == null) {
+            return null;
+        }
+        // Qualified: com.google.protobuf.Duration clashes with the imported java.time.Duration.
+        com.google.protobuf.Duration parsed = Durations.parseUnchecked(value);
+        return Duration.ofSeconds(parsed.getSeconds(), parsed.getNanos());
     }
 
     public StoredCryptoKey updateCryptoKeyPrimaryVersion(String name, String cryptoKeyVersionId) {

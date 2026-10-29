@@ -12,9 +12,13 @@ import java.security.KeyFactory;
 import java.security.PublicKey;
 import java.security.Signature;
 import java.security.spec.X509EncodedKeySpec;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import javax.crypto.Cipher;
 import javax.crypto.Mac;
@@ -271,5 +275,52 @@ class CloudKmsServiceTest {
     private static PublicKey publicKeyFrom(StoredCryptoKeyVersion version, String algorithm) throws Exception {
         byte[] der = Base64.getDecoder().decode(version.getPublicKeyBase64());
         return KeyFactory.getInstance(algorithm).generatePublic(new X509EncodedKeySpec(der));
+    }
+
+    @Test
+    void aKeyStoredBeforeDestroyScheduledDurationExistedReportsTheDefault() {
+        StoredCryptoKey legacy = new StoredCryptoKey("projects/p1/locations/l/keyRings/kr/cryptoKeys/old",
+                "ENCRYPT_DECRYPT", "GOOGLE_SYMMETRIC_ENCRYPTION", "2026-01-01T00:00:00Z");
+        assertNull(legacy.getDestroyScheduledDuration());
+        assertEquals("2592000s", CloudKmsService.destroyScheduledDurationOf(legacy));
+    }
+
+    @Test
+    void durationsAreWrittenAsProtoJson() {
+        assertEquals("86400s", CloudKmsService.formatDuration(Duration.ofDays(1)));
+        assertEquals("1.500s", CloudKmsService.formatDuration(Duration.ofMillis(1500)));
+        assertNull(CloudKmsService.formatDuration(null));
+    }
+
+    @Test
+    void updateMaskPathsAreReadInEitherCase() {
+        assertEquals(Set.of("rotation_period", "next_rotation_time", "version_template.algorithm", "labels"),
+                CloudKmsService.snakeCasePaths(List.of("rotationPeriod", " next_rotation_time",
+                        "versionTemplate.algorithm", "labels", "")));
+    }
+
+    @Test
+    void updateRejectsRotationOnANonSymmetricKeyWithoutTouchingIt() {
+        service.createKeyRing(LOCATION, "kr");
+        StoredCryptoKey key = service.createCryptoKey(LOCATION + "/keyRings/kr", "mac", "MAC", "HMAC_SHA256", false);
+        CloudKmsService.CryptoKeyFields fields = new CloudKmsService.CryptoKeyFields(
+                Duration.ofDays(1), Instant.parse("2027-01-01T00:00:00Z"), null, Map.of("team", "a"));
+
+        GcpException ex = assertThrows(GcpException.class, () -> service.updateCryptoKey(key.getName(), fields, null,
+                Set.of("labels", "rotation_period", "next_rotation_time")));
+        assertEquals("INVALID_ARGUMENT", ex.getGcpStatus());
+        StoredCryptoKey stored = service.getCryptoKey(key.getName());
+        assertNull(stored.getLabels());
+        assertNull(stored.getRotationPeriod());
+    }
+
+    @Test
+    void updateIgnoresPathsItDoesNotSupport() {
+        StoredCryptoKey key = symmetricKey("ignored");
+        StoredCryptoKey updated = service.updateCryptoKey(key.getName(),
+                new CloudKmsService.CryptoKeyFields(null, null, Duration.ofDays(1), null), null,
+                Set.of("destroy_scheduled_duration", "purpose"));
+        assertEquals("2592000s", updated.getDestroyScheduledDuration());
+        assertEquals("ENCRYPT_DECRYPT", updated.getPurpose());
     }
 }
