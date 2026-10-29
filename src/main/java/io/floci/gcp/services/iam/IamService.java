@@ -294,7 +294,7 @@ public class IamService {
         String key = policyKey(resource);
         synchronized (policyLock(key)) {
             requireResourceExists(resource);
-            return policyStore.get(key).orElseGet(IamService::emptyPolicy);
+            return policyStore.get(key).map(StoredPolicy::copy).orElseGet(IamService::emptyPolicy);
         }
     }
 
@@ -307,9 +307,8 @@ public class IamService {
         // resurrect the policy when the same name is recreated).
         synchronized (policyLock(key)) {
             requireResourceExists(resource);
-            String currentEtag = policyStore.get(key)
-                    .map(StoredPolicy::getEtag)
-                    .orElse(EMPTY_POLICY_ETAG);
+            Optional<StoredPolicy> current = policyStore.get(key);
+            String currentEtag = current.map(StoredPolicy::getEtag).orElse(EMPTY_POLICY_ETAG);
             String requestEtag = policy.getEtag();
             if (requestEtag != null && !requestEtag.isEmpty() && !requestEtag.equals(currentEtag)) {
                 throw GcpException.aborted(
@@ -317,10 +316,10 @@ public class IamService {
                                 + "The request's ETag '" + requestEtag + "' did not match the current policy's ETag '" + currentEtag + "'.");
             }
             if (authorization != null) {
-                authorization.get().validatePolicyWrite(resource, policy);
+                authorization.get().validatePolicyWrite(resource, current.orElse(null), policy);
             }
             policy.setEtag(newEtag());
-            policyStore.put(key, policy);
+            policyStore.put(key, policy.copy());
             return policy;
         }
     }
