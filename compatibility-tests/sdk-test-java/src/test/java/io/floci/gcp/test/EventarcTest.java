@@ -1,5 +1,8 @@
 package io.floci.gcp.test;
 
+import com.google.api.gax.httpjson.longrunning.OperationsClient;
+import com.google.api.gax.longrunning.OperationFuture;
+import com.google.api.gax.rpc.NotFoundException;
 import com.google.cloud.eventarc.v1.CloudRun;
 import com.google.cloud.eventarc.v1.CreateTriggerRequest;
 import com.google.cloud.eventarc.v1.DeleteTriggerRequest;
@@ -10,9 +13,11 @@ import com.google.cloud.eventarc.v1.GetProviderRequest;
 import com.google.cloud.eventarc.v1.GetTriggerRequest;
 import com.google.cloud.eventarc.v1.ListProvidersRequest;
 import com.google.cloud.eventarc.v1.ListTriggersRequest;
+import com.google.cloud.eventarc.v1.OperationMetadata;
 import com.google.cloud.eventarc.v1.Provider;
 import com.google.cloud.eventarc.v1.Trigger;
 import com.google.cloud.eventarc.v1.UpdateTriggerRequest;
+import com.google.longrunning.Operation;
 import com.google.protobuf.FieldMask;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -163,5 +168,50 @@ class EventarcTest {
                         .setName(TRIGGER_NAME)
                         .build()))
                 .isInstanceOf(RuntimeException.class);
+    }
+
+    @Test
+    @Order(8)
+    void triggerOperationsCanBeReadBackAndDeleted() throws Exception {
+        String triggerId = TestFixtures.uniqueName("eventarc-op-trigger");
+        OperationFuture<Trigger, OperationMetadata> future = client.createTriggerAsync(CreateTriggerRequest.newBuilder()
+                .setParent(PARENT)
+                .setTriggerId(triggerId)
+                .setTrigger(Trigger.newBuilder()
+                        .setDestination(Destination.newBuilder()
+                                .setCloudRun(CloudRun.newBuilder()
+                                        .setService("hello-run")
+                                        .setRegion(LOCATION)
+                                        .build())
+                                .build())
+                        .addEventFilters(EventFilter.newBuilder()
+                                .setAttribute("type")
+                                .setValue("google.cloud.pubsub.topic.v1.messagePublished")
+                                .build())
+                        .build())
+                .build());
+        future.get(10, TimeUnit.SECONDS);
+        String operationName = future.getName();
+        OperationsClient operations = client.getHttpJsonOperationsClient();
+
+        Operation operation = operations.getOperation(operationName);
+        assertThat(operation.getName()).isEqualTo(operationName);
+        assertThat(operation.getDone()).isTrue();
+        assertThat(operation.getMetadata().unpack(OperationMetadata.class).getTarget())
+                .isEqualTo(PARENT + "/triggers/" + triggerId);
+
+        List<String> listed = new ArrayList<>();
+        operations.listOperations(PARENT, "").iterateAll().forEach(op -> listed.add(op.getName()));
+        assertThat(listed).contains(operationName);
+
+        operations.cancelOperation(operationName);
+        operations.deleteOperation(operationName);
+        assertThatThrownBy(() -> operations.getOperation(operationName))
+                .isInstanceOf(NotFoundException.class);
+
+        client.deleteTriggerAsync(DeleteTriggerRequest.newBuilder()
+                        .setName(PARENT + "/triggers/" + triggerId)
+                        .build())
+                .get(10, TimeUnit.SECONDS);
     }
 }

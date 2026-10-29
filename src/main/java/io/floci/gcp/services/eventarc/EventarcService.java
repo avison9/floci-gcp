@@ -13,6 +13,7 @@ import com.google.cloud.eventarc.v1.OperationMetadata;
 import com.google.cloud.eventarc.v1.Provider;
 import com.google.cloud.eventarc.v1.Transport;
 import com.google.cloud.eventarc.v1.Trigger;
+import com.google.longrunning.ListOperationsResponse;
 import com.google.longrunning.Operation;
 import com.google.protobuf.Timestamp;
 import com.google.rpc.Code;
@@ -273,6 +274,39 @@ public class EventarcService {
                     .build();
         }
         throw GcpException.notFound("Provider not found: " + name);
+    }
+
+    // ── Operations ────────────────────────────────────────────────────────────
+
+    public Operation getOperation(String name) {
+        Operation operation = operations.get(name);
+        if (!isEventarcOperation(operation)) {
+            throw GcpException.notFound("Operation not found: " + name);
+        }
+        return operation;
+    }
+
+    public ListOperationsResponse listOperations(String project, String location, int pageSize, String pageToken) {
+        locations.requireListLocation(location, LocationCatalog.Kind.REGION);
+        return operations.list(parent(project, location), pageSize, pageToken, EventarcService::isEventarcOperation);
+    }
+
+    public void deleteOperation(String name) {
+        getOperation(name);
+        operations.delete(name);
+    }
+
+    /** Every Eventarc operation is created done, so there is nothing left to cancel. */
+    public void cancelOperation(String name) {
+        getOperation(name);
+    }
+
+    /**
+     * The shared store also holds Cloud Run and Cloud Functions operations under the same
+     * {@code projects/{p}/locations/{l}/operations/} prefix; only Eventarc's carry its metadata type.
+     */
+    private static boolean isEventarcOperation(Operation operation) {
+        return operation.getMetadata().is(OperationMetadata.class);
     }
 
     // ── Event Dispatching / Interception ──────────────────────────────────────
