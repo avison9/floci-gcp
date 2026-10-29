@@ -18,6 +18,8 @@ import java.util.Map;
 final class GcsGrpcMapper {
 
     private static final String BUCKET_MARKER = "/buckets/";
+    /** Per-key label changes from {@code labels.<key>} paths: a value sets the label, null removes it. */
+    static final String LABEL_CHANGES = "labelChanges";
 
     private GcsGrpcMapper() {}
 
@@ -145,9 +147,11 @@ final class GcsGrpcMapper {
         boolean updateUniformBucketLevelAccessEnabled = false;
         boolean updateUniformBucketLevelAccessLockTime = false;
         boolean updatePublicAccessPrevention = false;
+        Map<String, String> labels = null;
+        Map<String, java.lang.Object> labelChanges = null;
         for (String path : paths) {
             switch (path) {
-                case "labels" -> patch.put("labels", new LinkedHashMap<>(bucket.getLabelsMap()));
+                case "labels" -> labels = new LinkedHashMap<>(bucket.getLabelsMap());
                 case "versioning", "versioning.enabled" ->
                         patch.put("versioning", Map.of("enabled", bucket.getVersioning().getEnabled()));
                 case "iam_config" -> mergeIamConfigurationMessage = true;
@@ -165,12 +169,23 @@ final class GcsGrpcMapper {
                         patch.put("defaultEventBasedHold", bucket.getDefaultEventBasedHold());
                 default -> {
                     if (path.startsWith("labels.")) {
-                        patch.put("labels", new LinkedHashMap<>(bucket.getLabelsMap()));
+                        // A per-key path sets that label, or removes it (null) when the request's map lacks the key.
+                        // GcsService applies the changes to the stored labels under the bucket lock.
+                        if (labelChanges == null) {
+                            labelChanges = new LinkedHashMap<>();
+                        }
+                        String key = path.substring("labels.".length());
+                        labelChanges.put(key, bucket.containsLabels(key) ? bucket.getLabelsOrThrow(key) : null);
                     } else {
                         throw GcpException.invalidArgument("Unsupported bucket update field: " + path);
                     }
                 }
             }
+        }
+        if (labels != null) {
+            patch.put("labels", labels);
+        } else if (labelChanges != null) {
+            patch.put(LABEL_CHANGES, labelChanges);
         }
         if (mergeIamConfigurationMessage || mergeUniformBucketLevelAccessMessage
                 || updateUniformBucketLevelAccessEnabled || updateUniformBucketLevelAccessLockTime
