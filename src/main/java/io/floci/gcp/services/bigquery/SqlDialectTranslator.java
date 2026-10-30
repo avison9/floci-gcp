@@ -5231,20 +5231,22 @@ final class SqlDialectTranslator {
             case "TIMESTAMP_MILLIS" -> "make_timestamptz(CAST(" + at(a, 0) + " AS BIGINT) * 1000)";
             case "TIMESTAMP_MICROS" -> "make_timestamptz(CAST(" + at(a, 0) + " AS BIGINT))";
             case "TIMESTAMP_ADD" -> args(a, 2, name,
-                    "(" + timestampArithmeticValue(at(a, 0)) + " + " + at(a, 1) + ")");
+                    "(" + timestampArithmeticValue(temporalOperand(at(a, 0), name)) + " + " + at(a, 1) + ")");
             case "TIMESTAMP_SUB" -> args(a, 2, name,
-                    "(" + timestampArithmeticValue(at(a, 0)) + " - " + at(a, 1) + ")");
+                    "(" + timestampArithmeticValue(temporalOperand(at(a, 0), name)) + " - " + at(a, 1) + ")");
             case "DATETIME_ADD", "TIME_ADD" -> args(a, 2, name,
-                    "(" + at(a, 0) + " + " + at(a, 1) + ")");
+                    "(" + temporalOperand(at(a, 0), name) + " + " + at(a, 1) + ")");
             case "DATETIME_SUB", "TIME_SUB" -> args(a, 2, name,
-                    "(" + at(a, 0) + " - " + at(a, 1) + ")");
-            case "DATE_ADD" -> args(a, 2, name, "CAST(" + at(a, 0) + " + " + at(a, 1) + " AS DATE)");
-            case "DATE_SUB" -> args(a, 2, name, "CAST(" + at(a, 0) + " - " + at(a, 1) + " AS DATE)");
+                    "(" + temporalOperand(at(a, 0), name) + " - " + at(a, 1) + ")");
+            case "DATE_ADD" -> args(a, 2, name,
+                    "CAST(" + temporalOperand(at(a, 0), name) + " + " + at(a, 1) + " AS DATE)");
+            case "DATE_SUB" -> args(a, 2, name,
+                    "CAST(" + temporalOperand(at(a, 0), name) + " - " + at(a, 1) + " AS DATE)");
             case "TIMESTAMP_DIFF", "DATETIME_DIFF", "DATE_DIFF", "TIME_DIFF" -> args(a, 3, name,
-                    dateDiff(at(a, 0), at(a, 1), at(a, 2)));
+                    dateDiff(temporalOperand(at(a, 0), name), temporalOperand(at(a, 1), name), at(a, 2)));
             case "TIMESTAMP_TRUNC" -> renderTimestampTrunc(a, name);
             case "DATETIME_TRUNC" -> exactArgs(a, 2, name,
-                    dateTrunc(at(a, 0), at(a, 1), false, "TIMESTAMP"));
+                    dateTrunc(temporalOperand(at(a, 0), name), at(a, 1), false, "TIMESTAMP"));
             // DATE_TRUNC is overloaded in BigQuery and returns the type of its first argument.
             // In particular, a TIMESTAMP input must remain a TIMESTAMP rather than becoming a
             // DATE. DuckDB's cast_to_type preserves that runtime type for column expressions too.
@@ -5730,6 +5732,59 @@ final class SqlDialectTranslator {
         return isStringLiteral(literal) ? literal.substring(1, literal.length() - 1).replace("''", "'") : null;
     }
 
+    /**
+     * BigQuery coerces a STRING literal or STRING parameter passed to a date/time function to the
+     * function's type ({@code DATE_ADD(@d, INTERVAL 1 DAY)} with {@code @d} a STRING). DuckDB cannot
+     * pick an overload for a string plus an interval, so such an operand gets an explicit cast. Redundant
+     * parentheses around the literal are looked through, and a NULL STRING parameter becomes a typed NULL.
+     */
+    private static String temporalOperand(String operand, String function) {
+        String literal = operand.strip();
+        while (wrappedInParentheses(literal)) {
+            literal = literal.substring(1, literal.length() - 1).strip();
+        }
+        if (literal.startsWith("CAST(") && literal.endsWith(" AS VARCHAR)")) {
+            literal = literal.substring("CAST(".length(), literal.length() - " AS VARCHAR)".length());
+        }
+        if (!isStringLiteral(literal) && !(literal.equals("NULL") && operand.contains(" AS VARCHAR)"))) {
+            return operand;
+        }
+        String type;
+        if (function.startsWith("DATE_")) {
+            type = "DATE";
+        } else if (function.startsWith("DATETIME_")) {
+            type = "TIMESTAMP";
+        } else if (function.startsWith("TIMESTAMP_")) {
+            type = "TIMESTAMPTZ";
+        } else {
+            type = "TIME";
+        }
+        return "CAST(" + literal + " AS " + type + ")";
+    }
+
+    /** True when {@code sql} is one parenthesized expression: its first parenthesis closes at its last character. */
+    private static boolean wrappedInParentheses(String sql) {
+        if (sql.length() < 2 || sql.charAt(0) != '(' || sql.charAt(sql.length() - 1) != ')') {
+            return false;
+        }
+        int depth = 0;
+        boolean quoted = false;
+        for (int i = 0; i < sql.length(); i++) {
+            char c = sql.charAt(i);
+            if (c == '\'') {
+                quoted = !quoted;
+            } else if (!quoted && c == '(') {
+                depth++;
+            } else if (!quoted && c == ')') {
+                depth--;
+                if (depth == 0 && i < sql.length() - 1) {
+                    return false;
+                }
+            }
+        }
+        return depth == 0;
+    }
+
     /** True for exactly one single-quoted SQL string literal, with quotes escaped by doubling. */
     private static boolean isStringLiteral(String sql) {
         if (sql.length() < 2 || sql.charAt(0) != '\'' || sql.charAt(sql.length() - 1) != '\'') {
@@ -5808,7 +5863,7 @@ final class SqlDialectTranslator {
             throw invalidQuery("No matching signature for function " + name + " with " + arguments.size()
                     + " arguments");
         }
-        String input = dateTruncValue(at(arguments, 0), "TIMESTAMPTZ");
+        String input = dateTruncValue(temporalOperand(at(arguments, 0), "TIMESTAMP_TRUNC"), "TIMESTAMPTZ");
         String zone = arguments.size() == 3 ? at(arguments, 2) : DuckTypes.quoteLiteral("UTC");
         String local = "timezone(" + zone + ", " + input + ")";
         String truncated = dateTrunc(local, at(arguments, 1), false, null);
@@ -5817,7 +5872,7 @@ final class SqlDialectTranslator {
 
     private static String renderDateTrunc(List<String> arguments, String name) {
         if (arguments.size() == 2) {
-            return dateTrunc(at(arguments, 0), at(arguments, 1), true, "DATE");
+            return dateTrunc(temporalOperand(at(arguments, 0), "DATE_TRUNC"), at(arguments, 1), true, "DATE");
         }
         return renderTimestampTrunc(arguments, name);
     }
